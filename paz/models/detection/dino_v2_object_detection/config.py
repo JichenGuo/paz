@@ -416,6 +416,9 @@ class TrainConfig:
         run (Optional[str]): W&B run name.
         class_names (Optional[List[str]]): Class label names.
         run_test (bool): Run evaluation after training.
+        eval_interval (int): Run validation every N epochs. Set ``0`` to
+            skip built-in validation during training.
+        eval_ema (bool): Run validation on EMA weights when EMA is enabled.
         clip_max_norm (float): Max gradient norm for clipping.
         segmentation_head (bool): Train with segmentation head.
         eval_max_dets (int): Maximum detections per image at evaluation.
@@ -460,6 +463,8 @@ class TrainConfig:
     run: Optional[str] = None
     class_names: Optional[List[str]] = None
     run_test: bool = True
+    eval_interval: int = 1
+    eval_ema: bool = True
     clip_max_norm: float = 0.1
     segmentation_head: bool = False
     eval_max_dets: int = 500
