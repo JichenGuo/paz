@@ -436,7 +436,7 @@ def main():
     sys.stdout = _TeeWriter(sys.stdout, os.path.join(EXP_DIR, "output.txt"))
 
     logger.info("=" * 68)
-    logger.info("EXPERIMENT 9: RF-DETR Nano — Native RF-DETR Augmentation")
+    logger.info("EXPERIMENT 10: RF-DETR Nano — Native RF-DETR Augmentation")
     logger.info("=" * 68)
 
     BATCH_SIZE = 4 #16

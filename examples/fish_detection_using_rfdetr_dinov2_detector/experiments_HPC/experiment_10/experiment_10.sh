@@ -28,12 +28,12 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=jichen.guo@dfki.de
 #SBATCH --job-name=rfdetr_exp9_native_aug
-#SBATCH --partition=gpu_titan
+#SBATCH --partition=gpu_ampere
+#SBATCH --gres=gpu:a100:1
 #SBATCH --account=deepl
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:pascal:1
 # SBATCH --mem=64G
 #SBATCH --time=30-00:00:00
 #SBATCH --chdir=/mnt/beegfs/home/jguo/projects/fish_detector_using_rfdetr/paz/examples/fish_detection_using_rfdetr_dinov2_detector
