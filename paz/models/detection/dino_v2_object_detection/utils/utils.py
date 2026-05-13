@@ -5,17 +5,22 @@ import keras
 import keras.ops as k
 import numpy as np
 
+
+def _weight_tensor(weight):
+    """Return a backend tensor view of a Keras variable."""
+    return k.convert_to_tensor(getattr(weight, "value", weight))
+
+
 class ModelEma(object):
     """Exponential Moving Average of model weights.
 
-    Maintains a shadow copy of each weight as a NumPy array keyed by
-    variable path.  After each training step ``update()`` blends the
-    current model weights into the running average.  The EMA weights
-    can later be applied to any compatible model via ``apply_to()``.
+    Maintains a shadow copy of each weight keyed by variable path.  The
+    shadow values stay on the active backend device during training; moving
+    every weight to NumPy on each update would force a full device sync every
+    step and severely slow JAX-backed training.
 
     Attributes:
-        model_weights (dict): ``{variable_path: np.ndarray}`` shadow
-            weights.
+        model_weights (dict): ``{variable_path: tensor}`` shadow weights.
         decay (float): EMA decay factor.
         tau (float): Optional time-constant for a warm-up ramp on the
             decay.  Set to ``0`` to disable.
@@ -23,7 +28,7 @@ class ModelEma(object):
     """
     def __init__(self, model, decay=0.9997, tau=0, device=None):
         self.model_weights = {
-            w.path: w.numpy().copy() for w in model.weights
+            w.path: _weight_tensor(w) for w in model.weights
         }
         self.decay = decay
         self.tau = tau
@@ -46,20 +51,20 @@ class ModelEma(object):
         decay = self._get_decay()
         for w in model.weights:
             key = w.path
-            new = w.numpy()
+            new = _weight_tensor(w)
             if key in self.model_weights:
                 self.model_weights[key] = (
                     decay * self.model_weights[key] + (1. - decay) * new
                 )
             else:
                 # Variable appeared after init (e.g. via lazy build)
-                self.model_weights[key] = new.copy()
+                self.model_weights[key] = new
         self.updates += 1
 
     def set(self, model):
         """Replace the EMA shadow with the model's current weights."""
         self.model_weights = {
-            w.path: w.numpy().copy() for w in model.weights
+            w.path: _weight_tensor(w) for w in model.weights
         }
 
     def apply_to(self, model):
