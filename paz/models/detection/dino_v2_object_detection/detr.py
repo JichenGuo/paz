@@ -340,7 +340,8 @@ class RFDETR:
             data_loader_train = self._build_data_loader(
                 config, "train", all_kwargs
             )
-        if data_loader_val is None:
+        build_builtin_val = int(getattr(config, "eval_interval", 1)) > 0
+        if data_loader_val is None and build_builtin_val:
             data_loader_val = self._build_data_loader(
                 config, "val", all_kwargs
             )
@@ -510,9 +511,16 @@ class RFDETR:
                 "epoch": epoch,
             }
 
+            eval_interval = int(getattr(config, "eval_interval", 1))
+            run_eval = (
+                eval_interval > 0
+                and ((epoch + 1) % eval_interval == 0
+                     or epoch == config.epochs - 1)
+            )
+
             # ---- COCO evaluation on validation set ----
             map_regular = 0.0
-            if data_loader_val is not None and coco_gt is not None:
+            if run_eval and data_loader_val is not None and coco_gt is not None:
                 test_stats, coco_evaluator = evaluate_model(
                     model, criterion, postprocess, data_loader_val,
                     coco_gt, config=config,
@@ -541,7 +549,12 @@ class RFDETR:
                 )
 
             # EMA evaluation
-            if ema_m is not None and config.use_ema:
+            if (
+                run_eval
+                and ema_m is not None
+                and config.use_ema
+                and getattr(config, "eval_ema", True)
+            ):
                 # Apply EMA weights, evaluate, then restore
                 original_weights = {
                     w.path: w.numpy().copy() for w in model.weights
