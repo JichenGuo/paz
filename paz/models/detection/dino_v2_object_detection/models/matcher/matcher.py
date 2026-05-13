@@ -277,7 +277,7 @@ class HungarianMatcher(keras.layers.Layer):
             Returns:
                 tuple: (row_indices, col_indices) as int64 arrays.
             """
-            cost_matrix = np.array(cost_matrix)
+            cost_matrix = np.array(cost_matrix, copy=True)
             # Replace non-finite values to ensure the solver converges
             cost_matrix[np.isinf(cost_matrix) | np.isnan(cost_matrix)] = 1e6
             row_ind, col_ind = linear_sum_assignment(cost_matrix)
@@ -306,7 +306,7 @@ class HungarianMatcher(keras.layers.Layer):
                         [tf.int64, tf.int64]
                     )
                 else:
-                    c_i_np = ops.convert_to_numpy(c_i_split)
+                    c_i_np = np.array(ops.convert_to_numpy(c_i_split), copy=True)
                     c_i_np[np.isinf(c_i_np) | np.isnan(c_i_np)] = 1e6
                     row_ind, col_ind = linear_sum_assignment(c_i_np)
                     row_ind = ops.convert_to_tensor(row_ind, dtype="int64")
