@@ -1,4 +1,5 @@
 import math
+import os
 import random
 import time
 import datetime
@@ -229,11 +230,17 @@ def train_one_epoch(
         multi_scale_config["scales"] if multi_scale_config is not None
         else None
     )
+    profile_steps = int(os.environ.get("RFDETR_PROFILE_STEPS", "0") or 0)
 
     start_time = time.time()
     for step, (images, targets) in enumerate(
         metric_logger.log_every(data_iterator, print_freq, header)
     ):
+        step_t0 = time.time()
+        eager_time = 0.0
+        match_time = 0.0
+        grad_time = 0.0
+        apply_time = 0.0
         global_step = epoch * num_steps + step
 
         # ---- Per-step drop path scheduling ----
@@ -299,8 +306,11 @@ def train_one_epoch(
             # ==============================================================
             # Phase 1 – Eager forward + Hungarian matching
             # ==============================================================
+            eager_t0 = time.time()
             outputs_eager = model(model_input, training=True)
+            eager_time += time.time() - eager_t0
 
+            match_t0 = time.time()
             outputs_for_match = {
                 k: v for k, v in outputs_eager.items()
                 if k not in ("aux_outputs", "enc_outputs")
@@ -324,6 +334,7 @@ def train_one_epoch(
                     outputs_eager["enc_outputs"], sub_targets,
                     group_detr=group_detr,
                 )
+            match_time += time.time() - match_t0
 
             num_boxes = sum(len(t["labels"]) for t in sub_targets)
             if not sum_group_losses:
@@ -369,7 +380,9 @@ def train_one_epoch(
                 return total_loss, updated_nt
 
             grad_fn = jax.value_and_grad(forward_and_loss, has_aux=True)
+            grad_t0 = time.time()
             (sub_loss, updated_nt), sub_grads = grad_fn(trainable_values)
+            grad_time += time.time() - grad_t0
 
             # Cast gradients to float32 when AMP is enabled
             if amp:
@@ -396,6 +409,8 @@ def train_one_epoch(
 
         # Detect gradient overflow — skip the optimiser step entirely
         # (similar to GradScaler behaviour in mixed-precision training)
+        apply_t0 = time.time()
+
         if _has_nan_or_inf(grads):
             import logging as _logging
             _logging.getLogger(__name__).warning(
@@ -425,6 +440,7 @@ def train_one_epoch(
         # Per-step EMA update
         if ema_m is not None:
             ema_m.update(model)
+        apply_time += time.time() - apply_t0
 
         # ---- logging -----------------------------------------------------
         loss_value = accumulated_loss
@@ -441,6 +457,20 @@ def train_one_epoch(
         else:
             lr_val = 0.0
         metric_logger.update(loss=loss_value, lr=lr_val)
+
+        if profile_steps > 0 and step < profile_steps:
+            step_time = time.time() - step_t0
+            other_time = max(
+                0.0, step_time - eager_time - match_time
+                - grad_time - apply_time
+            )
+            print(
+                f"{header} profile step {step}: total={step_time:.3f}s "
+                f"eager={eager_time:.3f}s match={match_time:.3f}s "
+                f"grad={grad_time:.3f}s apply={apply_time:.3f}s "
+                f"other={other_time:.3f}s",
+                flush=True,
+            )
 
         if step >= num_steps - 1:
             break

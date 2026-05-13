@@ -44,6 +44,7 @@ set -euo pipefail
 
 export KERAS_BACKEND=jax
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export RFDETR_PROFILE_STEPS=5
 
 PYTHON="${PYTHON:-python3}"
 
