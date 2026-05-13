@@ -7,6 +7,7 @@ import keras
 from keras import ops
 
 import jax
+import jax.numpy as jnp
 
 from paz.models.detection.dino_v2_object_detection.utils.misc import (
     MetricLogger,
@@ -85,8 +86,12 @@ class LambdaLRSchedule(keras.optimizers.schedules.LearningRateSchedule):
         self.lr_lambda = lr_lambda
 
     def __call__(self, step):
-        return self.base_lr * self.lr_lambda(int(step))
-
+        try:
+            step = int(step)
+        except TypeError:
+            step = int(np.asarray(ops.convert_to_numpy(step)))
+        return self.base_lr * self.lr_lambda(step)
+    
     def get_config(self):
         return {"base_lr": self.base_lr}
 
@@ -536,13 +541,16 @@ def _has_nan_or_inf(grads):
     Returns:
         bool
     """
-    for g in grads:
-        if g is None:
-            continue
-        g_np = np.asarray(g)
-        if not np.all(np.isfinite(g_np)):
-            return True
-    return False
+    finite_checks = [
+        jnp.all(jnp.isfinite(g)) for g in grads if g is not None
+    ]
+    if not finite_checks:
+        return False
+
+    # Sync only a single scalar boolean.  Converting every full gradient
+    # tensor to NumPy here forces large host transfers on every train step.
+    all_finite = jnp.all(jnp.stack(finite_checks))
+    return not bool(jax.device_get(all_finite))
 
 
 def _clip_grad_norm(grads, max_norm):
@@ -901,4 +909,3 @@ def coco_extended_metrics(coco_eval):
         "precision": best["macro_precision"],
         "recall": best["macro_recall"],
     }
-
