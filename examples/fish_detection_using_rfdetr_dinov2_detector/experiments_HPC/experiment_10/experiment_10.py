@@ -43,7 +43,10 @@ Hyperparameters (identical to Experiment 5):
 """
 
 import os
-os.environ.setdefault("KERAS_BACKEND", "jax")
+# Must be set before importing keras/paz. ``setdefault`` is not enough here:
+# cluster/container environments may already define KERAS_BACKEND=tensorflow,
+# which would build tf.Variable weights that JAX cannot differentiate.
+os.environ["KERAS_BACKEND"] = "jax"
 import sys
 import json
 import math
