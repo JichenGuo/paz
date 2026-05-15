@@ -27,9 +27,9 @@
 ###############################################################################
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=jichen.guo@dfki.de
-#SBATCH --job-name=rfdetr_exp9_native_aug
-#SBATCH --partition=gpu_ampere
-#SBATCH --gres=gpu:a100:1
+#SBATCH --job-name=rfdetr_exp10_native_aug
+#SBATCH --partition=gpu_volta
+#SBATCH --gres=gpu:volta:1
 #SBATCH --account=deepl
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -44,14 +44,16 @@ set -euo pipefail
 
 export KERAS_BACKEND=jax
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export RFDETR_PROFILE_STEPS=5
+export RFDETR_PROFILE_STEPS=3
+export CUDA_VISIBLE_DEVICES=${SLURM_JOB_GPUS:-$CUDA_VISIBLE_DEVICES}
 
 PYTHON="${PYTHON:-python3}"
 
 EXP_BASE="/mnt/beegfs/home/jguo/projects/fish_detector_using_rfdetr/paz/examples/fish_detection_using_rfdetr_dinov2_detector/experiments_HPC/experiment_10"
 mkdir -p "${EXP_BASE}/checkpoints" "${EXP_BASE}/plots"
 
-export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_strict_conv_algorithm_picker=false --xla_gpu_autotune_level=0 --xla_gpu_enable_triton_gemm=false"
+#export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_strict_conv_algorithm_picker=false --xla_gpu_autotune_level=0 --xla_gpu_enable_triton_gemm=false"
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_strict_conv_algorithm_picker=false"
 
 SCRIPT_DIR="/mnt/beegfs/home/jguo/projects/fish_detector_using_rfdetr/paz/examples/fish_detection_using_rfdetr_dinov2_detector"
 
@@ -94,13 +96,23 @@ echo "============================================================"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-not_set}"
 echo "SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-not_set}"
 
-nvidia-smi
-
-${PYTHON} -c "
+echo "Running JAX device diagnostics..."
+${PYTHON} - <<'PY'
+import os
 import jax
-print(jax.devices())
-print(jax.default_backend())
-"
+print('ENV: CUDA_VISIBLE_DEVICES=', os.environ.get('CUDA_VISIBLE_DEVICES'))
+print('ENV: SLURM_JOB_GPUS=', os.environ.get('SLURM_JOB_GPUS'))
+print('ENV: SLURM_STEP_GPUS=', os.environ.get('SLURM_STEP_GPUS'))
+print('jax.devices():', jax.devices())
+print('jax.default_backend():', jax.default_backend())
+PY
+
+nvidia-smi \
+  --query-gpu=timestamp,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw \
+  --format=csv \
+  -lms 200 \
+  > "${EXP_BASE}/gpu_usage.log" &
+  
 ${PYTHON} "${SCRIPT_DIR}/experiments_HPC/experiment_10/experiment_10.py"
 
 
