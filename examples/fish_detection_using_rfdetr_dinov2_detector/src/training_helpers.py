@@ -1251,7 +1251,7 @@ def train_one_epoch_custom(
 
             return total_loss, updated_nt
 
-        grad_fn = jax.value_and_grad(forward_and_loss, has_aux=True)
+        grad_fn = jax.jit(jax.value_and_grad(forward_and_loss, has_aux=True))
         (total_loss, updated_nt), grads = grad_fn(trainable_values)
 
         # ==============================================================

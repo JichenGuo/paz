@@ -379,7 +379,7 @@ def train_one_epoch(
                 )
                 return total_loss, updated_nt
 
-            grad_fn = jax.value_and_grad(forward_and_loss, has_aux=True)
+            grad_fn = jax.jit(jax.value_and_grad(forward_and_loss, has_aux=True))
             grad_t0 = time.time()
             (sub_loss, updated_nt), sub_grads = grad_fn(trainable_values)
             grad_time += time.time() - grad_t0
