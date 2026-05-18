@@ -29,9 +29,8 @@ Differences vs Experiment 5:
 Hyperparameters (identical to Experiment 5):
   - Variant:        RFDETRNano
   - Resolution:     384 × 384
-  - Epochs:         100
-#  - Batch size:     16 (grad_accum_steps=1, effective batch = 16)
-  - Batch size:     4 (grad_accum_steps=4, effective batch = 16)
+  - Epochs:         20 by default (override with RFDETR_EPOCHS)
+  - Batch size:     16 (grad_accum_steps=1, effective batch = 16)
 
   - LR:             1e-4 cosine → 0   (warmup = 0 epochs)
   - LR encoder:     1.5e-4
@@ -104,6 +103,11 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import keras
 print("Keras backend:", keras.backend.backend())
+try:
+    import jax
+    print("JAX devices:", jax.devices())
+except Exception as exc:
+    print("JAX device diagnostics unavailable:", exc)
 
 # ---------------------------------------------------------------------------
 # Project imports (after path setup and engine patch)
@@ -118,6 +122,20 @@ from train_utils import prepare_coco_dataset, setup_logging, validate_epoch_full
 from metrics_tracker import MetricsTracker
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name, default):
+    """Read a positive integer from the environment."""
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be > 0, got {parsed}")
+    return parsed
 
 
 
@@ -442,9 +460,14 @@ def main():
     logger.info("EXPERIMENT 10: RF-DETR Nano — Native RF-DETR Augmentation")
     logger.info("=" * 68)
 
-    BATCH_SIZE = 4 #16
-    GRAD_ACCUM_STEPS = 4
-    EPOCHS = 11 # 100 define
+    # RF-DETR's loader uses batch_size * grad_accum_steps, then the engine
+    # splits that batch into grad_accum_steps micro-batches.  So these defaults
+    # keep effective batch = 16 while increasing the actual GPU micro-batch
+    # from 4 to 16 versus the previous 4 x 4 setup.
+    BATCH_SIZE = _env_int("RFDETR_BATCH_SIZE", 16)
+    GRAD_ACCUM_STEPS = _env_int("RFDETR_GRAD_ACCUM_STEPS", 1)
+    NUM_WORKERS = _env_int("RFDETR_NUM_WORKERS", 4)
+    EPOCHS = _env_int("RFDETR_EPOCHS", 20)
     BASE_LR = 1e-4
     WARMUP_EPOCHS = 0.0
     TRAIN_EVAL_INTERVAL = 10
@@ -517,7 +540,7 @@ def main():
         eval_interval=0,
         eval_ema=False,
         amp=True,
-        num_workers=2,
+        num_workers=NUM_WORKERS,
         run_test=False,
         class_names=eval_ds.class_names,
     )
@@ -579,7 +602,7 @@ def main():
         "multi_scale": False,
         "expanded_scales": False,
         "square_resize_div_64": True,
-        "num_workers": 2,
+        "num_workers": NUM_WORKERS,
         "amp": True,
         "built_in_eval_interval": 0,
         "built_in_eval_ema": False,

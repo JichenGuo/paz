@@ -45,6 +45,10 @@ set -euo pipefail
 export KERAS_BACKEND=jax
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export RFDETR_PROFILE_STEPS=3
+export RFDETR_BATCH_SIZE="${RFDETR_BATCH_SIZE:-16}"
+export RFDETR_GRAD_ACCUM_STEPS="${RFDETR_GRAD_ACCUM_STEPS:-1}"
+export RFDETR_NUM_WORKERS="${RFDETR_NUM_WORKERS:-4}"
+export RFDETR_EPOCHS="${RFDETR_EPOCHS:-20}"
 export CUDA_VISIBLE_DEVICES=${SLURM_JOB_GPUS:-$CUDA_VISIBLE_DEVICES}
 
 PYTHON="${PYTHON:-python3}"
@@ -72,9 +76,9 @@ echo "  API            : RFDETRNano.train_from_config (high-level)"
 echo "  Augmentation   : native RF-DETR (RandomHorizontalFlip +"
 echo "                   RandomSelect(SquareResize | RandomSizeCrop+"
 echo "                   SquareResize)) + ImageNet norm"
-echo "  Epochs         : 100"
-echo "  Batch size     : 4"
-echo "  Grad accum     : 4 (effective batch = 16)"
+echo "  Epochs         : ${RFDETR_EPOCHS}"
+echo "  Batch size     : ${RFDETR_BATCH_SIZE}"
+echo "  Grad accum     : ${RFDETR_GRAD_ACCUM_STEPS} (effective batch = $((RFDETR_BATCH_SIZE * RFDETR_GRAD_ACCUM_STEPS)))"
 echo "  Base LR        : 1e-4"
 echo "  LR schedule    : cosine -> 0 (warmup=0)"
 echo "  Encoder LR     : 1.5e-4"
@@ -95,6 +99,10 @@ echo "============================================================"
 
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-not_set}"
 echo "SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-not_set}"
+echo "RFDETR_BATCH_SIZE=${RFDETR_BATCH_SIZE}"
+echo "RFDETR_GRAD_ACCUM_STEPS=${RFDETR_GRAD_ACCUM_STEPS}"
+echo "RFDETR_NUM_WORKERS=${RFDETR_NUM_WORKERS}"
+echo "RFDETR_EPOCHS=${RFDETR_EPOCHS}"
 
 echo "Running JAX device diagnostics..."
 ${PYTHON} - <<'PY'
