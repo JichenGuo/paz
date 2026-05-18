@@ -231,6 +231,9 @@ def train_one_epoch(
         else None
     )
     profile_steps = int(os.environ.get("RFDETR_PROFILE_STEPS", "0") or 0)
+    jit_grad = os.environ.get("RFDETR_JIT_GRAD", "1").lower() not in (
+        "0", "false", "no",
+    )
 
     start_time = time.time()
     for step, (images, targets) in enumerate(
@@ -379,7 +382,9 @@ def train_one_epoch(
                 )
                 return total_loss, updated_nt
 
-            grad_fn = jax.jit(jax.value_and_grad(forward_and_loss, has_aux=True))
+            grad_fn = jax.value_and_grad(forward_and_loss, has_aux=True)
+            if jit_grad:
+                grad_fn = jax.jit(grad_fn)
             grad_t0 = time.time()
             (sub_loss, updated_nt), sub_grads = grad_fn(trainable_values)
             grad_time += time.time() - grad_t0
