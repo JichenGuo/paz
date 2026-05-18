@@ -30,9 +30,10 @@ from paz.models.detection.dino_v2_object_detection.detr import RFDETRNano
 
 DEFAULT_CHECKPOINT = _SCRIPT_DIR / "checkpoints" / "rfdetr_nano_best.weights.h5"
 DEFAULT_CLASS_NAMES = ["fish"]
-BOX_COLOR = (0, 180, 255)
-TEXT_COLOR = (255, 255, 255)
+BOX_COLOR = (255, 0, 0)
+TEXT_COLOR = (255, 0, 0)
 TEXT_BG_COLOR = (0, 120, 170)
+TEXT_FONT_SIZE = 32
 
 
 def parse_args():
@@ -111,7 +112,10 @@ def label_name(label, class_names):
 def draw_detections(image, detections, class_names):
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
-    font = ImageFont.load_default()
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", TEXT_FONT_SIZE)
+    except OSError:
+        font = ImageFont.load_default()
     width, height = annotated.size
 
     for box, score, label in zip(
