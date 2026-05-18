@@ -166,7 +166,7 @@ class ExperimentTracker:
         conf_threshold=0.3,
         iou_threshold=0.5,
         val_eval_interval=1,
-        train_eval_interval=10,
+        train_eval_interval=1,
         early_stopping_patience=10,
         early_stopping_min_delta=0.001,
 
