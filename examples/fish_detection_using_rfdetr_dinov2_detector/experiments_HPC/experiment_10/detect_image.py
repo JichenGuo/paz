@@ -30,6 +30,7 @@ from paz.models.detection.dino_v2_object_detection.detr import RFDETRNano
 
 DEFAULT_CHECKPOINT = _SCRIPT_DIR / "checkpoints" / "rfdetr_nano_best.weights.h5"
 DEFAULT_CLASS_NAMES = ["fish"]
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 BOX_COLOR = (255, 0, 0)
 TEXT_COLOR = (255, 0, 0)
 TEXT_BG_COLOR = (0, 120, 170)
@@ -40,13 +41,13 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Load the Experiment 10 best RF-DETR Nano checkpoint and run "
-            "detection on a new image."
+            "detection on one image or every image in a folder."
         )
     )
     parser.add_argument(
         "--image",
         required=True,
-        help="Path to the input image.",
+        help="Path to an input image or a folder of images.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -56,12 +57,15 @@ def parse_args():
     parser.add_argument(
         "--output",
         default=None,
-        help="Path for the annotated output image. Defaults next to input.",
+        help=(
+            "Path for the annotated output image, or output directory when "
+            "--image is a folder. Defaults next to the input."
+        ),
     )
     parser.add_argument(
         "--json-output",
         default=None,
-        help="Path for detection JSON. Defaults next to annotated image.",
+        help="Path for detection JSON. Folder mode writes one combined JSON.",
     )
     parser.add_argument(
         "--threshold",
@@ -74,12 +78,75 @@ def parse_args():
         default=",".join(DEFAULT_CLASS_NAMES),
         help="Comma-separated class names. Experiment 10 defaults to fish.",
     )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="When --image is a folder, scan images recursively.",
+    )
     return parser.parse_args()
 
 
 def load_rgb_image(image_path):
     image = Image.open(image_path).convert("RGB")
     return image, np.asarray(image, dtype=np.uint8)
+
+
+def collect_image_paths(input_path, recursive=False):
+    if input_path.is_file():
+        if input_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            raise ValueError(f"Unsupported image extension: {input_path}")
+        return [input_path]
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"Input image/folder not found: {input_path}")
+
+    pattern = "**/*" if recursive else "*"
+    image_paths = sorted(
+        path
+        for path in input_path.glob(pattern)
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if not image_paths:
+        raise FileNotFoundError(
+            f"No images found in {input_path}. Supported extensions: "
+            f"{', '.join(sorted(IMAGE_EXTENSIONS))}"
+        )
+    return image_paths
+
+
+def make_output_paths(input_path, image_paths, args):
+    folder_mode = input_path.is_dir()
+    if folder_mode:
+        if args.output is None:
+            output_dir = input_path / "experiment_10_detections"
+        else:
+            output_dir = Path(args.output).expanduser().resolve()
+        json_path = (
+            output_dir / "detections.json"
+            if args.json_output is None
+            else Path(args.json_output).expanduser().resolve()
+        )
+        output_paths = {
+            image_path: output_dir / f"{image_path.stem}_detected.jpg"
+            for image_path in image_paths
+        }
+    else:
+        image_path = image_paths[0]
+        output_path = (
+            image_path.with_name(f"{image_path.stem}_experiment_10_detected.jpg")
+            if args.output is None
+            else Path(args.output).expanduser().resolve()
+        )
+        json_path = (
+            output_path.with_suffix(".json")
+            if args.json_output is None
+            else Path(args.json_output).expanduser().resolve()
+        )
+        output_paths = {image_path: output_path}
+
+    for output_path in output_paths.values():
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    return output_paths, json_path
 
 
 def build_model(checkpoint_path):
@@ -163,55 +230,63 @@ def detections_to_records(detections, class_names):
 
 def main():
     args = parse_args()
-    image_path = Path(args.image).expanduser().resolve()
+    input_path = Path(args.image).expanduser().resolve()
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     class_names = [name.strip() for name in args.class_names.split(",") if name.strip()]
 
-    if not image_path.exists():
-        raise FileNotFoundError(f"Input image not found: {image_path}")
     if not class_names:
         raise ValueError("--class-names must contain at least one class name")
 
-    if args.output is None:
-        output_path = image_path.with_name(f"{image_path.stem}_experiment_10_detected.jpg")
-    else:
-        output_path = Path(args.output).expanduser().resolve()
-    if args.json_output is None:
-        json_path = output_path.with_suffix(".json")
-    else:
-        json_path = Path(args.json_output).expanduser().resolve()
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
+    image_paths = collect_image_paths(input_path, recursive=args.recursive)
+    output_paths, json_path = make_output_paths(input_path, image_paths, args)
 
     print(f"Loading checkpoint: {checkpoint_path}")
     detector = build_model(checkpoint_path)
 
-    image, image_array = load_rgb_image(image_path)
-    result = detector.predict(image_array, threshold=args.threshold)[0]
-    records = detections_to_records(result, class_names)
-
-    annotated = draw_detections(image, result, class_names)
-    annotated.save(output_path)
-
     payload = {
-        "image": str(image_path),
+        "input": str(input_path),
         "checkpoint": str(checkpoint_path),
         "threshold": args.threshold,
-        "num_detections": len(records),
-        "detections": records,
+        "num_images": len(image_paths),
+        "images": [],
     }
+
+    total_detections = 0
+    for index, image_path in enumerate(image_paths, start=1):
+        output_path = output_paths[image_path]
+        print(f"[{index}/{len(image_paths)}] Detecting: {image_path}")
+
+        image, image_array = load_rgb_image(image_path)
+        result = detector.predict(image_array, threshold=args.threshold)[0]
+        records = detections_to_records(result, class_names)
+        total_detections += len(records)
+
+        annotated = draw_detections(image, result, class_names)
+        annotated.save(output_path)
+
+        payload["images"].append(
+            {
+                "image": str(image_path),
+                "annotated_image": str(output_path),
+                "num_detections": len(records),
+                "detections": records,
+            }
+        )
+
+        print(f"  Detections: {len(records)}")
+        for record in records:
+            box = ", ".join(f"{v:.1f}" for v in record["box_xyxy"])
+            print(
+                f"    {record['class_name']} score={record['score']:.3f} "
+                f"box=[{box}]"
+            )
+
+    payload["total_detections"] = total_detections
     with open(json_path, "w") as f:
         json.dump(payload, f, indent=2)
 
-    print(f"Detections: {len(records)}")
-    for record in records:
-        box = ", ".join(f"{v:.1f}" for v in record["box_xyxy"])
-        print(
-            f"  {record['class_name']} score={record['score']:.3f} "
-            f"box=[{box}]"
-        )
-    print(f"Annotated image: {output_path}")
+    print(f"Processed images: {len(image_paths)}")
+    print(f"Total detections: {total_detections}")
     print(f"Detection JSON: {json_path}")
 
 
