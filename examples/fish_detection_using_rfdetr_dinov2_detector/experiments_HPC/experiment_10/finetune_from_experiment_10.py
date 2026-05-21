@@ -66,7 +66,7 @@ def parse_args():
         default=str(DEFAULT_OUTPUT_DIR),
         help="Directory for fine-tuning checkpoints/logs.",
     )
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
