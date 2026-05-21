@@ -29,12 +29,10 @@ from pathlib import Path
 
 
 DEFAULT_SOURCE_DIR = Path(
-    "/home/dfki.uni-bremen.de/jguo/SeaMe/paz/"
-    "datasets/Labelimage_Fish_coco/train"
+    "/mnt/beegfs/home/jguo/datasets/Labelimage_Fish_coco/train"
 )
 DEFAULT_OUTPUT_DIR = Path(
-    "/home/dfki.uni-bremen.de/jguo/SeaMe/paz/"
-    "datasets/Labelimage_Fish_coco_split_70_20_10"
+    "/mnt/beegfs/home/jguo/datasets/Labelimage_Fish_coco_split_70_20_10"
 )
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
