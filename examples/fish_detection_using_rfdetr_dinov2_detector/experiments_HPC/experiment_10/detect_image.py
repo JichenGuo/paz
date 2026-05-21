@@ -75,8 +75,12 @@ def parse_args():
     )
     parser.add_argument(
         "--class-names",
-        default=",".join(DEFAULT_CLASS_NAMES),
-        help="Comma-separated class names. Experiment 10 defaults to fish.",
+        default=None,
+        help=(
+            "Comma-separated class names. When omitted, this is read from "
+            "finetune_config.json next to the checkpoint when available, "
+            "otherwise defaults to fish."
+        ),
     )
     parser.add_argument(
         "--recursive",
@@ -149,21 +153,47 @@ def make_output_paths(input_path, image_paths, args):
     return output_paths, json_path
 
 
-def build_model(checkpoint_path):
+def read_finetune_class_names(checkpoint_path):
+    config_path = checkpoint_path.parent / "finetune_config.json"
+    if not config_path.exists():
+        return None
+
+    with config_path.open() as f:
+        config = json.load(f)
+    class_names = config.get("class_names")
+    if not class_names:
+        return None
+    return [str(name) for name in class_names]
+
+
+def resolve_class_names(args, checkpoint_path):
+    if args.class_names is not None:
+        class_names = [
+            name.strip() for name in args.class_names.split(",") if name.strip()
+        ]
+    else:
+        class_names = read_finetune_class_names(checkpoint_path) or DEFAULT_CLASS_NAMES
+
+    if not class_names:
+        raise ValueError("--class-names must contain at least one class name")
+    return class_names
+
+
+def build_model(checkpoint_path, class_names):
     if not checkpoint_path.exists():
         raise FileNotFoundError(
             f"Checkpoint not found: {checkpoint_path}\n"
             "Train experiment_10 first or pass --checkpoint /path/to/model.weights.h5"
         )
 
-    detector = RFDETRNano(num_classes=1)
+    detector = RFDETRNano(num_classes=len(class_names))
 
     # Build all layers before loading the H5 weights.
     resolution = detector.model_config.resolution
     dummy = np.ones((1, resolution, resolution, 3), dtype="float32") * 0.5
     detector.model.model(dummy, training=False)
-    detector.model.model.load_weights(str(checkpoint_path))
-    detector.model.class_names = DEFAULT_CLASS_NAMES
+    detector.model.load_pretrained_weights(str(checkpoint_path))
+    detector.model.class_names = class_names
     return detector
 
 
@@ -232,20 +262,19 @@ def main():
     args = parse_args()
     input_path = Path(args.image).expanduser().resolve()
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
-    class_names = [name.strip() for name in args.class_names.split(",") if name.strip()]
-
-    if not class_names:
-        raise ValueError("--class-names must contain at least one class name")
+    class_names = resolve_class_names(args, checkpoint_path)
 
     image_paths = collect_image_paths(input_path, recursive=args.recursive)
     output_paths, json_path = make_output_paths(input_path, image_paths, args)
 
     print(f"Loading checkpoint: {checkpoint_path}")
-    detector = build_model(checkpoint_path)
+    print(f"Classes ({len(class_names)}): {class_names}")
+    detector = build_model(checkpoint_path, class_names)
 
     payload = {
         "input": str(input_path),
         "checkpoint": str(checkpoint_path),
+        "class_names": class_names,
         "threshold": args.threshold,
         "num_images": len(image_paths),
         "images": [],
