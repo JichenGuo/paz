@@ -234,8 +234,12 @@ def augment_rare_image(image, rng, hflip_prob, jitter_strength):
 
 
 def flip_bbox_xywh(bbox, image_width):
-    x, y, w, h = bbox
+    x, y, w, h = [float(value) for value in bbox]
     return [image_width - x - w, y, w, h]
+
+
+def normalize_bbox_xywh(bbox):
+    return [float(value) for value in bbox]
 
 
 def copy_existing_split(source_dir, target_dir, split_name, copy_mode):
@@ -347,6 +351,10 @@ def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
                     new_annotation["bbox"] = flip_bbox_xywh(
                         list(new_annotation["bbox"]),
                         image["width"],
+                    )
+                else:
+                    new_annotation["bbox"] = normalize_bbox_xywh(
+                        list(new_annotation["bbox"])
                     )
                 new_annotations.append(new_annotation)
                 next_annotation_id += 1
