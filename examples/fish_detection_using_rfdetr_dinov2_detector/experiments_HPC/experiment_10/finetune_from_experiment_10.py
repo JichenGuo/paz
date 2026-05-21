@@ -265,6 +265,11 @@ def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
         if name.strip()
     ]
     if args.rare_repeat_factor <= 0 or not rare_names:
+        print(
+            "Rare-class oversampling disabled. To enable it, pass "
+            "--oversample-classes and --rare-repeat-factor > 0.",
+            flush=True,
+        )
         return source_dataset_dir
 
     prepared_dir = (
@@ -272,6 +277,11 @@ def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
         if args.oversampled_dataset_dir
         else output_dir / "oversampled_dataset"
     )
+    print("Preparing oversampled dataset ...", flush=True)
+    print(f"  Source      : {source_dataset_dir}", flush=True)
+    print(f"  Destination : {prepared_dir}", flush=True)
+    print(f"  Rare classes: {rare_names}", flush=True)
+    print(f"  Repeat      : {args.rare_repeat_factor}", flush=True)
     if prepared_dir.exists():
         if not args.overwrite_oversampled_dataset:
             raise FileExistsError(
@@ -311,6 +321,11 @@ def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
     new_images = [dict(image) for image in coco["images"]]
     new_annotations = [dict(annotation) for annotation in coco["annotations"]]
 
+    print(
+        f"Linking/copying {len(coco['images'])} original train images "
+        f"using mode={args.oversample_copy_mode} ...",
+        flush=True,
+    )
     for image in coco["images"]:
         src = train_dir / image["file_name"]
         if not src.exists():
@@ -321,7 +336,14 @@ def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
     next_image_id = max(image["id"] for image in new_images) + 1
     next_annotation_id = max(annotation["id"] for annotation in new_annotations) + 1
 
-    for image in rare_images:
+    total_augmented = len(rare_images) * args.rare_repeat_factor
+    completed_augmented = 0
+    print(
+        f"Creating {total_augmented} augmented rare-class images "
+        f"from {len(rare_images)} source images ...",
+        flush=True,
+    )
+    for image_index, image in enumerate(rare_images, start=1):
         source_path = train_dir / image["file_name"]
         image_annotations = anns_by_image.get(image["id"], [])
         stem = Path(image["file_name"]).stem
@@ -337,6 +359,7 @@ def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
             )
             new_file_name = f"{stem}__rare_aug_{repeat_index + 1:02d}{suffix}"
             aug_image.save(prepared_train_dir / new_file_name)
+            completed_augmented += 1
 
             new_image = dict(image)
             new_image["id"] = next_image_id
@@ -361,11 +384,20 @@ def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
 
             next_image_id += 1
 
+            if completed_augmented == 1 or completed_augmented % 25 == 0:
+                print(
+                    f"  Augmented {completed_augmented}/{total_augmented} "
+                    f"(source image {image_index}/{len(rare_images)})",
+                    flush=True,
+                )
+
     new_coco["images"] = new_images
     new_coco["annotations"] = new_annotations
+    print("Writing oversampled train annotations ...", flush=True)
     with (prepared_train_dir / "_annotations.coco.json").open("w") as f:
         json.dump(new_coco, f, indent=2)
 
+    print("Linking/copying val/test splits ...", flush=True)
     copy_existing_split(source_dataset_dir, prepared_dir, "val", args.oversample_copy_mode)
     copy_existing_split(source_dataset_dir, prepared_dir, "test", args.oversample_copy_mode)
 
@@ -385,13 +417,13 @@ def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
     with (prepared_dir / "oversampling_summary.json").open("w") as f:
         json.dump(summary, f, indent=2)
 
-    print("Prepared oversampled dataset:")
-    print(f"  Source             : {source_dataset_dir}")
-    print(f"  Prepared           : {prepared_dir}")
-    print(f"  Rare classes       : {rare_names}")
-    print(f"  Rare images        : {len(rare_images)}")
-    print(f"  Train images       : {len(coco['images'])} -> {len(new_images)}")
-    print(f"  Object counts      : {before_counts} -> {after_counts}")
+    print("Prepared oversampled dataset:", flush=True)
+    print(f"  Source             : {source_dataset_dir}", flush=True)
+    print(f"  Prepared           : {prepared_dir}", flush=True)
+    print(f"  Rare classes       : {rare_names}", flush=True)
+    print(f"  Rare images        : {len(rare_images)}", flush=True)
+    print(f"  Train images       : {len(coco['images'])} -> {len(new_images)}", flush=True)
+    print(f"  Object counts      : {before_counts} -> {after_counts}", flush=True)
     return prepared_dir
 
 
