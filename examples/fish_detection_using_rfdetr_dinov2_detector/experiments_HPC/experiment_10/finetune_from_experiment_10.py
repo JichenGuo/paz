@@ -6,11 +6,11 @@ The new dataset is expected to be in COCO/RoboFlow layout:
     dataset_dir/
       train/_annotations.coco.json
       train/*.jpg|*.png
-      val/_annotations.coco.json
-      val/*.jpg|*.png
+      valid/_annotations.coco.json
+      valid/*.jpg|*.png
 
-If your validation split is named ``valid`` instead of ``val``, create a
-``val`` symlink or pass a dataset directory that already has both splits.
+If your validation split is named ``val`` instead of ``valid``, the script
+creates a ``valid`` symlink or copy automatically.
 """
 
 import argparse
@@ -397,8 +397,8 @@ def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
     with (prepared_train_dir / "_annotations.coco.json").open("w") as f:
         json.dump(new_coco, f, indent=2)
 
-    print("Linking/copying val/test splits ...", flush=True)
-    copy_existing_split(source_dataset_dir, prepared_dir, "val", args.oversample_copy_mode)
+    print("Linking/copying valid/test splits ...", flush=True)
+    copy_existing_split(source_dataset_dir, prepared_dir, "valid", args.oversample_copy_mode)
     copy_existing_split(source_dataset_dir, prepared_dir, "test", args.oversample_copy_mode)
 
     before_counts = count_objects_by_class(coco)
@@ -427,21 +427,21 @@ def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
     return prepared_dir
 
 
-def ensure_val_split(dataset_dir):
+def ensure_valid_split(dataset_dir):
     val_dir = dataset_dir / "val"
     valid_dir = dataset_dir / "valid"
-    if val_dir.exists():
-        return
     if valid_dir.exists():
+        return
+    if val_dir.exists():
         try:
-            val_dir.symlink_to(valid_dir.resolve(), target_is_directory=True)
-            print(f"Created symlink: {val_dir} -> {valid_dir}")
+            valid_dir.symlink_to(val_dir.resolve(), target_is_directory=True)
+            print(f"Created symlink: {valid_dir} -> {val_dir}")
         except OSError:
-            shutil.copytree(valid_dir, val_dir)
-            print(f"Copied validation split: {valid_dir} -> {val_dir}")
+            shutil.copytree(val_dir, valid_dir)
+            print(f"Copied validation split: {val_dir} -> {valid_dir}")
         return
     raise FileNotFoundError(
-        f"Missing validation split: expected {val_dir} or {valid_dir}"
+        f"Missing validation split: expected {valid_dir} or {val_dir}"
     )
 
 
@@ -506,9 +506,9 @@ def main():
     source_checkpoint = Path(args.source_checkpoint).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
 
-    ensure_val_split(dataset_dir)
+    ensure_valid_split(dataset_dir)
     dataset_dir = prepare_oversampled_dataset(args, dataset_dir, output_dir)
-    ensure_val_split(dataset_dir)
+    ensure_valid_split(dataset_dir)
     class_names = read_coco_classes(dataset_dir)
     print(f"Dataset: {dataset_dir}")
     print(f"Classes ({len(class_names)}): {class_names}")
