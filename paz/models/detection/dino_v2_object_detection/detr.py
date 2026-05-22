@@ -140,11 +140,14 @@ class RFDETR:
             )
             with open(ann_path, "r") as f:
                 anns = json.load(f)
-            num_classes = len(anns["categories"])
+            categories = [
+                c for c in anns["categories"]
+                if c.get("supercategory", "") != "none"
+            ]
+            num_classes = len(categories)
             class_names = [
                 c["name"]
-                for c in anns["categories"]
-                if c.get("supercategory", "") != "none"
+                for c in categories
             ]
             self.model.class_names = class_names
         elif config.dataset_file == "coco":
