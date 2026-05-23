@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Split one COCO/RoboFlow image folder into train/val/test datasets.
+"""Split one COCO/RoboFlow image folder into train/valid/test datasets.
 
 Input example:
 
@@ -12,8 +12,8 @@ Output example:
     datasets/Labelimage_Fish_coco_split_70_20_10/
       train/_annotations.coco.json
       train/*.png
-      val/_annotations.coco.json
-      val/*.png
+      valid/_annotations.coco.json
+      valid/*.png
       test/_annotations.coco.json
       test/*.png
 
@@ -40,7 +40,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Randomly split a COCO/RoboFlow dataset into train/val/test "
+            "Randomly split a COCO/RoboFlow dataset into train/valid/test "
             "folders suitable for RF-DETR fine-tuning."
         )
     )
@@ -116,15 +116,15 @@ def split_images(images, train_ratio, val_ratio, seed):
     if min(train_count, val_count, test_count) <= 0:
         raise ValueError(
             "Dataset is too small for the requested split: "
-            f"train={train_count}, val={val_count}, test={test_count}"
+            f"train={train_count}, valid={val_count}, test={test_count}"
         )
 
     train_images = shuffled[:train_count]
-    val_images = shuffled[train_count:train_count + val_count]
+    valid_images = shuffled[train_count:train_count + val_count]
     test_images = shuffled[train_count + val_count:]
     return {
         "train": train_images,
-        "val": val_images,
+        "valid": valid_images,
         "test": test_images,
     }
 
@@ -223,7 +223,7 @@ def main():
         "seed": args.seed,
         "ratios": {
             "train": args.train_ratio,
-            "val": args.val_ratio,
+            "valid": args.val_ratio,
             "test": args.test_ratio,
         },
         "copy_mode": args.copy_mode,
