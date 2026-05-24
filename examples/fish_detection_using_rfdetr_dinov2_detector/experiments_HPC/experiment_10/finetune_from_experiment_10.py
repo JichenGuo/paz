@@ -83,6 +83,28 @@ def parse_args():
     parser.add_argument("--no-ema", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument(
+        "--include-classes",
+        default="",
+        help=(
+            "Comma-separated class names to keep for training/validation, "
+            "e.g. 'fish'. Other class annotations are removed and treated as "
+            "background. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--filtered-dataset-dir",
+        default=None,
+        help=(
+            "Where to write the generated class-filtered dataset. Defaults to "
+            "OUTPUT_DIR/filtered_dataset."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite-filtered-dataset",
+        action="store_true",
+        help="Remove the generated class-filtered dataset first if it exists.",
+    )
+    parser.add_argument(
         "--oversample-classes",
         default="",
         help=(
@@ -256,6 +278,131 @@ def copy_existing_split(source_dir, target_dir, split_name, copy_mode):
             shutil.copy2(path, target_path)
         elif path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
             copy_or_link(path, target_path, copy_mode)
+
+
+def prepare_class_filtered_dataset(args, source_dataset_dir, output_dir):
+    included_names = [
+        name.strip()
+        for name in args.include_classes.split(",")
+        if name.strip()
+    ]
+    if not included_names:
+        return source_dataset_dir
+
+    prepared_dir = (
+        Path(args.filtered_dataset_dir).expanduser().resolve()
+        if args.filtered_dataset_dir
+        else output_dir / "filtered_dataset"
+    )
+    print("Preparing class-filtered dataset ...", flush=True)
+    print(f"  Source       : {source_dataset_dir}", flush=True)
+    print(f"  Destination  : {prepared_dir}", flush=True)
+    print(f"  Include only : {included_names}", flush=True)
+    if prepared_dir.exists():
+        if not args.overwrite_filtered_dataset:
+            raise FileExistsError(
+                f"Filtered dataset already exists: {prepared_dir}\n"
+                "Use --overwrite-filtered-dataset or pass a different "
+                "--filtered-dataset-dir."
+            )
+        shutil.rmtree(prepared_dir)
+
+    summaries = {}
+    for split_name in ("train", "valid", "test"):
+        source_split_dir = source_dataset_dir / split_name
+        if not source_split_dir.exists():
+            if split_name == "test":
+                continue
+            raise FileNotFoundError(f"Missing split directory: {source_split_dir}")
+        summaries[split_name] = filter_coco_split(
+            source_split_dir,
+            prepared_dir / split_name,
+            included_names,
+            args.oversample_copy_mode,
+        )
+
+    summary = {
+        "source_dataset_dir": str(source_dataset_dir),
+        "prepared_dataset_dir": str(prepared_dir),
+        "include_classes": included_names,
+        "splits": summaries,
+    }
+    with (prepared_dir / "class_filter_summary.json").open("w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("Prepared class-filtered dataset:", flush=True)
+    for split_name, split_summary in summaries.items():
+        print(
+            f"  {split_name}: {split_summary['images']} images, "
+            f"{split_summary['annotations_before']} -> "
+            f"{split_summary['annotations_after']} annotations",
+            flush=True,
+        )
+    return prepared_dir
+
+
+def filter_coco_split(source_split_dir, target_split_dir, included_names, copy_mode):
+    source_ann_path = source_split_dir / "_annotations.coco.json"
+    coco = load_coco(source_ann_path)
+
+    categories = [
+        category
+        for category in coco.get("categories", [])
+        if category.get("supercategory", "") != "none"
+    ]
+    category_by_name = {category["name"]: category for category in categories}
+    missing = sorted(set(included_names) - set(category_by_name))
+    if missing:
+        raise ValueError(
+            f"Included classes not found in {source_ann_path}: {missing}. "
+            f"Available: {sorted(category_by_name)}"
+        )
+
+    old_to_new_category_id = {}
+    new_categories = []
+    for new_id, name in enumerate(included_names, start=1):
+        old_category = dict(category_by_name[name])
+        old_to_new_category_id[old_category["id"]] = new_id
+        old_category["id"] = new_id
+        new_categories.append(old_category)
+
+    target_split_dir.mkdir(parents=True, exist_ok=True)
+    for image in coco.get("images", []):
+        source_path = source_split_dir / image["file_name"]
+        if not source_path.exists():
+            raise FileNotFoundError(
+                f"Image referenced by COCO JSON is missing: {source_path}"
+            )
+        copy_or_link(source_path, target_split_dir / image["file_name"], copy_mode)
+
+    new_annotations = []
+    next_annotation_id = 1
+    for annotation in coco.get("annotations", []):
+        old_category_id = annotation.get("category_id")
+        if old_category_id not in old_to_new_category_id:
+            continue
+        new_annotation = dict(annotation)
+        new_annotation["id"] = next_annotation_id
+        new_annotation["category_id"] = old_to_new_category_id[old_category_id]
+        new_annotations.append(new_annotation)
+        next_annotation_id += 1
+
+    new_coco = {
+        key: value
+        for key, value in coco.items()
+        if key not in {"categories", "annotations"}
+    }
+    new_coco["categories"] = new_categories
+    new_coco["annotations"] = new_annotations
+    with (target_split_dir / "_annotations.coco.json").open("w") as f:
+        json.dump(new_coco, f, indent=2)
+
+    return {
+        "images": len(new_coco.get("images", [])),
+        "annotations_before": len(coco.get("annotations", [])),
+        "annotations_after": len(new_annotations),
+        "classes": included_names,
+    }
 
 
 def prepare_oversampled_dataset(args, source_dataset_dir, output_dir):
@@ -492,6 +639,8 @@ def save_finetune_config(args, output_dir, class_names):
         "amp": not args.no_amp,
         "resume": args.resume,
         "allow_class_mismatch": args.allow_class_mismatch,
+        "include_classes": args.include_classes,
+        "filtered_dataset_dir": args.filtered_dataset_dir,
         "oversample_classes": args.oversample_classes,
         "rare_repeat_factor": args.rare_repeat_factor,
         "oversampled_dataset_dir": args.oversampled_dataset_dir,
@@ -508,6 +657,8 @@ def main():
     source_checkpoint = Path(args.source_checkpoint).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
 
+    ensure_valid_split(dataset_dir)
+    dataset_dir = prepare_class_filtered_dataset(args, dataset_dir, output_dir)
     ensure_valid_split(dataset_dir)
     dataset_dir = prepare_oversampled_dataset(args, dataset_dir, output_dir)
     ensure_valid_split(dataset_dir)
