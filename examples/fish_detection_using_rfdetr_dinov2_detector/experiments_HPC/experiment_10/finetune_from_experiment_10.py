@@ -100,6 +100,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--label-remapped-dataset-dir",
+        default=None,
+        help=(
+            "Where to write the generated zero-based-label dataset when "
+            "--include-classes is not used. Defaults to OUTPUT_DIR/"
+            "label_remapped_dataset."
+        ),
+    )
+    parser.add_argument(
         "--overwrite-filtered-dataset",
         action="store_true",
         help="Remove the generated class-filtered dataset first if it exists.",
@@ -287,7 +296,7 @@ def prepare_class_filtered_dataset(args, source_dataset_dir, output_dir):
         if name.strip()
     ]
     if not included_names:
-        return source_dataset_dir
+        return prepare_label_remapped_dataset(args, source_dataset_dir, output_dir)
 
     prepared_dir = (
         Path(args.filtered_dataset_dir).expanduser().resolve()
@@ -341,6 +350,108 @@ def prepare_class_filtered_dataset(args, source_dataset_dir, output_dir):
     return prepared_dir
 
 
+def prepare_label_remapped_dataset(args, source_dataset_dir, output_dir):
+    prepared_dir = (
+        Path(args.label_remapped_dataset_dir).expanduser().resolve()
+        if args.label_remapped_dataset_dir
+        else output_dir / "label_remapped_dataset"
+    )
+    print("Preparing zero-based-label dataset ...", flush=True)
+    print(f"  Source      : {source_dataset_dir}", flush=True)
+    print(f"  Destination : {prepared_dir}", flush=True)
+    if prepared_dir.exists():
+        if not args.overwrite_filtered_dataset:
+            raise FileExistsError(
+                f"Label-remapped dataset already exists: {prepared_dir}\n"
+                "Use --overwrite-filtered-dataset or pass a different "
+                "--label-remapped-dataset-dir."
+            )
+        shutil.rmtree(prepared_dir)
+
+    summaries = {}
+    for split_name in ("train", "valid", "test"):
+        source_split_dir = source_dataset_dir / split_name
+        if not source_split_dir.exists():
+            if split_name == "test":
+                continue
+            raise FileNotFoundError(f"Missing split directory: {source_split_dir}")
+        summaries[split_name] = remap_coco_split_labels(
+            source_split_dir,
+            prepared_dir / split_name,
+            args.oversample_copy_mode,
+        )
+
+    summary = {
+        "source_dataset_dir": str(source_dataset_dir),
+        "prepared_dataset_dir": str(prepared_dir),
+        "splits": summaries,
+    }
+    with (prepared_dir / "label_remap_summary.json").open("w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("Prepared zero-based-label dataset:", flush=True)
+    for split_name, split_summary in summaries.items():
+        print(
+            f"  {split_name}: classes={split_summary['classes']}, "
+            f"{split_summary['annotations']} annotations",
+            flush=True,
+        )
+    return prepared_dir
+
+
+def remap_coco_split_labels(source_split_dir, target_split_dir, copy_mode):
+    source_ann_path = source_split_dir / "_annotations.coco.json"
+    coco = load_coco(source_ann_path)
+    categories = [
+        category
+        for category in coco.get("categories", [])
+        if category.get("supercategory", "") != "none"
+    ]
+    categories = sorted(categories, key=lambda category: category["id"])
+    old_to_new_category_id = {
+        category["id"]: new_id
+        for new_id, category in enumerate(categories)
+    }
+    new_categories = []
+    for new_id, category in enumerate(categories):
+        new_category = dict(category)
+        new_category["id"] = new_id
+        new_categories.append(new_category)
+
+    target_split_dir.mkdir(parents=True, exist_ok=True)
+    for image in coco.get("images", []):
+        source_path = source_split_dir / image["file_name"]
+        if not source_path.exists():
+            raise FileNotFoundError(
+                f"Image referenced by COCO JSON is missing: {source_path}"
+            )
+        copy_or_link(source_path, target_split_dir / image["file_name"], copy_mode)
+
+    new_annotations = []
+    for annotation in coco.get("annotations", []):
+        old_category_id = annotation.get("category_id")
+        if old_category_id not in old_to_new_category_id:
+            continue
+        new_annotation = dict(annotation)
+        new_annotation["category_id"] = old_to_new_category_id[old_category_id]
+        new_annotations.append(new_annotation)
+
+    new_coco = {
+        key: value
+        for key, value in coco.items()
+        if key not in {"categories", "annotations"}
+    }
+    new_coco["categories"] = new_categories
+    new_coco["annotations"] = new_annotations
+    with (target_split_dir / "_annotations.coco.json").open("w") as f:
+        json.dump(new_coco, f, indent=2)
+
+    return {
+        "classes": [category["name"] for category in new_categories],
+        "annotations": len(new_annotations),
+    }
+
+
 def filter_coco_split(source_split_dir, target_split_dir, included_names, copy_mode):
     source_ann_path = source_split_dir / "_annotations.coco.json"
     coco = load_coco(source_ann_path)
@@ -360,7 +471,7 @@ def filter_coco_split(source_split_dir, target_split_dir, included_names, copy_m
 
     old_to_new_category_id = {}
     new_categories = []
-    for new_id, name in enumerate(included_names, start=1):
+    for new_id, name in enumerate(included_names):
         old_category = dict(category_by_name[name])
         old_to_new_category_id[old_category["id"]] = new_id
         old_category["id"] = new_id
@@ -630,6 +741,7 @@ def save_finetune_config(args, output_dir, class_names):
         "effective_batch_size": args.batch_size * args.grad_accum_steps,
         "lr": args.lr,
         "lr_encoder": args.lr_encoder,
+        "augmentation": "native RF-DETR (make_coco_transforms_square_div_64)",
         "warmup_epochs": args.warmup_epochs,
         "weight_decay": args.weight_decay,
         "checkpoint_interval": args.checkpoint_interval,
@@ -641,6 +753,7 @@ def save_finetune_config(args, output_dir, class_names):
         "allow_class_mismatch": args.allow_class_mismatch,
         "include_classes": args.include_classes,
         "filtered_dataset_dir": args.filtered_dataset_dir,
+        "label_remapped_dataset_dir": args.label_remapped_dataset_dir,
         "oversample_classes": args.oversample_classes,
         "rare_repeat_factor": args.rare_repeat_factor,
         "oversampled_dataset_dir": args.oversampled_dataset_dir,
@@ -693,6 +806,9 @@ def main():
         ema_decay=0.993,
         ema_tau=100,
         drop_path=0.0,
+        # Native RF-DETR augmentation, matching experiment_10.py:
+        # RandomHorizontalFlip + RandomSelect(SquareResize,
+        # RandomResize/RandomSizeCrop/SquareResize) + ImageNet normalize.
         multi_scale=False,
         expanded_scales=False,
         square_resize_div_64=True,
