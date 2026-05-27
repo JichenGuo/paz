@@ -15,7 +15,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -35,6 +35,12 @@ from detect_image import (  # noqa: E402
 
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm"}
+COUNT_CLASSES = ("fish", "crab", "lobster")
+COUNT_TEXT_COLOR = (255, 255, 255)
+COUNT_BG_COLOR = (0, 0, 0)
+COUNT_FONT_SIZE = 28
+COUNT_MARGIN = 14
+COUNT_PADDING = 8
 
 
 def parse_args():
@@ -102,6 +108,14 @@ def parse_args():
         default="mp4v",
         help="OpenCV fourcc code for the output video.",
     )
+    parser.add_argument(
+        "--count-classes",
+        default=",".join(COUNT_CLASSES),
+        help=(
+            "Comma-separated class names to count in the top-right overlay. "
+            "Defaults to fish,crab,lobster."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -149,14 +163,70 @@ def make_writer(output_path, fps, width, height, fourcc):
     return writer
 
 
-def annotate_frame(frame_bgr, detector, class_names, threshold):
+def parse_count_classes(value):
+    count_classes = [name.strip() for name in value.split(",") if name.strip()]
+    if not count_classes:
+        raise ValueError("--count-classes must contain at least one class name")
+    return count_classes
+
+
+def count_records(records, count_classes):
+    counts = {name: 0 for name in count_classes}
+    name_lookup = {name.lower(): name for name in count_classes}
+    for record in records:
+        class_name = str(record["class_name"]).lower()
+        if class_name in name_lookup:
+            counts[name_lookup[class_name]] += 1
+    return counts
+
+
+def draw_count_overlay(image, counts):
+    annotated = image.copy()
+    draw = ImageDraw.Draw(annotated, "RGBA")
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", COUNT_FONT_SIZE)
+    except OSError:
+        font = ImageFont.load_default()
+
+    lines = [f"{name}: {count}" for name, count in counts.items()]
+    text_boxes = [draw.textbbox((0, 0), line, font=font) for line in lines]
+    line_widths = [right - left for left, top, right, bottom in text_boxes]
+    line_heights = [bottom - top for left, top, right, bottom in text_boxes]
+    line_gap = max(4, COUNT_FONT_SIZE // 5)
+    box_width = max(line_widths) + 2 * COUNT_PADDING
+    box_height = (
+        sum(line_heights)
+        + line_gap * max(0, len(lines) - 1)
+        + 2 * COUNT_PADDING
+    )
+
+    image_width, _ = annotated.size
+    x1 = max(0, image_width - box_width - COUNT_MARGIN)
+    y1 = COUNT_MARGIN
+    x2 = x1 + box_width
+    y2 = y1 + box_height
+    draw.rectangle((x1, y1, x2, y2), fill=(*COUNT_BG_COLOR, 170))
+
+    y = y1 + COUNT_PADDING
+    for line, line_height, text_box in zip(lines, line_heights, text_boxes):
+        left, _, right, _ = text_box
+        text_width = right - left
+        x = x2 - COUNT_PADDING - text_width
+        draw.text((x, y), line, fill=COUNT_TEXT_COLOR, font=font)
+        y += line_height + line_gap
+
+    return annotated
+
+
+def annotate_frame(frame_bgr, detector, class_names, count_classes, threshold):
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     result = detector.predict(frame_rgb, threshold=threshold)[0]
-    image = Image.fromarray(frame_rgb)
-    annotated = draw_detections(image, result, class_names)
-    annotated_bgr = cv2.cvtColor(np.asarray(annotated), cv2.COLOR_RGB2BGR)
     records = detections_to_records(result, class_names)
-    return annotated_bgr, records
+    annotated = draw_detections(Image.fromarray(frame_rgb), result, class_names)
+    counts = count_records(records, count_classes)
+    annotated = draw_count_overlay(annotated, counts)
+    annotated_bgr = cv2.cvtColor(np.asarray(annotated), cv2.COLOR_RGB2BGR)
+    return annotated_bgr, records, counts
 
 
 def write_json(json_path, payload):
@@ -178,9 +248,11 @@ def main():
         else Path(args.json_output).expanduser().resolve()
     )
     class_names = resolve_class_names(args, checkpoint_path)
+    count_classes = parse_count_classes(args.count_classes)
 
     print(f"Loading checkpoint: {checkpoint_path}")
     print(f"Classes ({len(class_names)}): {class_names}")
+    print(f"Count overlay classes: {count_classes}")
     detector = build_model(checkpoint_path, class_names)
 
     capture = open_video(video_path)
@@ -195,6 +267,7 @@ def main():
         "checkpoint": str(checkpoint_path),
         "annotated_video": str(output_path),
         "class_names": class_names,
+        "count_classes": count_classes,
         "threshold": args.threshold,
         "fps": fps,
         "width": width,
@@ -217,10 +290,11 @@ def main():
                 break
 
             frame_index = args.start_frame + processed
-            annotated, records = annotate_frame(
+            annotated, records, counts = annotate_frame(
                 frame,
                 detector,
                 class_names,
+                count_classes,
                 threshold=args.threshold,
             )
             writer.write(annotated)
@@ -231,6 +305,7 @@ def main():
                     {
                         "frame_index": frame_index,
                         "num_detections": len(records),
+                        "counts": counts,
                         "detections": records,
                     }
                 )
