@@ -470,7 +470,7 @@ def main():
     EPOCHS = _env_int("RFDETR_EPOCHS", 20)
     BASE_LR = 1e-4
     WARMUP_EPOCHS = 0.0
-    TRAIN_EVAL_INTERVAL = 10
+    TRAIN_EVAL_INTERVAL = 1
 
 
     # Load dataset: resolution=None for COCO creation (native loader resizes),

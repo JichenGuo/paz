@@ -470,14 +470,14 @@ def main():
     EPOCHS = _env_int("RFDETR_EPOCHS", 20)
     BASE_LR = 1e-4
     WARMUP_EPOCHS = 0.0
-    TRAIN_EVAL_INTERVAL = 10
+    TRAIN_EVAL_INTERVAL = 1
 
 
     # Load dataset: resolution=None for COCO creation (native loader resizes),
-    # eval_ds resolution=384 for validate_epoch_full (uses make_batches).
+    # eval_ds resolution=704 for validate_epoch_full (uses make_batches).
     logger.info("Loading DeepFish dataset ...")
     ds = DeepFishDataset(resolution=None)
-    eval_ds = DeepFishDataset(resolution=384)
+    eval_ds = DeepFishDataset(resolution=704)
     logger.info("DeepFish: %d images, %d classes %s",
                 len(ds), ds.num_classes, ds.class_names)
 
