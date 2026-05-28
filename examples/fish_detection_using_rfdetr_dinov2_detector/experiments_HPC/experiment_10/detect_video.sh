@@ -15,8 +15,8 @@ VIDEO=~/videos/Trim_1.mp4
 
 CHECKPOINT=/mnt/beegfs/home/jguo/projects/fish_detector_using_rfdetr/paz/examples/fish_detection_using_rfdetr_dinov2_detector/experiments_HPC/experiment_10/finetune_oversampled_epoch100/checkpoint_best_total.weights.h5
 
-OUTPUT=/mnt/beegfs/home/jguo/projects/fish_detector_using_rfdetr/paz/examples/fish_detection_using_rfdetr_dinov2_detector/experiments_HPC/experiment_10/finetune_results/detected_video_1.mp4
-JSON_OUTPUT=/mnt/beegfs/home/jguo/projects/fish_detector_using_rfdetr/paz/examples/fish_detection_using_rfdetr_dinov2_detector/experiments_HPC/experiment_10/finetune_results/detected_video_1.json
+OUTPUT=/mnt/beegfs/home/jguo/projects/fish_detector_using_rfdetr/paz/examples/fish_detection_using_rfdetr_dinov2_detector/experiments_HPC/experiment_10/finetune_results/detected_video_1_v2.mp4
+JSON_OUTPUT=/mnt/beegfs/home/jguo/projects/fish_detector_using_rfdetr/paz/examples/fish_detection_using_rfdetr_dinov2_detector/experiments_HPC/experiment_10/finetune_results/detected_video_1_v2.json
 
 THRESHOLD=0.5
 
@@ -28,7 +28,9 @@ singularity exec --nv \
         --checkpoint "$CHECKPOINT" \
         --output "$OUTPUT" \
         --json-output "$JSON_OUTPUT" \
-        --threshold "$THRESHOLD"
+        --threshold "$THRESHOLD"\
+        --count-classes fish,crab,lobster
+
 
 echo "Detection finished."
 echo "Output video: $OUTPUT"
