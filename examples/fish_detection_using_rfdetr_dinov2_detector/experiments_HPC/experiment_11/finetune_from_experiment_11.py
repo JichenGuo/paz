@@ -11,6 +11,15 @@ The new dataset is expected to be in COCO/RoboFlow layout:
 
 If your validation split is named ``val`` instead of ``valid``, the script
 creates a ``valid`` symlink or copy automatically.
+
+It also accepts the local FathomNet layout:
+
+    datasets/fathomnet/
+      train_dataset.json
+      *.jpg|*.png
+
+In that case it creates an 80/20 train/valid split and remaps category IDs to
+contiguous zero-based IDs without adding a background category.
 """
 
 import argparse
@@ -45,6 +54,7 @@ DEFAULT_SOURCE_CHECKPOINT = (
     _SCRIPT_DIR / "checkpoints" / "rfdetr_large_best.weights.h5"
 )
 DEFAULT_OUTPUT_DIR = _SCRIPT_DIR / "finetune_runs" / "from_experiment_11"
+DEFAULT_FATHOMNET_DIR = _PAZ_ROOT / "datasets" / "fathomnet"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
@@ -57,8 +67,41 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset-dir",
-        required=True,
+        default=str(DEFAULT_FATHOMNET_DIR),
         help="COCO-format dataset root containing train/_annotations.coco.json.",
+    )
+    parser.add_argument(
+        "--single-coco-json",
+        default="train_dataset.json",
+        help=(
+            "Single COCO annotation JSON to split when dataset-dir does not "
+            "already contain train/valid splits."
+        ),
+    )
+    parser.add_argument(
+        "--train-split",
+        type=float,
+        default=0.8,
+        help="Fraction of images used for training when splitting a single COCO JSON.",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="Random seed for the generated train/valid split.",
+    )
+    parser.add_argument(
+        "--prepared-dataset-dir",
+        default=None,
+        help=(
+            "Where to write a generated train/valid dataset from a single COCO "
+            "JSON. Defaults to OUTPUT_DIR/prepared_fathomnet_dataset."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite-prepared-dataset",
+        action="store_true",
+        help="Remove the generated single-JSON split dataset first if it exists.",
     )
     parser.add_argument(
         "--source-checkpoint",
@@ -203,6 +246,165 @@ def read_coco_classes(dataset_dir):
 def load_coco(ann_path):
     with ann_path.open() as f:
         return json.load(f)
+
+
+def has_train_valid_layout(dataset_dir):
+    return (
+        (dataset_dir / "train" / "_annotations.coco.json").exists()
+        and (
+            (dataset_dir / "valid" / "_annotations.coco.json").exists()
+            or (dataset_dir / "val" / "_annotations.coco.json").exists()
+        )
+    )
+
+
+def prepare_single_coco_split_dataset(args, source_dataset_dir, output_dir):
+    args._single_coco_prepared = False
+    if has_train_valid_layout(source_dataset_dir):
+        return source_dataset_dir
+
+    ann_path = source_dataset_dir / args.single_coco_json
+    if not ann_path.exists():
+        raise FileNotFoundError(
+            f"Missing COCO annotations: {ann_path}\n"
+            "Expected either train/valid COCO folders or a single annotation "
+            "JSON such as datasets/fathomnet/train_dataset.json."
+        )
+    if not 0.0 < args.train_split < 1.0:
+        raise ValueError(f"--train-split must be in (0, 1), got {args.train_split}")
+
+    prepared_dir = (
+        Path(args.prepared_dataset_dir).expanduser().resolve()
+        if args.prepared_dataset_dir
+        else output_dir / "prepared_fathomnet_dataset"
+    )
+    print("Preparing single-JSON COCO dataset split ...", flush=True)
+    print(f"  Source JSON  : {ann_path}", flush=True)
+    print(f"  Destination  : {prepared_dir}", flush=True)
+    print(f"  Train split  : {args.train_split:.2f}", flush=True)
+    print(f"  Split seed   : {args.split_seed}", flush=True)
+    if prepared_dir.exists():
+        if not args.overwrite_prepared_dataset:
+            raise FileExistsError(
+                f"Prepared dataset already exists: {prepared_dir}\n"
+                "Use --overwrite-prepared-dataset or pass a different "
+                "--prepared-dataset-dir."
+            )
+        shutil.rmtree(prepared_dir)
+
+    coco = load_coco(ann_path)
+    categories = [
+        category
+        for category in coco.get("categories", [])
+        if category.get("supercategory", "") != "none"
+    ]
+    categories = sorted(categories, key=lambda category: category["id"])
+    if not categories:
+        raise ValueError(f"No usable categories found in {ann_path}")
+
+    old_to_new_category_id = {
+        category["id"]: new_id
+        for new_id, category in enumerate(categories)
+    }
+    new_categories = []
+    for new_id, category in enumerate(categories):
+        new_category = dict(category)
+        new_category["id"] = new_id
+        new_categories.append(new_category)
+
+    images = [dict(image) for image in coco.get("images", [])]
+    if not images:
+        raise ValueError(f"No images found in {ann_path}")
+
+    rng = random.Random(args.split_seed)
+    shuffled_images = images[:]
+    rng.shuffle(shuffled_images)
+    n_train = int(round(len(shuffled_images) * args.train_split))
+    n_train = min(max(1, n_train), len(shuffled_images) - 1)
+    split_images = {
+        "train": shuffled_images[:n_train],
+        "valid": shuffled_images[n_train:],
+    }
+
+    anns_by_image = {}
+    for annotation in coco.get("annotations", []):
+        category_id = annotation.get("category_id")
+        if category_id not in old_to_new_category_id:
+            continue
+        anns_by_image.setdefault(annotation["image_id"], []).append(annotation)
+
+    split_summaries = {}
+    for split_name, split_image_list in split_images.items():
+        split_dir = prepared_dir / split_name
+        split_dir.mkdir(parents=True, exist_ok=True)
+
+        split_image_ids = {image["id"] for image in split_image_list}
+        split_annotations = []
+        next_annotation_id = 1
+        for image in split_image_list:
+            src = source_dataset_dir / image["file_name"]
+            if not src.exists():
+                raise FileNotFoundError(
+                    f"Image referenced by COCO JSON is missing: {src}"
+                )
+            copy_or_link(src, split_dir / image["file_name"], args.oversample_copy_mode)
+
+            for annotation in anns_by_image.get(image["id"], []):
+                if annotation["image_id"] not in split_image_ids:
+                    continue
+                new_annotation = dict(annotation)
+                new_annotation["id"] = next_annotation_id
+                new_annotation["category_id"] = old_to_new_category_id[
+                    annotation["category_id"]
+                ]
+                split_annotations.append(new_annotation)
+                next_annotation_id += 1
+
+        split_coco = {
+            key: value
+            for key, value in coco.items()
+            if key not in {"images", "annotations", "categories"}
+        }
+        split_coco["images"] = split_image_list
+        split_coco["annotations"] = split_annotations
+        split_coco["categories"] = new_categories
+        with (split_dir / "_annotations.coco.json").open("w") as f:
+            json.dump(split_coco, f, indent=2)
+
+        split_summaries[split_name] = {
+            "images": len(split_image_list),
+            "annotations": len(split_annotations),
+        }
+
+    summary = {
+        "source_dataset_dir": str(source_dataset_dir),
+        "source_annotations": str(ann_path),
+        "prepared_dataset_dir": str(prepared_dir),
+        "train_split": args.train_split,
+        "split_seed": args.split_seed,
+        "category_id_mapping": {
+            str(old_id): new_id for old_id, new_id in old_to_new_category_id.items()
+        },
+        "class_names": [category["name"] for category in new_categories],
+        "splits": split_summaries,
+    }
+    with (prepared_dir / "single_coco_split_summary.json").open("w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("Prepared single-JSON COCO dataset:", flush=True)
+    for split_name, split_summary in split_summaries.items():
+        print(
+            f"  {split_name}: {split_summary['images']} images, "
+            f"{split_summary['annotations']} annotations",
+            flush=True,
+        )
+    print(
+        "  Categories remapped to zero-based IDs: "
+        f"{summary['category_id_mapping']}",
+        flush=True,
+    )
+    args._single_coco_prepared = True
+    return prepared_dir
 
 
 def copy_or_link(src, dst, mode):
@@ -732,6 +934,10 @@ def save_finetune_config(args, output_dir, class_names):
         "source_experiment": "experiment_11",
         "source_checkpoint": str(Path(args.source_checkpoint).expanduser().resolve()),
         "dataset_dir": str(Path(args.dataset_dir).expanduser().resolve()),
+        "single_coco_json": args.single_coco_json,
+        "train_split": args.train_split,
+        "split_seed": args.split_seed,
+        "prepared_dataset_dir": args.prepared_dataset_dir,
         "output_dir": str(output_dir),
         "class_names": class_names,
         "num_classes": len(class_names),
@@ -770,14 +976,23 @@ def main():
     source_checkpoint = Path(args.source_checkpoint).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
 
+    dataset_dir = prepare_single_coco_split_dataset(args, dataset_dir, output_dir)
     ensure_valid_split(dataset_dir)
-    dataset_dir = prepare_class_filtered_dataset(args, dataset_dir, output_dir)
+    if args.include_classes or not getattr(args, "_single_coco_prepared", False):
+        dataset_dir = prepare_class_filtered_dataset(args, dataset_dir, output_dir)
     ensure_valid_split(dataset_dir)
     dataset_dir = prepare_oversampled_dataset(args, dataset_dir, output_dir)
     ensure_valid_split(dataset_dir)
     class_names = read_coco_classes(dataset_dir)
     print(f"Dataset: {dataset_dir}")
     print(f"Classes ({len(class_names)}): {class_names}")
+    if len(class_names) != 1 and not args.allow_class_mismatch:
+        args.allow_class_mismatch = True
+        print(
+            "Detected a multi-class fine-tuning dataset. Loading compatible "
+            "source weights with classification-head mismatches skipped.",
+            flush=True,
+        )
 
     detector = build_detector(
         num_classes=len(class_names),
