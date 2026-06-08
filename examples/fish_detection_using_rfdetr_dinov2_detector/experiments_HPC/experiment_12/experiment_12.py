@@ -346,8 +346,8 @@ def _exp12_main():
     _EXP12_LOGGER.info("EXPERIMENT 12: RF-DETR Large — DeepFish + FathomNet sea_animal")
     _EXP12_LOGGER.info("=" * 68)
 
-    deepfish_dir = _exp12_env_path("DEEPFISH_DIR", _EXP12_PAZ_ROOT / "datasets" / "Deepfish")
-    fathomnet_dir = _exp12_env_path("FATHOMNET_DIR", _EXP12_PAZ_ROOT / "datasets" / "fathomnet")
+    deepfish_dir = _exp12_env_path("DEEPFISH_DIR", _Path("/mnt/beegfs/home/jguo/datasets/Deepfish"))
+    fathomnet_dir = _exp12_env_path("FATHOMNET_DIR", _Path("/mnt/beegfs/home/jguo/datasets/fathomnet"))
     rebuild_dataset = bool(_exp12_env_int("RFDETR_REBUILD_DATASET", 1))
 
     batch_size = _exp12_env_int("RFDETR_BATCH_SIZE", 16)
