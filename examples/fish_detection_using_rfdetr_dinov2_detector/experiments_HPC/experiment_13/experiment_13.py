@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Experiment 13: RF-DETR Large on DeepFish + FathomNet as ``sea_animal``.
+"""Experiment 13: RF-DETR Nano on DeepFish + FathomNet as ``sea_animal``.
 """
 
 import json
@@ -26,7 +26,7 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 from paz.models.detection.dino_v2_object_detection.config import TrainConfig
-from paz.models.detection.dino_v2_object_detection.detr import RFDETRLarge
+from paz.models.detection.dino_v2_object_detection.detr import RFDETRNano
 from train_utils import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -338,7 +338,7 @@ def main():
         print("JAX device diagnostics unavailable:", exc)
 
     logger.info("=" * 68)
-    logger.info("EXPERIMENT 13: RF-DETR Large — DeepFish + FathomNet sea_animal")
+    logger.info("EXPERIMENT 13: RF-DETR Nano — DeepFish + FathomNet sea_animal")
     logger.info("=" * 68)
 
     deepfish_dir = _env_path("DEEPFISH_DIR", Path("/mnt/beegfs/home/jguo/datasets/Deepfish"))
@@ -357,9 +357,9 @@ def main():
         deepfish_dir, fathomnet_dir, exp_dir, rebuild=rebuild_dataset
     )
 
-    logger.info("Creating RFDETRLarge (num_classes=1) ...")
-    model = RFDETRLarge(num_classes=1)
-    dummy = np.ones((1, 704, 704, 3), dtype="float32") * 0.5
+    logger.info("Creating RFDETRNano (num_classes=1) ...")
+    model = RFDETRNano(num_classes=1)
+    dummy = np.ones((1, 384, 384, 3), dtype="float32") * 0.5
     model.model.model(dummy, training=True)
     model.model.class_names = [CLASS_NAME]
 
@@ -398,8 +398,8 @@ def main():
 
     exp_config = {
         "experiment": "experiment_13",
-        "description": "RF-DETR Large trained on DeepFish train + FathomNet as sea_animal",
-        "variant": "RFDETRLarge",
+        "description": "RF-DETR Nano trained on DeepFish train + FathomNet as sea_animal",
+        "variant": "RFDETRNano",
         "class_names": [CLASS_NAME],
         "num_classes": 1,
         "deepfish_dir": str(deepfish_dir),
@@ -421,7 +421,7 @@ def main():
     logger.info("Starting training ...")
     model.train_from_config(config)
 
-    final_path = exp_dir / "checkpoints" / "rfdetr_large_sea_animal_final.weights.h5"
+    final_path = exp_dir / "checkpoints" / "rfdetr_nano_sea_animal_final.weights.h5"
     model.model.model.save_weights(str(final_path))
     logger.info("Final weights saved -> %s", final_path)
 
