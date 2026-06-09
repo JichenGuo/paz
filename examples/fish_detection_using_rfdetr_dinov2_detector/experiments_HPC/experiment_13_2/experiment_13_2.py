@@ -747,7 +747,7 @@ def main():
     deepfish_dir = _env_path("DEEPFISH_DIR", Path("/mnt/beegfs/home/jguo/datasets/Deepfish"))
     fathomnet_dir = _env_path("FATHOMNET_DIR", Path("/mnt/beegfs/home/jguo/datasets/fathomnet"))
     fathomnet_valid_dir = _env_path(
-        "FATHOMNET_VALID_DIR", Path("/mnt/beegfs/home/jguo/datasets/fathom_test_small")
+        "FATHOMNET_VALID_DIR", Path("/mnt/beegfs/home/jguo/datasets/images_fathom_test")
     )
     rebuild_dataset = bool(_env_int("RFDETR_REBUILD_DATASET", 1))
 
