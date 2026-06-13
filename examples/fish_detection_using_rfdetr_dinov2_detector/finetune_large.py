@@ -42,7 +42,10 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_PAZ_ROOT = _SCRIPT_DIR.parents[3]
+_PAZ_ROOT = next(
+    parent for parent in (_SCRIPT_DIR, *_SCRIPT_DIR.parents)
+    if (parent / "paz" / "models").is_dir()
+)
 if str(_PAZ_ROOT) not in sys.path:
     sys.path.insert(0, str(_PAZ_ROOT))
 
