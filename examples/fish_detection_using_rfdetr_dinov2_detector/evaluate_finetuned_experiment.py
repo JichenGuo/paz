@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate a model fine-tuned from Experiment 10 on a COCO test split."""
+"""Evaluate the fine-tuned model on a COCO test split."""
 
 import argparse
 import csv
@@ -21,7 +21,7 @@ from PIL import Image
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PAZ_ROOT = _SCRIPT_DIR.parents[1]
 _SRC_DIR = _SCRIPT_DIR / "src"
-_EXP10_DIR = _SCRIPT_DIR / "experiments_HPC" / "experiment_10"
+_EXP_DIR = _SCRIPT_DIR / "experiments_HPC" / "experiment_10"
 
 for path in (_PAZ_ROOT, _SRC_DIR):
     if str(path) not in sys.path:
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_TEST_DIR = (
     _SCRIPT_DIR / "datasets" / "Labelimage_Fish_coco_split_70_20_10" / "test"
 )
-DEFAULT_FINETUNE_DIR = _EXP10_DIR / "finetune_runs" / "from_experiment_10"
+DEFAULT_FINETUNE_DIR = _EXP_DIR / "finetune_runs" / "from_experiment_10"
 DEFAULT_CHECKPOINT = DEFAULT_FINETUNE_DIR / "rfdetr_nano_finetuned_final.weights.h5"
 DEFAULT_CONFIG = DEFAULT_FINETUNE_DIR / "finetune_config.json"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -166,7 +166,7 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=_SCRIPT_DIR / "evaluation_results" / "experiment_10_finetuned",
+        default=_SCRIPT_DIR / "evaluation_results",
     )
     parser.add_argument("--batch-size", type=positive_int, default=16)
     parser.add_argument("--conf-threshold", type=float, default=0.3)
@@ -408,7 +408,8 @@ def write_csv(row, csv_path):
 
 def main():
     args = parse_args()
-    output_dir = args.output_dir.expanduser().resolve()
+    # output_dir = args.output_dir.expanduser().resolve()
+    output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(str(output_dir))
     sys.stdout = _TeeWriter(sys.stdout, output_dir / "output.txt")
@@ -480,7 +481,7 @@ def main():
 
     results = {
         "source_experiment": "experiment_10",
-        "fine_tune_script": str(_EXP10_DIR / "finetune_from_experiment_10.py"),
+        "fine_tune_script": str(_EXP_DIR / "finetune_from_experiment_10.py"),
         "metric_source": "experiment_10.validate_epoch_full",
         "checkpoint": str(checkpoint),
         "finetune_config": str(args.finetune_config),
@@ -510,8 +511,8 @@ def main():
         if not key.startswith("per_class_")
     })
 
-    json_path = output_dir / "experiment_10_finetuned_test_results.json"
-    csv_path = output_dir / "experiment_10_finetuned_test_summary.csv"
+    json_path = output_dir / "finetuned_test_results.json"
+    csv_path = output_dir / "finetuned_test_summary.csv"
     with json_path.open("w") as f:
         json.dump(results, f, indent=2)
     write_csv(summary_row, csv_path)
