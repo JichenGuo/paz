@@ -453,6 +453,7 @@ def main():
     logger.info("=" * 68)
     logger.info("Keras backend       : %s", keras.backend.backend())
     logger.info("Checkpoint          : %s", checkpoint)
+    logger.info("Confidence threshold: %s", args.conf_threshold)
     logger.info("Fine-tune config    : %s", args.finetune_config)
     logger.info("Test split          : %s", test_dir)
     logger.info("Test images         : %d", len(dataset))
