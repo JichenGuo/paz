@@ -28,7 +28,7 @@ for path in (_PAZ_ROOT, _SRC_DIR):
         sys.path.insert(0, str(path))
 
 from paz.models.detection.dino_v2_object_detection.config import TrainConfig
-from paz.models.detection.dino_v2_object_detection.detr import RFDETRNano
+from paz.models.detection.dino_v2_object_detection.detr import RFDETRNano, RFDETRLarge
 from paz.models.detection.dino_v2_object_detection.main import (
     build_criterion_from_config,
 )
@@ -176,6 +176,11 @@ def parse_args():
         type=nonnegative_int,
         default=0,
         help="Debug limit. 0 evaluates all batches.",
+    )
+    parser.add_argument(
+        "--detector",
+        default="nano",
+        help="Choose nano or large detector.",
     )
     parser.add_argument(
         "--allow-class-mismatch",
@@ -330,6 +335,20 @@ def build_detector(num_classes, checkpoint_path, allow_class_mismatch):
     return detector
 
 
+def build_detector_large(num_classes, checkpoint_path, allow_class_mismatch):
+    detector = RFDETRLarge(num_classes=num_classes)
+    resolution = detector.model_config.resolution
+    print("resolution:", resolution)
+    dummy = np.ones((1, resolution, resolution, 3), dtype="float32") * 0.5
+    detector.model.model(dummy, training=False)
+    detector.model.model.load_weights(
+        str(checkpoint_path),
+        skip_mismatch=allow_class_mismatch,
+    )
+    detector.model.model(dummy, training=True)
+    return detector
+
+
 def make_train_config(dataset_root, output_dir, batch_size, class_names):
     return TrainConfig(
         dataset_dir=str(dataset_root),
@@ -453,6 +472,7 @@ def main():
     logger.info("=" * 68)
     logger.info("Keras backend       : %s", keras.backend.backend())
     logger.info("Checkpoint          : %s", checkpoint)
+    logger.info("Detector            : %s", args.detector)
     logger.info("Confidence threshold: %s", args.conf_threshold)
     logger.info("Fine-tune config    : %s", args.finetune_config)
     logger.info("Test split          : %s", test_dir)
@@ -461,11 +481,20 @@ def main():
     logger.info("Output dir          : %s", output_dir)
 
     start = time.time()
-    detector = build_detector(
-        num_classes=len(class_names),
-        checkpoint_path=checkpoint,
-        allow_class_mismatch=args.allow_class_mismatch,
-    )
+    if args.detector.lower() == "nano":
+        print("the detector is nano")
+        detector = build_detector(
+            num_classes=len(class_names),
+            checkpoint_path=checkpoint,
+            allow_class_mismatch=args.allow_class_mismatch,
+        )
+    elif args.detector.lower() == "large":
+        print("the detector is large")
+        detector = build_detector_large(
+            num_classes=len(class_names),
+            checkpoint_path=checkpoint,
+            allow_class_mismatch=args.allow_class_mismatch,
+        )
     detector.model.class_names = class_names
     train_config = make_train_config(
         dataset_root=test_dir.parent,
