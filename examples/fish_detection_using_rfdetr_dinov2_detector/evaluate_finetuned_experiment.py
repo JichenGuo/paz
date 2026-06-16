@@ -368,6 +368,30 @@ def make_train_config(dataset_root, output_dir, batch_size, class_names):
     )
 
 
+def compute_class_support(dataset, indices, num_classes):
+    support = np.zeros(num_classes, dtype=np.int64)
+    for idx in indices:
+        image_info = dataset._images[idx]
+        for ann in dataset._annotations_by_image.get(image_info["id"], []):
+            label = dataset._category_id_to_label.get(ann.get("category_id"))
+            if label is not None and 0 <= label < num_classes:
+                support[label] += 1
+    return support
+
+
+def add_weighted_f1(metrics, prefix, class_support):
+    per_class_f1 = np.asarray(metrics.get("per_class_f1", []), dtype=np.float64)
+    support = np.asarray(class_support, dtype=np.float64)
+    if per_class_f1.size < support.size:
+        per_class_f1 = np.pad(per_class_f1, (0, support.size - per_class_f1.size))
+    per_class_f1 = per_class_f1[:support.size]
+    total_support = float(support.sum())
+    weighted_f1 = float(np.sum(per_class_f1 * support) / total_support) if total_support > 0 else 0.0
+    metrics[f"{prefix}_weighted_f1"] = weighted_f1
+    metrics[f"{prefix}_class_support"] = class_support
+    return weighted_f1
+
+
 def jsonable(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -395,6 +419,7 @@ def write_csv(row, csv_path):
         "test_precision",
         "test_recall",
         "test_f1",
+        "test_weighted_f1",
         "test_accuracy",
         "test_num_gt_boxes",
         "test_num_pred_boxes",
@@ -464,17 +489,20 @@ def main():
         logger=logger,
         prefix="test",
     )
+    class_support = compute_class_support(dataset, indices, len(class_names))
+    weighted_f1 = add_weighted_f1(metrics, "test", class_support)
     elapsed = time.time() - start
 
     logger.info("")
     logger.info("-" * 68)
     logger.info(
-        "mAP@50=%.4f mAP@50:95=%.4f precision=%.4f recall=%.4f f1=%.4f loss=%.4f",
+        "mAP@50=%.4f mAP@50:95=%.4f precision=%.4f recall=%.4f f1=%.4f weighted_f1=%.4f loss=%.4f",
         metrics["test_mAP_50"],
         metrics["test_mAP_50_95"],
         metrics["test_precision"],
         metrics["test_recall"],
         metrics["test_f1"],
+        weighted_f1,
         metrics["test_loss"],
     )
     logger.info("Evaluation completed in %.1fs", elapsed)
