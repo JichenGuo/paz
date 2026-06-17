@@ -6,6 +6,7 @@ from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
+import ssl
 import sys
 import time
 from urllib.error import HTTPError, URLError
@@ -90,16 +91,38 @@ def parse_args():
         action="store_true",
         help="Download again even when the destination file already exists.",
     )
+    parser.add_argument(
+        "--ca-bundle",
+        type=Path,
+        default=None,
+        help="Path to a CA certificate bundle to use for HTTPS verification.",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help=(
+            "Disable HTTPS certificate verification. Use only when the runtime "
+            "container lacks CA certificates and you trust the network."
+        ),
+    )
     return parser.parse_args()
 
 
-def request_url(url, timeout):
+def make_ssl_context(args):
+    if args.insecure:
+        return ssl._create_unverified_context()
+    if args.ca_bundle is not None:
+        return ssl.create_default_context(cafile=str(args.ca_bundle))
+    return None
+
+
+def request_url(url, timeout, ssl_context=None):
     request = Request(url, headers={"User-Agent": USER_AGENT})
-    return urlopen(request, timeout=timeout)
+    return urlopen(request, timeout=timeout, context=ssl_context)
 
 
-def read_listing(url, timeout):
-    with request_url(url, timeout) as response:
+def read_listing(url, timeout, ssl_context=None):
+    with request_url(url, timeout, ssl_context) as response:
         content_type = response.headers.get("Content-Type", "")
         body = response.read()
     text = body.decode("utf-8", errors="replace")
@@ -157,7 +180,7 @@ def is_image_url(url, extensions):
     return Path(path).suffix.lower() in extensions
 
 
-def collect_image_urls(root_url, extensions, recursive, timeout):
+def collect_image_urls(root_url, extensions, recursive, timeout, ssl_context=None):
     root_url = root_url.rstrip("/") + "/"
     seen_dirs = set()
     seen_images = set()
@@ -171,7 +194,7 @@ def collect_image_urls(root_url, extensions, recursive, timeout):
         seen_dirs.add(listing_url)
 
         print(f"Reading listing: {listing_url}", flush=True)
-        text, content_type = read_listing(listing_url, timeout)
+        text, content_type = read_listing(listing_url, timeout, ssl_context)
         links = parse_xml_links(listing_url, text)
         if not links:
             links = parse_html_links(listing_url, text)
@@ -202,35 +225,35 @@ def destination_for_url(url, root_url, output_dir):
     return output_dir / relative
 
 
-def remote_size(url, timeout):
+def remote_size(url, timeout, ssl_context=None):
     request = Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with urlopen(request, timeout=timeout, context=ssl_context) as response:
             size = response.headers.get("Content-Length")
     except (HTTPError, URLError):
         return None
     return int(size) if size and size.isdigit() else None
 
 
-def should_skip(destination, url, timeout, overwrite):
+def should_skip(destination, url, timeout, overwrite, ssl_context=None):
     if overwrite or not destination.exists():
         return False
-    size = remote_size(url, timeout)
+    size = remote_size(url, timeout, ssl_context)
     if size is None:
         return destination.stat().st_size > 0
     return destination.stat().st_size == size
 
 
-def download_file(url, destination, timeout, retries, overwrite):
+def download_file(url, destination, timeout, retries, overwrite, ssl_context=None):
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if should_skip(destination, url, timeout, overwrite):
+    if should_skip(destination, url, timeout, overwrite, ssl_context):
         print(f"SKIP {destination}", flush=True)
         return "skipped"
 
     partial = destination.with_suffix(destination.suffix + ".part")
     for attempt in range(1, retries + 1):
         try:
-            with request_url(url, timeout) as response, partial.open("wb") as f:
+            with request_url(url, timeout, ssl_context) as response, partial.open("wb") as f:
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
@@ -282,12 +305,16 @@ def main():
     }
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    ssl_context = make_ssl_context(args)
+    if args.insecure:
+        print("WARNING: HTTPS certificate verification is disabled.", flush=True)
 
     image_urls = collect_image_urls(
         args.url,
         extensions=extensions,
         recursive=args.recursive,
         timeout=args.timeout,
+        ssl_context=ssl_context,
     )
     if args.limit:
         image_urls = image_urls[:args.limit]
@@ -311,6 +338,7 @@ def main():
             timeout=args.timeout,
             retries=args.retries,
             overwrite=args.overwrite,
+            ssl_context=ssl_context,
         )
         status_counts[status] += 1
 
