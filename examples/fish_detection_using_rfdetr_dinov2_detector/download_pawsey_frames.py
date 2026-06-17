@@ -10,7 +10,7 @@ import ssl
 import sys
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
@@ -140,6 +140,33 @@ def parse_html_links(base_url, text):
     return links
 
 
+
+def object_store_listing_url(url):
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    bucket = parts[0]
+    prefix = "/".join(parts[1:]).rstrip("/") + "/"
+    return f"{parsed.scheme}://{parsed.netloc}/{bucket}?prefix={quote(prefix)}"
+
+
+def listing_candidates(root_url):
+    candidates = []
+    if "?" in root_url:
+        candidates.append(root_url)
+    else:
+        candidates.append(root_url.rstrip("/") + "/")
+        candidates.append(root_url.rstrip("/"))
+        object_listing = object_store_listing_url(root_url)
+        if object_listing is not None:
+            candidates.append(object_listing)
+    unique = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
 def parse_xml_links(base_url, text):
     try:
         root = ET.fromstring(text)
@@ -153,15 +180,18 @@ def parse_xml_links(base_url, text):
     if root.tag.startswith("{"):
         namespace = root.tag.split("}", 1)[0] + "}"
 
+    bucket = parsed.path.strip("/").split("/", 1)[0]
+    bucket_prefix = f"/{bucket}/" if bucket else "/"
+
     for key in root.findall(f".//{namespace}Key"):
         if key.text:
             path = key.text.lstrip("/")
-            links.append(f"{parsed.scheme}://{parsed.netloc}/{path}")
+            links.append(f"{parsed.scheme}://{parsed.netloc}{bucket_prefix}{path}")
 
     for prefix in root.findall(f".//{namespace}Prefix"):
         if prefix.text:
             path = prefix.text.lstrip("/")
-            links.append(f"{parsed.scheme}://{parsed.netloc}/{path}")
+            links.append(f"{parsed.scheme}://{parsed.netloc}{bucket_prefix}{path}")
 
     if not links and base_prefix:
         for element in root.iter():
@@ -181,10 +211,9 @@ def is_image_url(url, extensions):
 
 
 def collect_image_urls(root_url, extensions, recursive, timeout, ssl_context=None):
-    root_url = root_url.rstrip("/") + "/"
     seen_dirs = set()
     seen_images = set()
-    pending = [root_url]
+    pending = listing_candidates(root_url)
     images = []
 
     while pending:
@@ -194,7 +223,13 @@ def collect_image_urls(root_url, extensions, recursive, timeout, ssl_context=Non
         seen_dirs.add(listing_url)
 
         print(f"Reading listing: {listing_url}", flush=True)
-        text, content_type = read_listing(listing_url, timeout, ssl_context)
+        try:
+            text, content_type = read_listing(listing_url, timeout, ssl_context)
+        except HTTPError as exc:
+            if exc.code == 404:
+                print(f"Listing not found, trying next form: {listing_url}", flush=True)
+                continue
+            raise
         links = parse_xml_links(listing_url, text)
         if not links:
             links = parse_html_links(listing_url, text)
