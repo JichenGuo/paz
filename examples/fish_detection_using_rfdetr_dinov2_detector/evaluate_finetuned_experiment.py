@@ -179,7 +179,7 @@ def parse_args():
     )
     parser.add_argument(
         "--detector",
-        default="nano",
+        default="NANO",
         help="Choose nano or large detector.",
     )
     parser.add_argument(
@@ -322,7 +322,7 @@ def resolve_checkpoint(path):
     )
 
 
-def build_detector(num_classes, checkpoint_path, allow_class_mismatch):
+def build_detector_nano(num_classes, checkpoint_path, allow_class_mismatch):
     detector = RFDETRNano(num_classes=num_classes)
     resolution = detector.model_config.resolution
     dummy = np.ones((1, resolution, resolution, 3), dtype="float32") * 0.5
@@ -338,7 +338,6 @@ def build_detector(num_classes, checkpoint_path, allow_class_mismatch):
 def build_detector_large(num_classes, checkpoint_path, allow_class_mismatch):
     detector = RFDETRLarge(num_classes=num_classes)
     resolution = detector.model_config.resolution
-    print("resolution:", resolution)
     dummy = np.ones((1, resolution, resolution, 3), dtype="float32") * 0.5
     detector.model.model(dummy, training=False)
     detector.model.model.load_weights(
@@ -463,7 +462,10 @@ def main():
     test_dir = args.test_dir.expanduser().resolve()
     checkpoint = resolve_checkpoint(args.checkpoint)
     class_names = read_class_names(args)
-    dataset = CocoSplitDataset(test_dir, class_names, resolution=384)
+    if args.detector.lower() == "nano":
+        dataset = CocoSplitDataset(test_dir, class_names, resolution=384)
+    elif args.detector.lower() == "large":
+        dataset = CocoSplitDataset(test_dir, class_names, resolution=704)
     indices = list(range(len(dataset)))
     max_batches = args.max_batches if args.max_batches > 0 else None
 
@@ -483,7 +485,7 @@ def main():
     start = time.time()
     if args.detector.lower() == "nano":
         print("the detector is nano")
-        detector = build_detector(
+        detector = build_detector_nano(
             num_classes=len(class_names),
             checkpoint_path=checkpoint,
             allow_class_mismatch=args.allow_class_mismatch,
