@@ -6,6 +6,7 @@ its configured original weights, ``lwdetr_nano.weights.h5``.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -28,12 +29,29 @@ for path in (_PAZ_ROOT, _EXAMPLE_DIR, _EXP10_DIR):
 
 from paz.models.detection.dino_v2_object_detection.config import TrainConfig
 from paz.models.detection.dino_v2_object_detection.detr import RFDETRNano
-from finetune_from_experiment_10 import (
-    ensure_valid_split,
-    prepare_class_filtered_dataset,
-    prepare_oversampled_dataset,
-    read_coco_classes,
-)
+
+
+def load_finetune_helpers():
+    helper_path = _EXP10_DIR / "finetune_from_experiment_10.py"
+    if not helper_path.exists():
+        raise FileNotFoundError(
+            f"Required fine-tuning helper script not found: {helper_path}"
+        )
+    spec = importlib.util.spec_from_file_location(
+        "experiment_10_finetune_helpers", helper_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load fine-tuning helpers from {helper_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_finetune_helpers = load_finetune_helpers()
+ensure_valid_split = _finetune_helpers.ensure_valid_split
+prepare_class_filtered_dataset = _finetune_helpers.prepare_class_filtered_dataset
+prepare_oversampled_dataset = _finetune_helpers.prepare_oversampled_dataset
+read_coco_classes = _finetune_helpers.read_coco_classes
 
 DEFAULT_DATASET_DIR = (
     _PAZ_ROOT / "datasets" / "Labelimage_Fish_coco_split_70_20_10"
