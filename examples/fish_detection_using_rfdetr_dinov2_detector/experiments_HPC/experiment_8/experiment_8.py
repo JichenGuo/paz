@@ -53,8 +53,8 @@ prepare_class_filtered_dataset = _finetune_helpers.prepare_class_filtered_datase
 prepare_oversampled_dataset = _finetune_helpers.prepare_oversampled_dataset
 read_coco_classes = _finetune_helpers.read_coco_classes
 
-DEFAULT_DATASET_DIR = (
-    _PAZ_ROOT / "datasets" / "Labelimage_Fish_coco_split_70_20_10"
+DEFAULT_DATASET_DIR = Path(
+    "/mnt/beegfs/home/jguo/datasets/Labelimage_Fish_coco_split_70_20_10"
 )
 DEFAULT_OUTPUT_DIR = _SCRIPT_DIR / "finetune_original_rfdetr_nano"
 
@@ -179,6 +179,17 @@ def main():
     dataset_dir = args.dataset_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    train_ann = dataset_dir / "train" / "_annotations.coco.json"
+    valid_ann = dataset_dir / "valid" / "_annotations.coco.json"
+    if not train_ann.exists() or not valid_ann.exists():
+        raise FileNotFoundError(
+            "Expected the pre-split COCO dataset to contain:\n"
+            f"  {train_ann}\n"
+            f"  {valid_ann}\n"
+            "Pass the correct dataset root with --dataset-dir if it is stored "
+            "elsewhere."
+        )
 
     ensure_valid_split(dataset_dir)
     dataset_dir = prepare_class_filtered_dataset(args, dataset_dir, output_dir)
