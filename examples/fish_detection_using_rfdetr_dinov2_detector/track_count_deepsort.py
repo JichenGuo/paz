@@ -210,7 +210,7 @@ def track_bbox_xyxy(track):
 
 
 def draw_track_overlay(
-    image, tracks, track_lengths, counted_track_ids, track_display_ids
+    image, tracks, track_lengths, counted_track_ids, counted_display_ids
 ):
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
@@ -234,12 +234,12 @@ def draw_track_overlay(
             continue
 
         class_name = track_class_name(track)
-        length = track_lengths.get(track_id, 0)
         counted = track_id in counted_track_ids
-        display_id = track_display_ids.get(track_id, track_id)
-        label = f"{class_name} id:{display_id}"
         if counted:
-            label += " counted"
+            display_id = counted_display_ids[track_id]
+            label = f"{class_name} id:{display_id} counted"
+        else:
+            label = f"{class_name} not counted"
 
         draw.rectangle((x1, y1, x2, y2), outline=TRACK_BOX_COLOR, width=3)
         left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
@@ -292,7 +292,14 @@ def draw_count_overlay(image, counts):
     return annotated
 
 
-def count_tracks_once(tracks, track_lengths, counted_track_ids, counts, min_frames):
+def count_tracks_once(
+    tracks,
+    track_lengths,
+    counted_track_ids,
+    counted_display_ids,
+    counts,
+    min_frames,
+):
     newly_counted = []
     count_lookup = {name.lower(): name for name in counts}
     for track in tracks:
@@ -310,13 +317,14 @@ def count_tracks_once(tracks, track_lengths, counted_track_ids, counts, min_fram
             continue
 
         counted_name = count_lookup[normalized_class]
+        counted_display_ids[track_id] = counts[counted_name]
         counts[counted_name] += 1
         counted_track_ids.add(track_id)
         newly_counted.append(track_id)
     return newly_counted
 
 
-def tracks_to_records(tracks, track_lengths, counted_track_ids, track_display_ids):
+def tracks_to_records(tracks, track_lengths, counted_track_ids, counted_display_ids):
     records = []
     for track in tracks:
         if not track.is_confirmed():
@@ -325,7 +333,7 @@ def tracks_to_records(tracks, track_lengths, counted_track_ids, track_display_id
         records.append(
             {
                 "track_id": track_id,
-                "display_id": track_display_ids.get(track_id),
+                "display_id": counted_display_ids.get(track_id),
                 "class_name": track_class_name(track),
                 "box_xyxy": track_bbox_xyxy(track),
                 "length_frames": int(track_lengths.get(track_id, 0)),
@@ -345,8 +353,7 @@ def annotate_frame(
     threshold,
     track_lengths,
     counted_track_ids,
-    track_display_ids,
-    next_display_id,
+    counted_display_ids,
     counts,
     min_track_frames,
 ):
@@ -360,22 +367,24 @@ def annotate_frame(
         if track.time_since_update == 0:
             track_id = str(track.track_id)
             track_lengths[track_id] += 1
-            if track_id not in track_display_ids:
-                track_display_ids[track_id] = next_display_id[0]
-                next_display_id[0] += 1
 
     newly_counted = count_tracks_once(
-        tracks, track_lengths, counted_track_ids, counts, min_track_frames
+        tracks,
+        track_lengths,
+        counted_track_ids,
+        counted_display_ids,
+        counts,
+        min_track_frames,
     )
 
     annotated = draw_detections(Image.fromarray(frame_rgb), result, class_names)
     annotated = draw_track_overlay(
-        annotated, tracks, track_lengths, counted_track_ids, track_display_ids
+        annotated, tracks, track_lengths, counted_track_ids, counted_display_ids
     )
     annotated = draw_count_overlay(annotated, counts)
     annotated_bgr = cv2.cvtColor(np.asarray(annotated), cv2.COLOR_RGB2BGR)
     return annotated_bgr, detection_records, tracks_to_records(
-        tracks, track_lengths, counted_track_ids, track_display_ids
+        tracks, track_lengths, counted_track_ids, counted_display_ids
     ), newly_counted
 
 
@@ -412,8 +421,7 @@ def main():
     counts = {name: 0 for name in count_classes}
     track_lengths = defaultdict(int)
     counted_track_ids = set()
-    track_display_ids = {}
-    next_display_id = [0]
+    counted_display_ids = {}
     payload = {
         "input": str(video_path),
         "checkpoint": str(checkpoint_path),
@@ -458,8 +466,7 @@ def main():
                 args.threshold,
                 track_lengths,
                 counted_track_ids,
-                track_display_ids,
-                next_display_id,
+                counted_display_ids,
                 counts,
                 args.min_track_frames,
             )
@@ -491,7 +498,7 @@ def main():
     payload["processed_frames"] = processed
     payload["final_counts"] = dict(counts)
     payload["counted_track_ids"] = sorted(counted_track_ids)
-    payload["track_display_ids"] = track_display_ids
+    payload["counted_display_ids"] = counted_display_ids
     write_json(json_path, payload)
 
     print(f"Processed frames: {processed}")
