@@ -52,7 +52,7 @@ from detect_video import (  # noqa: E402
 TRACK_BOX_COLOR = (0, 255, 255)
 TRACK_TEXT_COLOR = (255, 255, 255)
 TRACK_TEXT_BG_COLOR = (0, 105, 130)
-TRACK_FONT_SIZE = 24
+TRACK_FONT_SIZE = 30
 
 
 def parse_args():
