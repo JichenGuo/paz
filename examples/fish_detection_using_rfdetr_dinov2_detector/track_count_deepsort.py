@@ -237,12 +237,12 @@ def draw_track_overlay(
         counted = track_id in counted_track_ids
         if counted:
             display_id = counted_display_ids[track_id]
-            label = f"{class_name} id:{display_id} counted"
+            label = f"{class_name} id:{display_id}"
         else:
-            label = f"{class_name} not counted"
+            label = f"{class_name}"
 
         draw.rectangle((x1, y1, x2, y2), outline=TRACK_BOX_COLOR, width=3)
-        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+        left, top, right, bottom = draw.textbbox((0, 0), label, font=font+3)
         text_width = right - left
         text_height = bottom - top
         text_y = max(0, y1 - text_height - 6)
