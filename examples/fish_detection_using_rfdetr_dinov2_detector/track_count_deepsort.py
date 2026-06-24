@@ -18,17 +18,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_PAZ_ROOT = next(
-    parent for parent in (_SCRIPT_DIR, *_SCRIPT_DIR.parents)
-    if (parent / "paz" / "models").is_dir()
-)
-# _EXPERIMENT_10_DIR = _SCRIPT_DIR / "experiments_HPC" / "experiment_10"
-# for path in (_PAZ_ROOT, _EXPERIMENT_10_DIR, _SCRIPT_DIR):
-#     if path.is_dir() and str(path) not in sys.path:
-#         sys.path.insert(0, str(path))
-
 from detect_video import (  # noqa: E402
     COUNT_BG_COLOR,
     COUNT_CLASSES,
