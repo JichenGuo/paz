@@ -242,7 +242,7 @@ def draw_track_overlay(
             label = f"{class_name}"
 
         draw.rectangle((x1, y1, x2, y2), outline=TRACK_BOX_COLOR, width=3)
-        left, top, right, bottom = draw.textbbox((0, 0), label, font=font+3)
+        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
         text_width = right - left
         text_height = bottom - top
         text_y = max(0, y1 - text_height - 6)
