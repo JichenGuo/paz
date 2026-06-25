@@ -30,7 +30,8 @@ from detect_image import (  # noqa: E402
     DEFAULT_CHECKPOINT,
     detections_to_records,
     draw_detections,
-    build_model,
+    build_model_nano,
+    build_model_large,
     resolve_class_names,
 )
 
@@ -108,6 +109,11 @@ def parse_args():
         "--fourcc",
         default="mp4v",
         help="OpenCV fourcc code for the output video.",
+    )
+    parser.add_argument(
+        "--detector",
+        default="NANO",
+        help="Choose nano or large detector.",
     )
     parser.add_argument(
         "--count-classes",
@@ -254,8 +260,12 @@ def main():
     print(f"Loading checkpoint: {checkpoint_path}")
     print(f"Classes ({len(class_names)}): {class_names}")
     print(f"Count overlay classes: {count_classes}")
-    detector = build_model(checkpoint_path, class_names)
-
+    
+    if args.detector.lower() == "nano":
+        detector = build_model_nano(checkpoint_path, class_names)
+    if args.detector.lower() == "large":
+        detector = build_model_large(checkpoint_path, class_names)
+    
     capture = open_video(video_path)
     fps, width, height, frame_count = video_metadata(capture)
     writer = make_writer(output_path, fps, width, height, args.fourcc)

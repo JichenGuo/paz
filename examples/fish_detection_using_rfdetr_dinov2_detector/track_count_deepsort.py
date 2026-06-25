@@ -26,7 +26,8 @@ from detect_video import (  # noqa: E402
     COUNT_PADDING,
     COUNT_TEXT_COLOR,
     DEFAULT_CHECKPOINT,
-    build_model,
+    build_model_nano,
+    build_model_large,
     detections_to_records,
     draw_detections,
     make_writer,
@@ -118,6 +119,11 @@ def parse_args():
         type=float,
         default=0.2,
         help="DeepSORT appearance matching threshold.",
+    )
+    parser.add_argument(
+        "--detector",
+        default="NANO",
+        help="Choose nano or large detector.",
     )
     parser.add_argument(
         "--embedder",
@@ -427,7 +433,14 @@ def main():
     print(f"Classes ({len(class_names)}): {class_names}")
     print(f"Count classes: {count_classes}")
     print(f"Minimum track length for counting: {args.min_track_frames} frames")
-    detector = build_model(checkpoint_path, class_names)
+    
+    if args.detector.lower() == "nano":
+        print("the detector is nano")
+        detector = build_model_nano(checkpoint_path, class_names)
+    elif args.detector.lower() == "large":
+        print("the detector is large")
+        detector = build_model_large(checkpoint_path, class_names)
+            
     tracker = build_tracker(args)
 
     capture = open_video(video_path)
