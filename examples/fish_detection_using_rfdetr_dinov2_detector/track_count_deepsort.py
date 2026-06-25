@@ -103,6 +103,15 @@ def parse_args():
         help="DeepSORT max_age: frames to keep an unmatched track alive.",
     )
     parser.add_argument(
+        "--max-draw-missed-frames",
+        type=int,
+        default=5,
+        help=(
+            "Draw predicted tracks for at most this many missed frames. "
+            "The track still stays alive internally until --max-age."
+        ),
+    )
+    parser.add_argument(
         "--n-init",
         type=int,
         default=3,
@@ -219,6 +228,7 @@ def draw_track_overlay(
     counted_track_ids,
     counted_display_ids,
     track_class_names,
+    max_draw_missed_frames,
 ):
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
@@ -230,6 +240,8 @@ def draw_track_overlay(
     image_width, image_height = annotated.size
     for track in tracks:
         if not track.is_confirmed():
+            continue
+        if track.time_since_update > max_draw_missed_frames:
             continue
 
         track_id = str(track.track_id)
@@ -368,6 +380,7 @@ def annotate_frame(
     track_class_names,
     counts,
     min_track_frames,
+    max_draw_missed_frames,
 ):
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     result = detector.predict(frame_rgb, threshold=threshold)[0]
@@ -401,6 +414,7 @@ def annotate_frame(
         counted_track_ids,
         counted_display_ids,
         track_class_names,
+        max_draw_missed_frames,
     )
     annotated = draw_count_overlay(annotated, counts)
     annotated_bgr = cv2.cvtColor(np.asarray(annotated), cv2.COLOR_RGB2BGR)
@@ -417,6 +431,8 @@ def main():
     args = parse_args()
     if args.min_track_frames < 1:
         raise ValueError("--min-track-frames must be >= 1")
+    if args.max_draw_missed_frames < 0:
+        raise ValueError("--max-draw-missed-frames must be >= 0")
 
     video_path = Path(args.video).expanduser().resolve()
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
@@ -465,6 +481,7 @@ def main():
         "min_track_frames": args.min_track_frames,
         "deepsort": {
             "max_age": args.max_age,
+            "max_draw_missed_frames": args.max_draw_missed_frames,
             "n_init": args.n_init,
             "max_iou_distance": args.max_iou_distance,
             "max_cosine_distance": args.max_cosine_distance,
@@ -503,6 +520,7 @@ def main():
                 track_class_names,
                 counts,
                 args.min_track_frames,
+                args.max_draw_missed_frames,
             )
             writer.write(annotated)
 
