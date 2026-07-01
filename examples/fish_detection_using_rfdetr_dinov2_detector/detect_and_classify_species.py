@@ -149,7 +149,7 @@ def make_output_paths(input_path, image_paths, output_arg, json_output_arg):
     folder_mode = input_path.is_dir()
     if folder_mode:
         output_dir = (
-            input_path / "experiment_10_species"
+            input_path / "fathomnet_species"
             if output_arg is None
             else Path(output_arg).expanduser().resolve()
         )
