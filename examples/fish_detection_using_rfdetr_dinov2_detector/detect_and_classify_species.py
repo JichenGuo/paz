@@ -35,7 +35,7 @@ from species_classifier import (  # noqa: E402
     crop_with_padding,
     resize_letterbox,
 )
-from paz.models.detection.dino_v2_object_detection.detr import RFDETRNano  # noqa: E402
+from paz.models.detection.dino_v2_object_detection.detr import RFDETRNano, RFDETRLarge  # noqa: E402
 
 
 DEFAULT_DETECTOR_CHECKPOINT = _SCRIPT_DIR / "checkpoints" / "rfdetr_nano_best.weights.h5"
@@ -72,6 +72,11 @@ def parse_args():
         default=str(DEFAULT_CLASSIFIER_DIR),
         help="Directory containing classifier_config.json.",
     )
+    parser.add_argument(
+        "--detector",
+        default="NANO",
+        help="Choose nano or large detector.",
+    )    
     parser.add_argument("--output", default=None)
     parser.add_argument("--json-output", default=None)
     parser.add_argument("--threshold", type=float, default=0.3)
@@ -82,7 +87,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_detector(checkpoint_path, class_names):
+def build_detector_nano(checkpoint_path, class_names):
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Detector checkpoint not found: {checkpoint_path}")
 
@@ -93,6 +98,19 @@ def build_detector(checkpoint_path, class_names):
     detector.model.load_pretrained_weights(str(checkpoint_path))
     detector.model.class_names = class_names
     return detector
+
+
+ def build_detector_large(checkpoint_path, class_names):
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Detector checkpoint not found: {checkpoint_path}")
+
+    detector = RFDETRLarge(num_classes=len(class_names))
+    resolution = detector.model_config.resolution
+    dummy = np.ones((1, resolution, resolution, 3), dtype="float32") * 0.5
+    detector.model.model(dummy, training=False)
+    detector.model.load_pretrained_weights(str(checkpoint_path))
+    detector.model.class_names = class_names
+    return detector   
 
 
 def load_classifier(classifier_dir, classifier_checkpoint):
@@ -256,7 +274,11 @@ def main():
     print(f"Detector classes: {detector_class_names}")
     print(f"Classifier checkpoint: {classifier_checkpoint}")
     print(f"Species classes ({len(species_names)}): {species_names}")
-    detector = build_detector(detector_checkpoint, detector_class_names)
+    
+    if args.detector.lower() == "nano":
+        detector = build_detector_nano(detector_checkpoint, detector_class_names)
+    elif args.detector.lower() == "large":
+        detector = build_detector_large(detector_checkpoint, detector_class_names)
 
     payload = {
         "input": str(input_path),
