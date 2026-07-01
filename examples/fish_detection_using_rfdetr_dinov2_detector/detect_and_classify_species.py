@@ -100,7 +100,7 @@ def build_detector_nano(checkpoint_path, class_names):
     return detector
 
 
- def build_detector_large(checkpoint_path, class_names):
+def build_detector_large(checkpoint_path, class_names):
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Detector checkpoint not found: {checkpoint_path}")
 
