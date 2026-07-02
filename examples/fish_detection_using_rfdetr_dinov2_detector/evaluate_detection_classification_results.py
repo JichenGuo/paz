@@ -25,7 +25,6 @@ Ground truth is expected to be COCO format with images, annotations, categories.
 import argparse
 import csv
 import json
-import math
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -140,9 +139,12 @@ def normalize_predictions(predictions, limit_images=0):
     if limit_images > 0:
         images = images[:limit_images]
 
+    prediction_image_keys = []
     predictions_by_image = defaultdict(list)
     for image_record in images:
         image_key = prediction_image_key(image_record)
+        if image_key:
+            prediction_image_keys.append(image_key)
         for index, detection in enumerate(image_record.get("detections", [])):
             box = detection.get("box_xyxy") or detection.get("bbox_xyxy")
             if box is None and "bbox" in detection:
@@ -172,7 +174,14 @@ def normalize_predictions(predictions, limit_images=0):
             )
     for image_predictions in predictions_by_image.values():
         image_predictions.sort(key=lambda item: item["detector_score"], reverse=True)
-    return predictions_by_image, len(images)
+    return predictions_by_image, sorted(set(prediction_image_keys)), len(images)
+
+
+def filter_gt_to_prediction_images(gt_by_image, prediction_image_keys):
+    return {
+        image_key: gt_by_image.get(image_key, [])
+        for image_key in prediction_image_keys
+    }
 
 
 def box_iou(box_a, box_b):
@@ -385,7 +394,7 @@ def summarize_per_class(per_class_counts):
     return rows
 
 
-def prediction_summary(predictions_by_image, prediction_image_count):
+def prediction_summary(predictions_by_image, prediction_image_keys, prediction_image_count):
     species_counts = Counter()
     detection_counts = []
     scores = []
@@ -395,7 +404,8 @@ def prediction_summary(predictions_by_image, prediction_image_count):
             species_counts[prediction.get("species_top1") or "<missing>"] += 1
             scores.append(prediction["detector_score"])
     return {
-        "prediction_images": prediction_image_count,
+        "prediction_image_records": prediction_image_count,
+        "evaluated_prediction_images": len(prediction_image_keys),
         "images_with_predictions": len(predictions_by_image),
         "total_predictions": sum(detection_counts),
         "mean_predictions_per_image": safe_div(sum(detection_counts), prediction_image_count),
@@ -422,10 +432,11 @@ def main():
     ground_truth, ground_truth_path = load_json(args.ground_truth)
 
     _, gt_by_image, id_to_name, _ = build_gt(ground_truth)
-    predictions_by_image, prediction_image_count = normalize_predictions(
+    predictions_by_image, prediction_image_keys, prediction_image_count = normalize_predictions(
         predictions,
         limit_images=args.limit_images,
     )
+    gt_by_image = filter_gt_to_prediction_images(gt_by_image, prediction_image_keys)
 
     output_json = (
         Path(args.output_json).expanduser().resolve()
@@ -439,9 +450,18 @@ def main():
         "iou_threshold": args.iou_threshold,
         "class_aware_detection": args.class_aware_detection,
         "num_categories": len(id_to_name),
-        "num_gt_images": len(ground_truth.get("images", [])),
-        "num_gt_annotations": len(ground_truth.get("annotations", [])),
-        "prediction_summary": prediction_summary(predictions_by_image, prediction_image_count),
+        "num_gt_images_total": len(ground_truth.get("images", [])),
+        "num_gt_annotations_total": len(ground_truth.get("annotations", [])),
+        "evaluation_scope": "prediction_images_only",
+        "num_evaluated_prediction_images": len(prediction_image_keys),
+        "num_evaluated_gt_annotations": sum(
+            len(items) for items in gt_by_image.values()
+        ),
+        "prediction_summary": prediction_summary(
+            predictions_by_image,
+            prediction_image_keys,
+            prediction_image_count,
+        ),
     }
 
     if not ground_truth.get("annotations"):
@@ -514,7 +534,8 @@ def main():
     output_json.parent.mkdir(parents=True, exist_ok=True)
     with output_json.open("w") as f:
         json.dump(summary, f, indent=2)
-    print(f"Prediction images: {summary['prediction_summary']['prediction_images']}")
+    print(f"Prediction image records: {summary['prediction_summary']['prediction_image_records']}")
+    print(f"Evaluated prediction images: {summary['prediction_summary']['evaluated_prediction_images']}")
     print(f"Total predictions: {summary['prediction_summary']['total_predictions']}")
     print(f"Saved evaluation JSON: {output_json}")
 
