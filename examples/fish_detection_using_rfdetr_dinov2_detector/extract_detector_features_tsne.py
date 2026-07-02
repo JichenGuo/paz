@@ -12,6 +12,17 @@ COCO ground-truth boxes, one point per annotated object::
         --detector large \
         --point-source gt_boxes
 
+In-house Labelimage_Fish COCO dataset, ignoring category id 0/background::
+
+    python examples/fish_detection_using_rfdetr_dinov2_detector/extract_detector_features_tsne.py \
+        --image-dir datasets/Labelimage_Fish_coco/train \
+        --annotation-file datasets/Labelimage_Fish_coco/train/_annotations.coco.json \
+        --checkpoint /path/to/checkpoint.weights.h5 \
+        --detector large \
+        --class-names crab,fish,lobster \
+        --point-source gt_boxes \
+        --background-category-ids 0
+
 Two-stage prediction JSON, one point per classified detection::
 
     python examples/fish_detection_using_rfdetr_dinov2_detector/extract_detector_features_tsne.py \
@@ -94,6 +105,19 @@ def parse_args():
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--min-box-size", type=float, default=4.0)
     parser.add_argument("--include-classes", default="")
+    parser.add_argument(
+        "--background-category-ids",
+        default="0",
+        help=(
+            "Comma-separated COCO category ids to ignore as background/root "
+            "classes. Defaults to 0 for Roboflow-style datasets."
+        ),
+    )
+    parser.add_argument(
+        "--background-class-names",
+        default="background,none,__background__,Labelimage_Fish",
+        help="Comma-separated category names to ignore as background/root classes.",
+    )
     parser.add_argument("--recursive", action="store_true")
     return parser.parse_args()
 
@@ -184,11 +208,30 @@ def pool_image_feature(feature_map):
     return feature_map[0].mean(axis=(0, 1))
 
 
-def build_category_maps(coco):
-    categories = [
-        category for category in coco.get("categories", [])
-        if category.get("supercategory", "") != "none"
-    ]
+def parse_csv_set(value, cast=str):
+    values = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        values.add(cast(item))
+    return values
+
+
+def build_category_maps(coco, background_category_ids=None, background_class_names=None):
+    background_category_ids = background_category_ids or set()
+    background_class_names = background_class_names or set()
+    categories = []
+    for category in coco.get("categories", []):
+        category_id = category.get("id")
+        category_name = str(category.get("name", ""))
+        if category_id in background_category_ids:
+            continue
+        if category_name in background_class_names:
+            continue
+        if category.get("supercategory", "") == "none":
+            continue
+        categories.append(category)
     categories = sorted(categories, key=lambda category: category["id"])
     id_to_name = {category["id"]: category["name"] for category in categories}
     return id_to_name
@@ -209,9 +252,20 @@ def find_image_path(image_root, file_name):
     raise FileNotFoundError(f"Image not found for COCO file_name={file_name}")
 
 
-def records_from_gt_boxes(annotation_file, image_dir, min_box_size, include_classes):
+def records_from_gt_boxes(
+    annotation_file,
+    image_dir,
+    min_box_size,
+    include_classes,
+    background_category_ids,
+    background_class_names,
+):
     coco = load_json(annotation_file)
-    id_to_name = build_category_maps(coco)
+    id_to_name = build_category_maps(
+        coco,
+        background_category_ids=background_category_ids,
+        background_class_names=background_class_names,
+    )
     image_by_id = {image["id"]: image for image in coco.get("images", [])}
     include = {name.strip() for name in include_classes.split(",") if name.strip()}
     records = []
@@ -421,6 +475,8 @@ def main():
             args.image_dir,
             args.min_box_size,
             args.include_classes,
+            parse_csv_set(args.background_category_ids, int),
+            parse_csv_set(args.background_class_names, str),
         )
     elif args.point_source == "predicted_boxes":
         if not args.predictions_json:
