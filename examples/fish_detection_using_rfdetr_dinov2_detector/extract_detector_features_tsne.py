@@ -512,6 +512,7 @@ def compute_clustering_metrics(features, embeddings, metadata):
     return metrics
 
 
+def plot_tsne(path, embeddings, metadata):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
