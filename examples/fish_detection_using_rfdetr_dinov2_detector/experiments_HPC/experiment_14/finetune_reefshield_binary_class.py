@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""Fine-tune RF-DETR Large from the Experiment 14 trained checkpoint.
+"""Fine-tune RF-DETR Large for binary ReefShield sea-animal detection.
 
-The new dataset is expected to be in COCO/RoboFlow layout:
+The dataset is expected to be in COCO/RoboFlow layout:
 
     dataset_dir/
       train/_annotations.coco.json
@@ -12,14 +12,10 @@ The new dataset is expected to be in COCO/RoboFlow layout:
 If your validation split is named ``val`` instead of ``valid``, the script
 creates a ``valid`` symlink or copy automatically.
 
-It also accepts the local FathomNet layout:
-
-    datasets/fathomnet/
-      train_dataset.json
-      *.jpg|*.png
-
-In that case it creates an 80/20 train/valid split and remaps category IDs to
-contiguous zero-based IDs without adding a background category.
+For the in-house ReefShield dataset, crab, fish, and lobster annotations are
+merged into one foreground class named ``sea_animal``. Category id 0 from the
+source Roboflow dataset is ignored because it is a non-object root/background
+category.
 """
 
 import argparse
@@ -53,22 +49,28 @@ from paz.models.detection.dino_v2_object_detection.detr import RFDETRLarge
 DEFAULT_SOURCE_CHECKPOINT = (
     _SCRIPT_DIR / "checkpoints" / "rfdetr_large_best.weights.h5"
 )
-DEFAULT_OUTPUT_DIR = _SCRIPT_DIR / "finetune_runs" / "from_experiment_11"
-DEFAULT_FATHOMNET_DIR = _PAZ_ROOT / "datasets" / "fathomnet"
+DEFAULT_OUTPUT_DIR = _SCRIPT_DIR / "finetune_runs" / "reefshield_binary_sea_animal"
+DEFAULT_DATASET_DIR = _PAZ_ROOT / "datasets" / "Labelimage_Fish_coco_split_70_20_10"
+DEFAULT_MERGE_CLASSES = "crab,fish,lobster"
+DEFAULT_MERGED_CLASS_NAME = "sea_animal"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Load the best Experiment 11 RF-DETR Large checkpoint and fine-tune "
-            "it on a new COCO-format dataset."
+            "Load a well-trained RF-DETR Large checkpoint and fine-tune it for "
+            "binary sea_animal detection by merging crab, fish, and lobster."
         )
     )
     parser.add_argument(
         "--dataset-dir",
-        default=str(DEFAULT_FATHOMNET_DIR),
-        help="COCO-format dataset root containing train/_annotations.coco.json.",
+        default=str(DEFAULT_DATASET_DIR),
+        help=(
+            "COCO-format dataset root containing train/_annotations.coco.json "
+            "and valid/_annotations.coco.json. Defaults to the in-house "
+            "Labelimage_Fish_coco_split_70_20_10 dataset."
+        ),
     )
     parser.add_argument(
         "--single-coco-json",
@@ -211,6 +213,32 @@ def parse_args():
             "Resume a previous fine-tuning run from output-dir/checkpoint.weights.h5 "
             "instead of initializing from --source-checkpoint."
         ),
+    )
+    parser.add_argument(
+        "--merge-classes",
+        default=DEFAULT_MERGE_CLASSES,
+        help=(
+            "Comma-separated source class names to merge into --merged-class-name. "
+            "Defaults to crab,fish,lobster."
+        ),
+    )
+    parser.add_argument(
+        "--merged-class-name",
+        default=DEFAULT_MERGED_CLASS_NAME,
+        help="Target binary foreground class name. Defaults to sea_animal.",
+    )
+    parser.add_argument(
+        "--merged-dataset-dir",
+        default=None,
+        help=(
+            "Where to write the generated binary COCO dataset. Defaults to "
+            "OUTPUT_DIR/merged_binary_dataset."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite-merged-dataset",
+        action="store_true",
+        help="Remove the generated merged binary dataset first if it exists.",
     )
     parser.add_argument(
         "--allow-class-mismatch",
@@ -489,6 +517,141 @@ def copy_existing_split(source_dir, target_dir, split_name, copy_mode):
             shutil.copy2(path, target_path)
         elif path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
             copy_or_link(path, target_path, copy_mode)
+
+
+
+def prepare_merged_binary_dataset(args, source_dataset_dir, output_dir):
+    merge_names = [
+        name.strip() for name in args.merge_classes.split(",") if name.strip()
+    ]
+    if not merge_names:
+        raise ValueError("--merge-classes must contain at least one class name")
+
+    prepared_dir = (
+        Path(args.merged_dataset_dir).expanduser().resolve()
+        if args.merged_dataset_dir
+        else output_dir / "merged_binary_dataset"
+    )
+    print("Preparing merged binary COCO dataset ...", flush=True)
+    print(f"  Source       : {source_dataset_dir}", flush=True)
+    print(f"  Destination  : {prepared_dir}", flush=True)
+    print(f"  Merge classes: {merge_names}", flush=True)
+    print(f"  Target class : {args.merged_class_name}", flush=True)
+    if prepared_dir.exists():
+        if not args.overwrite_merged_dataset:
+            raise FileExistsError(
+                f"Merged binary dataset already exists: {prepared_dir}\n"
+                "Use --overwrite-merged-dataset or pass a different "
+                "--merged-dataset-dir."
+            )
+        shutil.rmtree(prepared_dir)
+
+    summaries = {}
+    for split_name in ("train", "valid", "test"):
+        source_split_dir = source_dataset_dir / split_name
+        if not source_split_dir.exists():
+            if split_name == "test":
+                continue
+            raise FileNotFoundError(f"Missing split directory: {source_split_dir}")
+        summaries[split_name] = merge_coco_split_to_binary(
+            source_split_dir,
+            prepared_dir / split_name,
+            merge_names,
+            args.merged_class_name,
+            args.oversample_copy_mode,
+        )
+
+    summary = {
+        "source_dataset_dir": str(source_dataset_dir),
+        "prepared_dataset_dir": str(prepared_dir),
+        "merge_classes": merge_names,
+        "merged_class_name": args.merged_class_name,
+        "splits": summaries,
+    }
+    with (prepared_dir / "merged_binary_summary.json").open("w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("Prepared merged binary dataset:", flush=True)
+    for split_name, split_summary in summaries.items():
+        print(
+            f"  {split_name}: {split_summary['images']} images, "
+            f"{split_summary['annotations_before']} -> "
+            f"{split_summary['annotations_after']} sea_animal annotations, "
+            f"source_counts={split_summary['source_object_counts']}",
+            flush=True,
+        )
+    return prepared_dir
+
+
+def merge_coco_split_to_binary(
+    source_split_dir,
+    target_split_dir,
+    merge_names,
+    merged_class_name,
+    copy_mode,
+):
+    source_ann_path = source_split_dir / "_annotations.coco.json"
+    coco = load_coco(source_ann_path)
+    categories = [
+        category
+        for category in coco.get("categories", [])
+        if category.get("supercategory", "") != "none"
+    ]
+    category_by_name = {category["name"]: category for category in categories}
+    missing = sorted(set(merge_names) - set(category_by_name))
+    if missing:
+        raise ValueError(
+            f"Merge classes not found in {source_ann_path}: {missing}. "
+            f"Available: {sorted(category_by_name)}"
+        )
+
+    source_id_to_name = {
+        category_by_name[name]["id"]: name for name in merge_names
+    }
+    source_ids = set(source_id_to_name)
+    target_split_dir.mkdir(parents=True, exist_ok=True)
+
+    for image in coco.get("images", []):
+        source_path = source_split_dir / image["file_name"]
+        if not source_path.exists():
+            raise FileNotFoundError(
+                f"Image referenced by COCO JSON is missing: {source_path}"
+            )
+        copy_or_link(source_path, target_split_dir / image["file_name"], copy_mode)
+
+    source_counts = Counter()
+    new_annotations = []
+    next_annotation_id = 1
+    for annotation in coco.get("annotations", []):
+        old_category_id = annotation.get("category_id")
+        if old_category_id not in source_ids:
+            continue
+        source_counts[source_id_to_name[old_category_id]] += 1
+        new_annotation = dict(annotation)
+        new_annotation["id"] = next_annotation_id
+        new_annotation["category_id"] = 0
+        new_annotations.append(new_annotation)
+        next_annotation_id += 1
+
+    new_coco = {
+        key: value
+        for key, value in coco.items()
+        if key not in {"categories", "annotations"}
+    }
+    new_coco["categories"] = [
+        {"id": 0, "name": merged_class_name, "supercategory": "object"}
+    ]
+    new_coco["annotations"] = new_annotations
+    with (target_split_dir / "_annotations.coco.json").open("w") as f:
+        json.dump(new_coco, f, indent=2)
+
+    return {
+        "images": len(new_coco.get("images", [])),
+        "annotations_before": len(coco.get("annotations", [])),
+        "annotations_after": len(new_annotations),
+        "source_object_counts": dict(source_counts),
+        "classes": [merged_class_name],
+    }
 
 
 def prepare_class_filtered_dataset(args, source_dataset_dir, output_dir):
@@ -915,7 +1078,7 @@ def build_detector(num_classes, checkpoint_path, allow_class_mismatch):
     if not checkpoint_path.exists():
         raise FileNotFoundError(
             f"Source checkpoint not found: {checkpoint_path}\n"
-            "Train experiment_11 first or pass --source-checkpoint."
+            "Train the source model first or pass --source-checkpoint."
         )
 
     print(f"Loading source checkpoint: {checkpoint_path}")
@@ -931,7 +1094,7 @@ def build_detector(num_classes, checkpoint_path, allow_class_mismatch):
 def save_finetune_config(args, output_dir, class_names):
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
-        "source_experiment": "experiment_11",
+        "source_experiment": "experiment_14",
         "source_checkpoint": str(Path(args.source_checkpoint).expanduser().resolve()),
         "dataset_dir": str(Path(args.dataset_dir).expanduser().resolve()),
         "single_coco_json": args.single_coco_json,
@@ -958,6 +1121,9 @@ def save_finetune_config(args, output_dir, class_names):
         "resume": args.resume,
         "allow_class_mismatch": args.allow_class_mismatch,
         "include_classes": args.include_classes,
+        "merge_classes": args.merge_classes,
+        "merged_class_name": args.merged_class_name,
+        "merged_dataset_dir": args.merged_dataset_dir,
         "filtered_dataset_dir": args.filtered_dataset_dir,
         "label_remapped_dataset_dir": args.label_remapped_dataset_dir,
         "oversample_classes": args.oversample_classes,
@@ -978,18 +1144,21 @@ def main():
 
     dataset_dir = prepare_single_coco_split_dataset(args, dataset_dir, output_dir)
     ensure_valid_split(dataset_dir)
-    if args.include_classes or not getattr(args, "_single_coco_prepared", False):
-        dataset_dir = prepare_class_filtered_dataset(args, dataset_dir, output_dir)
+    dataset_dir = prepare_merged_binary_dataset(args, dataset_dir, output_dir)
     ensure_valid_split(dataset_dir)
     dataset_dir = prepare_oversampled_dataset(args, dataset_dir, output_dir)
     ensure_valid_split(dataset_dir)
     class_names = read_coco_classes(dataset_dir)
     print(f"Dataset: {dataset_dir}")
     print(f"Classes ({len(class_names)}): {class_names}")
-    if len(class_names) != 1 and not args.allow_class_mismatch:
+    if class_names != [args.merged_class_name]:
+        raise ValueError(
+            f"Expected binary class list {[args.merged_class_name]}, got {class_names}"
+        )
+    if not args.allow_class_mismatch:
         args.allow_class_mismatch = True
         print(
-            "Detected a multi-class fine-tuning dataset. Loading compatible "
+            "Fine-tuning a one-class binary detector. Loading compatible "
             "source weights with classification-head mismatches skipped.",
             flush=True,
         )
