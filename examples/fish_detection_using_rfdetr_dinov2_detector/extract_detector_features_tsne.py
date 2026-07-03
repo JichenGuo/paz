@@ -23,6 +23,20 @@ In-house Labelimage_Fish COCO dataset, ignoring category id 0/background::
         --point-source gt_boxes \
         --background-category-ids 0
 
+Only images containing rare crab/lobster, then plot crab/fish/lobster boxes::
+
+    python examples/fish_detection_using_rfdetr_dinov2_detector/extract_detector_features_tsne.py \
+        --image-dir datasets/Labelimage_Fish_coco/train \
+        --annotation-file datasets/Labelimage_Fish_coco/train/_annotations.coco.json \
+        --checkpoint /path/to/checkpoint.weights.h5 \
+        --detector large \
+        --class-names crab,fish,lobster \
+        --point-source gt_boxes \
+        --include-classes crab,fish,lobster \
+        --require-image-classes crab,lobster \
+        --background-category-ids 0 \
+        --max-points 0
+
 Two-stage prediction JSON, one point per classified detection::
 
     python examples/fish_detection_using_rfdetr_dinov2_detector/extract_detector_features_tsne.py \
@@ -257,6 +271,7 @@ def records_from_gt_boxes(
     image_dir,
     min_box_size,
     include_classes,
+    require_image_classes,
     background_category_ids,
     background_class_names,
 ):
@@ -268,15 +283,35 @@ def records_from_gt_boxes(
     )
     image_by_id = {image["id"]: image for image in coco.get("images", [])}
     include = {name.strip() for name in include_classes.split(",") if name.strip()}
+    required = {
+        name.strip() for name in require_image_classes.split(",") if name.strip()
+    }
+
+    allowed_image_ids = None
+    if required:
+        allowed_image_ids = set()
+        for annotation in coco.get("annotations", []):
+            category_id = annotation.get("category_id")
+            class_name = id_to_name.get(category_id)
+            if class_name in required:
+                allowed_image_ids.add(annotation.get("image_id"))
+        if not allowed_image_ids:
+            raise ValueError(
+                f"No images contain required classes: {sorted(required)}"
+            )
+
     records = []
     for annotation in coco.get("annotations", []):
+        image_id = annotation.get("image_id")
+        if allowed_image_ids is not None and image_id not in allowed_image_ids:
+            continue
         category_id = annotation.get("category_id")
         if category_id not in id_to_name:
             continue
         class_name = id_to_name[category_id]
         if include and class_name not in include:
             continue
-        image = image_by_id.get(annotation.get("image_id"))
+        image = image_by_id.get(image_id)
         if image is None:
             continue
         x, y, w, h = [float(value) for value in annotation.get("bbox", [])[:4]]
@@ -428,7 +463,39 @@ def save_metadata_csv(path, metadata, embeddings):
             writer.writerow(payload)
 
 
-def plot_tsne(path, embeddings, metadata):
+def compute_clustering_metrics(features, embeddings, metadata):
+    labels = [row["class_name"] for row in metadata]
+    unique_labels = sorted(set(labels))
+    if len(unique_labels) < 2 or len(features) <= len(unique_labels):
+        return {
+            "num_classes": len(unique_labels),
+            "message": "Need at least two classes and more points than classes.",
+        }
+    try:
+        from sklearn.metrics import calinski_harabasz_score
+        from sklearn.metrics import davies_bouldin_score
+        from sklearn.metrics import silhouette_score
+    except ImportError:
+        return {
+            "num_classes": len(unique_labels),
+            "message": "scikit-learn metrics unavailable.",
+        }
+
+    label_to_index = {label: index for index, label in enumerate(unique_labels)}
+    y = np.asarray([label_to_index[label] for label in labels])
+    metrics = {
+        "num_classes": len(unique_labels),
+        "labels": unique_labels,
+    }
+    for name, values in (("feature", features), ("tsne", embeddings)):
+        metrics[name] = {
+            "silhouette": float(silhouette_score(values, y)),
+            "davies_bouldin": float(davies_bouldin_score(values, y)),
+            "calinski_harabasz": float(calinski_harabasz_score(values, y)),
+        }
+    return metrics
+
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -475,6 +542,7 @@ def main():
             args.image_dir,
             args.min_box_size,
             args.include_classes,
+            args.require_image_classes,
             parse_csv_set(args.background_category_ids, int),
             parse_csv_set(args.background_class_names, str),
         )
@@ -500,6 +568,7 @@ def main():
     )
     features, metadata = extract_features(detector, records, args.batch_size)
     embeddings, used_perplexity = run_tsne(features, args.perplexity, args.random_state)
+    clustering_metrics = compute_clustering_metrics(features, embeddings, metadata)
 
     features_path = output_dir / "detector_features.npz"
     csv_path = output_dir / "detector_features_tsne.csv"
@@ -524,6 +593,10 @@ def main():
         "feature_dim": int(features.shape[1]),
         "perplexity": used_perplexity,
         "class_counts": dict(Counter(row["class_name"] for row in metadata)),
+        "selected_image_count": len({row["image_key"] for row in metadata}),
+        "required_image_classes": args.require_image_classes,
+        "included_point_classes": args.include_classes,
+        "clustering_metrics": clustering_metrics,
         "features_npz": str(features_path),
         "metadata_csv": str(csv_path),
         "plot_png": str(plot_path),
@@ -531,6 +604,7 @@ def main():
     with summary_path.open("w") as f:
         json.dump(summary, f, indent=2)
 
+    print(f"Clustering metrics: {clustering_metrics}")
     print(f"Saved features: {features_path}")
     print(f"Saved t-SNE CSV: {csv_path}")
     print(f"Saved t-SNE plot: {plot_path}")
