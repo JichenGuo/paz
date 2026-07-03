@@ -118,7 +118,23 @@ def parse_args():
     parser.add_argument("--perplexity", type=float, default=30.0)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--min-box-size", type=float, default=4.0)
-    parser.add_argument("--include-classes", default="")
+    parser.add_argument(
+        "--include-classes",
+        default="",
+        help=(
+            "Comma-separated object classes to include as t-SNE points. "
+            "For the in-house dataset use crab,fish,lobster."
+        ),
+    )
+    parser.add_argument(
+        "--require-image-classes",
+        default="",
+        help=(
+            "Comma-separated classes that an image must contain before any "
+            "records from that image are used. Matching is image-level OR. "
+            "Example: crab,lobster selects all images containing crab or lobster."
+        ),
+    )
     parser.add_argument(
         "--background-category-ids",
         default="0",
