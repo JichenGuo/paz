@@ -298,7 +298,7 @@ def main():
     
     elif args.detector.lower() == "large":
         print("the detector is large")
-        detector = build_detector_large(checkpoint_path, class_names)
+        detector = build_model_large(checkpoint_path, class_names)
 
     payload = {
         "input": str(input_path),
