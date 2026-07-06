@@ -12,10 +12,11 @@ The dataset is expected to be in COCO/RoboFlow layout:
 If your validation split is named ``val`` instead of ``valid``, the script
 creates a ``valid`` symlink or copy automatically.
 
-For the in-house ReefShield dataset, crab, fish, and lobster annotations are
-merged into one foreground class named ``sea_animal``. Category id 0 from the
-source Roboflow dataset is ignored because it is a non-object root/background
-category.
+For the in-house ReefShield dataset, crab and lobster training images are
+oversampled first while their original labels are still available. Then crab,
+fish, and lobster annotations are merged into one foreground class named
+``sea_animal``. Category id 0 from the source Roboflow dataset is ignored
+because it is a non-object root/background category.
 """
 
 import argparse
@@ -53,6 +54,8 @@ DEFAULT_OUTPUT_DIR = _SCRIPT_DIR / "finetune_runs" / "reefshield_binary_sea_anim
 DEFAULT_DATASET_DIR = _PAZ_ROOT / "datasets" / "Labelimage_Fish_coco_split_70_20_10"
 DEFAULT_MERGE_CLASSES = "crab,fish,lobster"
 DEFAULT_MERGED_CLASS_NAME = "sea_animal"
+DEFAULT_OVERSAMPLE_CLASSES = "crab,lobster"
+DEFAULT_RARE_REPEAT_FACTOR = 1
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
@@ -60,7 +63,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Load a well-trained RF-DETR Large checkpoint and fine-tune it for "
-            "binary sea_animal detection by merging crab, fish, and lobster."
+            "binary sea_animal detection by oversampling crab/lobster before merging crab, fish, and lobster."
         )
     )
     parser.add_argument(
@@ -160,19 +163,19 @@ def parse_args():
     )
     parser.add_argument(
         "--oversample-classes",
-        default="",
+        default=DEFAULT_OVERSAMPLE_CLASSES,
         help=(
             "Comma-separated rare class names to oversample, e.g. "
-            "'crab,lobster'. Disabled by default."
+            "'crab,lobster'. Defaults to crab,lobster. Pass an empty string or --rare-repeat-factor 0 to disable oversampling."
         ),
     )
     parser.add_argument(
         "--rare-repeat-factor",
         type=int,
-        default=0,
+        default=DEFAULT_RARE_REPEAT_FACTOR,
         help=(
             "Number of augmented copies to create for every training image "
-            "containing one of --oversample-classes. 0 disables oversampling."
+            "containing one of --oversample-classes. Defaults to 1. 0 disables oversampling."
         ),
     )
     parser.add_argument(
@@ -1144,9 +1147,9 @@ def main():
 
     dataset_dir = prepare_single_coco_split_dataset(args, dataset_dir, output_dir)
     ensure_valid_split(dataset_dir)
-    dataset_dir = prepare_merged_binary_dataset(args, dataset_dir, output_dir)
-    ensure_valid_split(dataset_dir)
     dataset_dir = prepare_oversampled_dataset(args, dataset_dir, output_dir)
+    ensure_valid_split(dataset_dir)
+    dataset_dir = prepare_merged_binary_dataset(args, dataset_dir, output_dir)
     ensure_valid_split(dataset_dir)
     class_names = read_coco_classes(dataset_dir)
     print(f"Dataset: {dataset_dir}")
