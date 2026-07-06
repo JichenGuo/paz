@@ -42,6 +42,8 @@ DEFAULT_TEST_DIR = (
 DEFAULT_FINETUNE_DIR = _EXP_DIR / "finetune_runs" / "from_experiment_10"
 DEFAULT_CHECKPOINT = DEFAULT_FINETUNE_DIR / "rfdetr_nano_finetuned_final.weights.h5"
 DEFAULT_CONFIG = DEFAULT_FINETUNE_DIR / "finetune_config.json"
+DEFAULT_MERGE_CLASSES = "crab,fish,lobster"
+DEFAULT_MERGED_CLASS_NAME = "sea_animal"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
@@ -69,7 +71,14 @@ class _TeeWriter:
 class CocoSplitDataset:
     """Small COCO split adapter for ``validate_epoch_full``."""
 
-    def __init__(self, split_dir, class_names, resolution=384):
+    def __init__(
+        self,
+        split_dir,
+        class_names,
+        resolution=384,
+        merge_class_names=None,
+        merged_class_name=None,
+    ):
         self.split_dir = Path(split_dir).expanduser().resolve()
         self.ann_path = self.split_dir / "_annotations.coco.json"
         self.resolution = resolution
@@ -86,9 +95,17 @@ class CocoSplitDataset:
         with self.ann_path.open() as f:
             coco = json.load(f)
 
-        self._category_id_to_label = build_category_mapping(
-            coco.get("categories", []), self.class_names
-        )
+        if merge_class_names:
+            self._category_id_to_label = build_merged_category_mapping(
+                coco.get("categories", []),
+                merge_class_names,
+                merged_class_name,
+                self.class_names,
+            )
+        else:
+            self._category_id_to_label = build_category_mapping(
+                coco.get("categories", []), self.class_names
+            )
         self._images = list(coco.get("images", []))
         self._annotations_by_image = {}
         for ann in coco.get("annotations", []):
@@ -195,6 +212,27 @@ def parse_args():
             "from finetune_config.json, then from test COCO categories."
         ),
     )
+    parser.add_argument(
+        "--merge-test-labels",
+        action="store_true",
+        help=(
+            "Merge --merge-classes labels in the test annotations into "
+            "--merged-class-name for binary sea_animal evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--merge-classes",
+        default=DEFAULT_MERGE_CLASSES,
+        help=(
+            "Comma-separated test annotation class names to map to "
+            "--merged-class-name when --merge-test-labels is set."
+        ),
+    )
+    parser.add_argument(
+        "--merged-class-name",
+        default=DEFAULT_MERGED_CLASS_NAME,
+        help="Merged foreground class name. Defaults to sea_animal.",
+    )
     return parser.parse_args()
 
 
@@ -263,11 +301,16 @@ def class_names_from_coco(split_dir):
 
 def read_class_names(args):
     if args.class_names.strip():
-        return [
+        class_names = [
             name.strip()
             for name in args.class_names.split(",")
             if name.strip()
         ]
+        validate_merged_class_names(args, class_names)
+        return class_names
+
+    if args.merge_test_labels:
+        return [args.merged_class_name]
 
     config_path = args.finetune_config.expanduser().resolve()
     if config_path.exists():
@@ -275,7 +318,9 @@ def read_class_names(args):
             config = json.load(f)
         class_names = config.get("class_names")
         if class_names:
-            return list(class_names)
+            class_names = list(class_names)
+            validate_merged_class_names(args, class_names)
+            return class_names
 
     return class_names_from_coco(args.test_dir)
 
@@ -305,6 +350,51 @@ def build_category_mapping(categories, class_names):
         category["id"]: idx
         for idx, category in enumerate(usable)
     }
+
+
+def parse_class_list(value):
+    return [name.strip() for name in value.split(",") if name.strip()]
+
+
+def validate_merged_class_names(args, class_names):
+    if not args.merge_test_labels:
+        return
+    if class_names != [args.merged_class_name]:
+        raise ValueError(
+            "--merge-test-labels requires the evaluated class list to be "
+            f"{[args.merged_class_name]}, got {class_names}. Pass "
+            f"--class-names {args.merged_class_name} or use a binary "
+            "fine-tune config."
+        )
+
+
+def build_merged_category_mapping(
+    categories,
+    merge_class_names,
+    merged_class_name,
+    class_names,
+):
+    if class_names != [merged_class_name]:
+        raise ValueError(
+            "Merged test-label evaluation expects a single model class "
+            f"{[merged_class_name]}, got {class_names}"
+        )
+
+    by_name = {
+        category["name"]: category["id"]
+        for category in categories
+        if category.get("supercategory", "") != "none"
+    }
+    if not merge_class_names:
+        raise ValueError("--merge-classes must contain at least one class name")
+
+    missing = sorted(set(merge_class_names) - set(by_name))
+    if missing:
+        raise ValueError(
+            f"Merge classes not found in test COCO categories: {missing}. "
+            f"Available: {sorted(by_name)}"
+        )
+    return {by_name[name]: 0 for name in merge_class_names}
 
 
 def resolve_checkpoint(path):
@@ -462,10 +552,29 @@ def main():
     test_dir = args.test_dir.expanduser().resolve()
     checkpoint = resolve_checkpoint(args.checkpoint)
     class_names = read_class_names(args)
+    merge_class_names = (
+        parse_class_list(args.merge_classes)
+        if args.merge_test_labels
+        else None
+    )
     if args.detector.lower() == "nano":
-        dataset = CocoSplitDataset(test_dir, class_names, resolution=384)
+        dataset = CocoSplitDataset(
+            test_dir,
+            class_names,
+            resolution=384,
+            merge_class_names=merge_class_names,
+            merged_class_name=args.merged_class_name,
+        )
     elif args.detector.lower() == "large":
-        dataset = CocoSplitDataset(test_dir, class_names, resolution=704)
+        dataset = CocoSplitDataset(
+            test_dir,
+            class_names,
+            resolution=704,
+            merge_class_names=merge_class_names,
+            merged_class_name=args.merged_class_name,
+        )
+    else:
+        raise ValueError(f"Unsupported detector: {args.detector}")
     indices = list(range(len(dataset)))
     max_batches = args.max_batches if args.max_batches > 0 else None
 
@@ -478,6 +587,13 @@ def main():
     logger.info("Confidence threshold: %s", args.conf_threshold)
     logger.info("Fine-tune config    : %s", args.finetune_config)
     logger.info("Test split          : %s", test_dir)
+    logger.info("Merge test labels   : %s", args.merge_test_labels)
+    if args.merge_test_labels:
+        logger.info(
+            "Merge classes       : %s -> %s",
+            merge_class_names,
+            args.merged_class_name,
+        )
     logger.info("Test images         : %d", len(dataset))
     logger.info("Classes (%d)        : %s", len(class_names), class_names)
     logger.info("Output dir          : %s", output_dir)
@@ -554,6 +670,9 @@ def main():
             "iou_threshold": args.iou_threshold,
             "max_batches": max_batches,
             "allow_class_mismatch": args.allow_class_mismatch,
+            "merge_test_labels": args.merge_test_labels,
+            "merge_classes": merge_class_names,
+            "merged_class_name": args.merged_class_name,
         },
         "elapsed_seconds": elapsed,
         "metrics": jsonable(metrics),
