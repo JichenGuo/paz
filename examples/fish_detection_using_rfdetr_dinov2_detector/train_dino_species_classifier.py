@@ -461,7 +461,7 @@ def main():
         ],
     )
 
-    checkpoint_path = output_dir / "fathomnet_dino_species_best.weights.h5"
+    checkpoint_path = output_dir / "reefshield_dino_species_best.weights.h5"
     callbacks = [
         keras.callbacks.ModelCheckpoint(
             filepath=str(checkpoint_path),
@@ -539,7 +539,7 @@ def main():
         callbacks=callbacks,
     )
 
-    final_path = output_dir / "fathomnet_dino_species_final.weights.h5"
+    final_path = output_dir / "reefshield_dino_species_final.weights.h5"
     model.save_weights(str(final_path))
     print(f"Saved best weights: {checkpoint_path}")
     print(f"Saved final weights: {final_path}")
