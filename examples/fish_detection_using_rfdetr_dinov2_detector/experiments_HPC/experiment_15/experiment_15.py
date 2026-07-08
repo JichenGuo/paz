@@ -398,6 +398,40 @@ def _write_coco(split_dir, images, annotations):
         json.dump(_make_coco(images, annotations), f, indent=2)
 
 
+def _copy_best_checkpoints(exp_dir):
+    checkpoint_dir = exp_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_aliases = [
+        (
+            exp_dir / "checkpoint_best_total.weights.h5",
+            checkpoint_dir / "rfdetr_large_fish_best.weights.h5",
+        ),
+        (
+            exp_dir / "checkpoint_best_regular.weights.h5",
+            checkpoint_dir / "rfdetr_large_fish_best_regular.weights.h5",
+        ),
+        (
+            exp_dir / "checkpoint_best_ema.weights.h5",
+            checkpoint_dir / "rfdetr_large_fish_best_ema.weights.h5",
+        ),
+    ]
+
+    copied = []
+    for source_path, target_path in checkpoint_aliases:
+        if not source_path.exists():
+            continue
+        shutil.copy2(source_path, target_path)
+        copied.append(target_path)
+        logger.info("Best checkpoint alias saved -> %s", target_path)
+
+    if not copied:
+        logger.warning(
+            "No built-in best checkpoints were found to alias. "
+            "Check that validation ran and produced checkpoint_best_*.weights.h5."
+        )
+    return copied
+
+
 def _prepare_merged_coco(
     deepfish_dir,
     ozfish_images_dir,
@@ -632,6 +666,7 @@ def main():
 
     logger.info("Starting training ...")
     model.train_from_config(config)
+    _copy_best_checkpoints(exp_dir)
 
     final_path = exp_dir / "checkpoints" / "rfdetr_large_fish_final.weights.h5"
     model.model.model.save_weights(str(final_path))
