@@ -568,12 +568,12 @@ def main():
     logger.info("EXPERIMENT 15: RF-DETR Large -- DeepFish + OzFish fish")
     logger.info("=" * 68)
 
-    deepfish_dir = _env_path("DEEPFISH_DIR", _PAZ_ROOT / "datasets" / "Deepfish")
+    deepfish_dir = _env_path("DEEPFISH_DIR", Path("/mnt/beegfs/home/jguo/datasets/Deepfish"))
     ozfish_images_dir = _env_path(
-        "OZFISH_IMAGES_DIR", _PAZ_ROOT / "datasets" / "OzFish" / "frames_labelled"
+        "OZFISH_IMAGES_DIR", Path("/mnt/beegfs/home/jguo/datasets/OzFish/frames_labelled")
     )
     ozfish_manifests_dir = _env_path(
-        "OZFISH_MANIFESTS_DIR", _PAZ_ROOT / "datasets" / "OzFish" / "manifests"
+        "OZFISH_MANIFESTS_DIR", Path("/mnt/beegfs/home/jguo/datasets/OzFish/manifests")
     )
     ozfish_train_ratio = _env_float("OZFISH_TRAIN_RATIO", OZFISH_TRAIN_RATIO)
     ozfish_split_seed = _env_int("OZFISH_SPLIT_SEED", 42)
