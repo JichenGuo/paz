@@ -5,7 +5,7 @@ This experiment prepares a COCO-style dataset with two splits:
 
     _coco_fish/
       train/  DeepFish train images + 80% of OzFish frames
-      valid/  remaining 20% of OzFish frames
+      valid/  DeepFish valid images + remaining 20% of OzFish frames
 
 OzFish annotations are read from SageMaker GroundTruth JSON Lines manifests.
 """
@@ -156,6 +156,7 @@ def _add_annotations(annotations, boxes, image_id, next_annotation_id):
 
 def _collect_deepfish(
     deepfish_dir,
+    split_name,
     target_dir,
     images,
     annotations,
@@ -166,18 +167,19 @@ def _collect_deepfish(
         raise FileNotFoundError(f"DeepFish dataset directory not found: {deepfish_dir}")
     image_paths = sorted(
         path
-        for path in deepfish_dir.glob("*/train/*")
+        for path in deepfish_dir.glob(f"*/{split_name}/*")
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     )
     if not image_paths:
         raise FileNotFoundError(
-            f"No DeepFish training images found under {deepfish_dir}/*/train"
+            f"No DeepFish {split_name} images found under "
+            f"{deepfish_dir}/*/{split_name}"
         )
 
     before_annotations = len(annotations)
     for source_path in image_paths:
         subset_name = source_path.parents[1].name
-        file_name = f"deepfish_{subset_name}_{source_path.name}"
+        file_name = f"deepfish_{split_name}_{subset_name}_{source_path.name}"
         width, height = _image_size(source_path)
         _safe_symlink(source_path, target_dir / file_name)
         images.append(
@@ -461,16 +463,30 @@ def _prepare_merged_coco(
     next_annotation_id = 1
 
     logger.info("Collecting DeepFish train images from %s", deepfish_dir)
-    deepfish_summary = _collect_deepfish(
+    deepfish_train_summary = _collect_deepfish(
         deepfish_dir,
+        "train",
         train_dir,
         train_images,
         train_annotations,
         next_image_id,
         next_annotation_id,
     )
-    next_image_id = deepfish_summary.pop("next_image_id")
-    next_annotation_id = deepfish_summary.pop("next_annotation_id")
+    next_image_id = deepfish_train_summary.pop("next_image_id")
+    next_annotation_id = deepfish_train_summary.pop("next_annotation_id")
+
+    logger.info("Collecting DeepFish valid images from %s", deepfish_dir)
+    deepfish_valid_summary = _collect_deepfish(
+        deepfish_dir,
+        "valid",
+        valid_dir,
+        valid_images,
+        valid_annotations,
+        next_image_id,
+        next_annotation_id,
+    )
+    next_image_id = deepfish_valid_summary.pop("next_image_id")
+    next_annotation_id = deepfish_valid_summary.pop("next_annotation_id")
 
     logger.info(
         "Loading OzFish manifests from %s and frames from %s",
@@ -523,7 +539,8 @@ def _prepare_merged_coco(
         "ozfish_manifests_dir": str(ozfish_manifests_dir),
         "ozfish_train_ratio": ozfish_train_ratio,
         "split_seed": split_seed,
-        "deepfish": deepfish_summary,
+        "deepfish_train": deepfish_train_summary,
+        "deepfish_valid": deepfish_valid_summary,
         "ozfish_train": ozfish_train_summary,
         "ozfish_valid": ozfish_valid_summary,
         "train_images": len(train_images),
@@ -640,7 +657,7 @@ def main():
 
     exp_config = {
         "experiment": "experiment_15",
-        "description": "RF-DETR Large trained on DeepFish train + OzFish 80/20 as fish",
+        "description": "RF-DETR Large trained on DeepFish train + OzFish 80/20 as fish; validated on DeepFish valid + OzFish 20%",
         "variant": "RFDETRLarge",
         "class_names": [CLASS_NAME],
         "num_classes": 1,
@@ -659,7 +676,7 @@ def main():
         "lr_encoder": lr_encoder,
         "warmup_epochs": warmup_epochs,
         "resolution": model.model_config.resolution,
-        "validation": "OzFish 20% split in valid/",
+        "validation": "DeepFish valid split + OzFish 20% split in valid/",
     }
     with (exp_dir / "experiment_config.json").open("w") as f:
         json.dump(exp_config, f, indent=2)
