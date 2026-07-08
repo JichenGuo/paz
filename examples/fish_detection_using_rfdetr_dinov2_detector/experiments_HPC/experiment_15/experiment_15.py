@@ -1,10 +1,19 @@
 #!/usr/bin/env python
-"""Experiment 15: RF-DETR Large on DeepFish + OzFish as ``Fish``.
+"""Experiment 15: RF-DETR Large on DeepFish + OzFish as ``fish``.
+
+This experiment prepares a COCO-style dataset with two splits:
+
+    _coco_fish/
+      train/  DeepFish train images + 80% of OzFish frames
+      valid/  remaining 20% of OzFish frames
+
+OzFish annotations are read from SageMaker GroundTruth JSON Lines manifests.
 """
 
 import json
 import logging
 import os
+import random
 import shutil
 import sys
 from pathlib import Path
@@ -31,7 +40,8 @@ from train_utils import setup_logging
 
 logger = logging.getLogger(__name__)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-CLASS_NAME = "sea_animal"
+CLASS_NAME = "fish"
+OZFISH_TRAIN_RATIO = 0.80
 
 
 class _TeeWriter:
@@ -144,8 +154,14 @@ def _add_annotations(annotations, boxes, image_id, next_annotation_id):
     return next_annotation_id
 
 
-def _collect_deepfish(deepfish_dir, target_dir, images, annotations,
-                            next_image_id, next_annotation_id):
+def _collect_deepfish(
+    deepfish_dir,
+    target_dir,
+    images,
+    annotations,
+    next_image_id,
+    next_annotation_id,
+):
     if not deepfish_dir.exists():
         raise FileNotFoundError(f"DeepFish dataset directory not found: {deepfish_dir}")
     image_paths = sorted(
@@ -186,31 +202,155 @@ def _collect_deepfish(deepfish_dir, target_dir, images, annotations,
     }
 
 
-def _collect_fathomnet(fathomnet_dir, target_dir, images, annotations,
-                             next_image_id, next_annotation_id):
-    ann_path = fathomnet_dir / "train_dataset.json"
-    if not ann_path.exists():
-        raise FileNotFoundError(f"FathomNet annotations not found: {ann_path}")
-    with ann_path.open() as f:
-        coco = json.load(f)
-
-    anns_by_image = {}
-    for ann in coco.get("annotations", []):
-        anns_by_image.setdefault(ann["image_id"], []).append(ann)
-
-    before_annotations = len(annotations)
-    missing_images = []
-    for image in coco.get("images", []):
-        source_path = fathomnet_dir / image["file_name"]
-        if not source_path.exists():
-            missing_images.append(str(source_path))
+def _source_key_from_image_name(filename):
+    lower_name = filename.lower()
+    first_extension_index = None
+    first_extension = None
+    for extension in IMAGE_EXTENSIONS:
+        index = lower_name.find(extension)
+        if index == -1:
             continue
+        if first_extension_index is None or index < first_extension_index:
+            first_extension_index = index
+            first_extension = extension
+    if first_extension_index is None:
+        return filename
+    return filename[:first_extension_index + len(first_extension)]
 
-        file_name = f"fathomnet_{Path(image['file_name']).name}"
-        image_width = int(image.get("width") or 0)
-        image_height = int(image.get("height") or 0)
-        if image_width <= 0 or image_height <= 0:
-            image_width, image_height = _image_size(source_path)
+
+def _build_ozfish_image_index(ozfish_images_dir):
+    if not ozfish_images_dir.exists():
+        raise FileNotFoundError(
+            f"OzFish frames_labelled directory not found: {ozfish_images_dir}"
+        )
+    image_index = {}
+    for image_path in sorted(ozfish_images_dir.rglob("*")):
+        if not image_path.is_file():
+            continue
+        if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        source_key = _source_key_from_image_name(image_path.name)
+        image_index.setdefault(source_key, image_path)
+    if not image_index:
+        raise FileNotFoundError(f"No OzFish images found under {ozfish_images_dir}")
+    return image_index
+
+
+def _get_ozfish_payload(record):
+    for value in record.values():
+        if not isinstance(value, dict):
+            continue
+        if "annotations" in value and "image_size" in value:
+            return value
+    return None
+
+
+def _load_ozfish_records(ozfish_images_dir, ozfish_manifests_dir, manifest_glob):
+    if not ozfish_manifests_dir.exists():
+        raise FileNotFoundError(
+            f"OzFish manifests directory not found: {ozfish_manifests_dir}"
+        )
+    manifest_paths = sorted(
+        path for path in ozfish_manifests_dir.glob(manifest_glob) if path.is_file()
+    )
+    if not manifest_paths:
+        raise FileNotFoundError(
+            f"No OzFish manifest files matched {ozfish_manifests_dir / manifest_glob}"
+        )
+
+    image_index = _build_ozfish_image_index(ozfish_images_dir)
+    records = []
+    missing_images = []
+    for manifest_path in manifest_paths:
+        with manifest_path.open() as manifest_file:
+            for line_number, line in enumerate(manifest_file, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"Invalid JSON in {manifest_path}:{line_number}"
+                    ) from error
+                source_ref = Path(record.get("source-ref", "")).name
+                payload = _get_ozfish_payload(record)
+                if payload is None:
+                    continue
+                image_path = image_index.get(source_ref)
+                if image_path is None:
+                    missing_images.append(f"{manifest_path}:{line_number} {source_ref}")
+                    continue
+                records.append(
+                    {
+                        "source_ref": source_ref,
+                        "image_path": image_path,
+                        "payload": payload,
+                    }
+                )
+
+    if missing_images:
+        preview = "\n".join(missing_images[:10])
+        raise FileNotFoundError(
+            f"{len(missing_images)} OzFish manifest rows reference missing images. "
+            f"First missing rows:\n{preview}"
+        )
+    if not records:
+        raise FileNotFoundError(
+            f"No usable OzFish manifest rows found in {ozfish_manifests_dir}"
+        )
+    return records
+
+
+def _split_records(records, train_ratio, seed):
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError(f"OZFISH_TRAIN_RATIO must be between 0 and 1, got {train_ratio}")
+    if len(records) < 2:
+        raise ValueError("Need at least 2 OzFish records to create train/valid splits")
+    shuffled = list(records)
+    random.Random(seed).shuffle(shuffled)
+    train_count = int(round(len(shuffled) * train_ratio))
+    train_count = max(1, min(train_count, len(shuffled) - 1))
+    return shuffled[:train_count], shuffled[train_count:]
+
+
+def _ozfish_boxes(payload, image_width, image_height):
+    image_size = payload.get("image_size", [{}])[0]
+    manifest_width = float(image_size.get("width") or image_width)
+    manifest_height = float(image_size.get("height") or image_height)
+    x_scale = image_width / manifest_width
+    y_scale = image_height / manifest_height
+
+    boxes = []
+    for annotation in payload.get("annotations", []):
+        clipped = _clip_bbox_xywh(
+            float(annotation["left"]) * x_scale,
+            float(annotation["top"]) * y_scale,
+            float(annotation["width"]) * x_scale,
+            float(annotation["height"]) * y_scale,
+            image_width,
+            image_height,
+        )
+        if clipped is not None:
+            boxes.append(clipped)
+    return boxes
+
+
+def _collect_ozfish(
+    records,
+    target_dir,
+    split_name,
+    images,
+    annotations,
+    next_image_id,
+    next_annotation_id,
+):
+    before_annotations = len(annotations)
+    for record in records:
+        source_path = record["image_path"]
+        batch_name = source_path.parent.name
+        file_name = f"ozfish_{split_name}_{batch_name}_{source_path.name}"
+        image_width, image_height = _image_size(source_path)
         _safe_symlink(source_path, target_dir / file_name)
         images.append(
             {
@@ -220,101 +360,154 @@ def _collect_fathomnet(fathomnet_dir, target_dir, images, annotations,
                 "file_name": file_name,
             }
         )
-
-        boxes = []
-        for ann in anns_by_image.get(image["id"], []):
-            bbox = ann.get("bbox", [])
-            if len(bbox) != 4:
-                continue
-            clipped = _clip_bbox_xywh(*bbox, image_width, image_height)
-            if clipped is not None:
-                boxes.append(clipped)
+        boxes = _ozfish_boxes(record["payload"], image_width, image_height)
         next_annotation_id = _add_annotations(
             annotations, boxes, next_image_id, next_annotation_id
         )
         next_image_id += 1
 
-    if missing_images:
-        preview = "\n".join(missing_images[:10])
-        raise FileNotFoundError(
-            f"{len(missing_images)} FathomNet images referenced by JSON are missing. "
-            f"First missing files:\n{preview}"
-        )
-
     return {
-        "images": len(coco.get("images", [])),
+        "images": len(records),
         "annotations": len(annotations) - before_annotations,
-        "source_categories": len(coco.get("categories", [])),
         "next_image_id": next_image_id,
         "next_annotation_id": next_annotation_id,
     }
 
 
-def _prepare_merged_coco(deepfish_dir, fathomnet_dir, output_dir, rebuild=True):
-    coco_dir = output_dir / "_coco_sea_animal"
-    train_dir = coco_dir / "train"
-    ann_path = train_dir / "_annotations.coco.json"
-    if coco_dir.exists() and rebuild:
-        shutil.rmtree(coco_dir)
-    if ann_path.exists() and not rebuild:
-        logger.info("Using existing merged COCO dataset: %s", coco_dir)
-        return coco_dir
-
-    train_dir.mkdir(parents=True, exist_ok=True)
-    images = []
-    annotations = []
-    next_image_id = 1
-    next_annotation_id = 1
-
-    logger.info("Collecting DeepFish train images from %s", deepfish_dir)
-    deepfish_summary = _collect_deepfish(
-        deepfish_dir, train_dir, images, annotations, next_image_id, next_annotation_id
-    )
-    next_image_id = deepfish_summary.pop("next_image_id")
-    next_annotation_id = deepfish_summary.pop("next_annotation_id")
-
-    logger.info("Collecting FathomNet images from %s", fathomnet_dir)
-    fathomnet_summary = _collect_fathomnet(
-        fathomnet_dir, train_dir, images, annotations, next_image_id, next_annotation_id
-    )
-    fathomnet_summary.pop("next_image_id")
-    fathomnet_summary.pop("next_annotation_id")
-
-    coco = {
+def _make_coco(images, annotations):
+    return {
         "images": images,
         "annotations": annotations,
         "categories": [
             {
                 "id": 0,
                 "name": CLASS_NAME,
-                "supercategory": "sea_animal",
+                "supercategory": "fish",
             }
         ],
         "info": {
-            "description": "Experiment 12 merged DeepFish/FathomNet sea_animal dataset"
+            "description": "Experiment 15 DeepFish/OzFish fish dataset"
         },
         "licenses": [],
     }
-    with ann_path.open("w") as f:
-        json.dump(coco, f, indent=2)
+
+
+def _write_coco(split_dir, images, annotations):
+    split_dir.mkdir(parents=True, exist_ok=True)
+    with (split_dir / "_annotations.coco.json").open("w") as f:
+        json.dump(_make_coco(images, annotations), f, indent=2)
+
+
+def _prepare_merged_coco(
+    deepfish_dir,
+    ozfish_images_dir,
+    ozfish_manifests_dir,
+    output_dir,
+    rebuild=True,
+    ozfish_train_ratio=OZFISH_TRAIN_RATIO,
+    split_seed=42,
+    manifest_glob="*",
+):
+    coco_dir = output_dir / "_coco_fish"
+    train_dir = coco_dir / "train"
+    valid_dir = coco_dir / "valid"
+    train_ann_path = train_dir / "_annotations.coco.json"
+    valid_ann_path = valid_dir / "_annotations.coco.json"
+    if coco_dir.exists() and rebuild:
+        shutil.rmtree(coco_dir)
+    if train_ann_path.exists() and valid_ann_path.exists() and not rebuild:
+        logger.info("Using existing merged COCO dataset: %s", coco_dir)
+        return coco_dir
+
+    train_images = []
+    train_annotations = []
+    valid_images = []
+    valid_annotations = []
+    next_image_id = 1
+    next_annotation_id = 1
+
+    logger.info("Collecting DeepFish train images from %s", deepfish_dir)
+    deepfish_summary = _collect_deepfish(
+        deepfish_dir,
+        train_dir,
+        train_images,
+        train_annotations,
+        next_image_id,
+        next_annotation_id,
+    )
+    next_image_id = deepfish_summary.pop("next_image_id")
+    next_annotation_id = deepfish_summary.pop("next_annotation_id")
+
+    logger.info(
+        "Loading OzFish manifests from %s and frames from %s",
+        ozfish_manifests_dir,
+        ozfish_images_dir,
+    )
+    ozfish_records = _load_ozfish_records(
+        ozfish_images_dir, ozfish_manifests_dir, manifest_glob
+    )
+    ozfish_train_records, ozfish_valid_records = _split_records(
+        ozfish_records, ozfish_train_ratio, split_seed
+    )
+
+    logger.info(
+        "Collecting OzFish split: %d train / %d valid",
+        len(ozfish_train_records),
+        len(ozfish_valid_records),
+    )
+    ozfish_train_summary = _collect_ozfish(
+        ozfish_train_records,
+        train_dir,
+        "train",
+        train_images,
+        train_annotations,
+        next_image_id,
+        next_annotation_id,
+    )
+    next_image_id = ozfish_train_summary.pop("next_image_id")
+    next_annotation_id = ozfish_train_summary.pop("next_annotation_id")
+
+    ozfish_valid_summary = _collect_ozfish(
+        ozfish_valid_records,
+        valid_dir,
+        "valid",
+        valid_images,
+        valid_annotations,
+        next_image_id,
+        next_annotation_id,
+    )
+    ozfish_valid_summary.pop("next_image_id")
+    ozfish_valid_summary.pop("next_annotation_id")
+
+    _write_coco(train_dir, train_images, train_annotations)
+    _write_coco(valid_dir, valid_images, valid_annotations)
 
     summary = {
         "class_name": CLASS_NAME,
         "deepfish_dir": str(deepfish_dir),
-        "fathomnet_dir": str(fathomnet_dir),
+        "ozfish_images_dir": str(ozfish_images_dir),
+        "ozfish_manifests_dir": str(ozfish_manifests_dir),
+        "ozfish_train_ratio": ozfish_train_ratio,
+        "split_seed": split_seed,
         "deepfish": deepfish_summary,
-        "fathomnet": fathomnet_summary,
-        "total_images": len(images),
-        "total_annotations": len(annotations),
+        "ozfish_train": ozfish_train_summary,
+        "ozfish_valid": ozfish_valid_summary,
+        "train_images": len(train_images),
+        "train_annotations": len(train_annotations),
+        "valid_images": len(valid_images),
+        "valid_annotations": len(valid_annotations),
         "output_dir": str(coco_dir),
     }
     with (coco_dir / "merge_summary.json").open("w") as f:
         json.dump(summary, f, indent=2)
 
     logger.info(
-        "Merged COCO dataset: %d images, %d annotations -> %s",
-        len(images),
-        len(annotations),
+        "Merged COCO dataset: train=%d images/%d annotations, "
+        "valid=%d images/%d annotations -> %s",
+        len(train_images),
+        len(train_annotations),
+        len(valid_images),
+        len(valid_annotations),
         coco_dir,
     )
     return coco_dir
@@ -338,11 +531,19 @@ def main():
         print("JAX device diagnostics unavailable:", exc)
 
     logger.info("=" * 68)
-    logger.info("EXPERIMENT 12: RF-DETR Large — DeepFish + FathomNet sea_animal")
+    logger.info("EXPERIMENT 15: RF-DETR Large -- DeepFish + OzFish fish")
     logger.info("=" * 68)
 
-    deepfish_dir = _env_path("DEEPFISH_DIR", Path("/mnt/beegfs/home/jguo/datasets/Deepfish"))
-    fathomnet_dir = _env_path("FATHOMNET_DIR", Path("/mnt/beegfs/home/jguo/datasets/fathomnet"))
+    deepfish_dir = _env_path("DEEPFISH_DIR", _PAZ_ROOT / "datasets" / "Deepfish")
+    ozfish_images_dir = _env_path(
+        "OZFISH_IMAGES_DIR", _PAZ_ROOT / "datasets" / "OzFish" / "frames_labelled"
+    )
+    ozfish_manifests_dir = _env_path(
+        "OZFISH_MANIFESTS_DIR", _PAZ_ROOT / "datasets" / "OzFish" / "manifests"
+    )
+    ozfish_train_ratio = _env_float("OZFISH_TRAIN_RATIO", OZFISH_TRAIN_RATIO)
+    ozfish_split_seed = _env_int("OZFISH_SPLIT_SEED", 42)
+    ozfish_manifest_glob = os.environ.get("OZFISH_MANIFEST_GLOB", "*")
     rebuild_dataset = bool(_env_int("RFDETR_REBUILD_DATASET", 1))
 
     batch_size = _env_int("RFDETR_BATCH_SIZE", 16)
@@ -354,7 +555,14 @@ def main():
     warmup_epochs = _env_float("RFDETR_WARMUP_EPOCHS", 0.0)
 
     coco_dir = _prepare_merged_coco(
-        deepfish_dir, fathomnet_dir, exp_dir, rebuild=rebuild_dataset
+        deepfish_dir,
+        ozfish_images_dir,
+        ozfish_manifests_dir,
+        exp_dir,
+        rebuild=rebuild_dataset,
+        ozfish_train_ratio=ozfish_train_ratio,
+        split_seed=ozfish_split_seed,
+        manifest_glob=ozfish_manifest_glob,
     )
 
     logger.info("Creating RFDETRLarge (num_classes=1) ...")
@@ -388,8 +596,8 @@ def main():
         square_resize_div_64=True,
         checkpoint_interval=10,
         early_stopping=False,
-        eval_interval=0,
-        eval_ema=False,
+        eval_interval=1,
+        eval_ema=True,
         amp=True,
         num_workers=num_workers,
         run_test=False,
@@ -397,13 +605,17 @@ def main():
     )
 
     exp_config = {
-        "experiment": "experiment_12",
-        "description": "RF-DETR Large trained on DeepFish train + FathomNet as sea_animal",
+        "experiment": "experiment_15",
+        "description": "RF-DETR Large trained on DeepFish train + OzFish 80/20 as fish",
         "variant": "RFDETRLarge",
         "class_names": [CLASS_NAME],
         "num_classes": 1,
         "deepfish_dir": str(deepfish_dir),
-        "fathomnet_dir": str(fathomnet_dir),
+        "ozfish_images_dir": str(ozfish_images_dir),
+        "ozfish_manifests_dir": str(ozfish_manifests_dir),
+        "ozfish_train_ratio": ozfish_train_ratio,
+        "ozfish_split_seed": ozfish_split_seed,
+        "ozfish_manifest_glob": ozfish_manifest_glob,
         "coco_dir": str(coco_dir),
         "epochs": epochs,
         "batch_size": batch_size,
@@ -413,7 +625,7 @@ def main():
         "lr_encoder": lr_encoder,
         "warmup_epochs": warmup_epochs,
         "resolution": model.model_config.resolution,
-        "validation": "disabled; all requested source images are used for training",
+        "validation": "OzFish 20% split in valid/",
     }
     with (exp_dir / "experiment_config.json").open("w") as f:
         json.dump(exp_config, f, indent=2)
@@ -421,7 +633,7 @@ def main():
     logger.info("Starting training ...")
     model.train_from_config(config)
 
-    final_path = exp_dir / "checkpoints" / "rfdetr_large_sea_animal_final.weights.h5"
+    final_path = exp_dir / "checkpoints" / "rfdetr_large_fish_final.weights.h5"
     model.model.model.save_weights(str(final_path))
     logger.info("Final weights saved -> %s", final_path)
 
