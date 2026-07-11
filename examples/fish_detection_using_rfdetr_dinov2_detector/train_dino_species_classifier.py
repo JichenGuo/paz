@@ -454,10 +454,10 @@ def main():
         loss="sparse_categorical_crossentropy",
         metrics=[
             keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
-            keras.metrics.SparseTopKCategoricalAccuracy(
-                k=top_k,
-                name=f"top{top_k}_accuracy",
-            ),
+            # keras.metrics.SparseTopKCategoricalAccuracy(
+            #     k=top_k,
+            #     name=f"top{top_k}_accuracy",
+            # ),
         ],
     )
 
