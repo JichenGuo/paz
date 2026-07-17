@@ -10,7 +10,8 @@ COCO ground-truth boxes, one point per annotated object::
         --annotation-file datasets/fathomnet/train_dataset.json \
         --checkpoint /path/to/checkpoint.weights.h5 \
         --detector large \
-        --point-source gt_boxes
+        --point-source gt_boxes \
+        --umap-dimensions 3
 
 In-house Labelimage_Fish COCO dataset, ignoring category id 0/background::
 
@@ -131,6 +132,13 @@ def parse_args():
         "--umap-metric",
         default="euclidean",
         help="Distance metric used by UMAP.",
+    )
+    parser.add_argument(
+        "--umap-dimensions",
+        type=int,
+        choices=(2, 3),
+        default=2,
+        help="Number of UMAP embedding dimensions to compute and plot.",
     )
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--min-box-size", type=float, default=4.0)
@@ -458,7 +466,7 @@ def extract_features(detector, records, batch_size):
     return np.stack(features, axis=0), metadata
 
 
-def run_umap(features, n_neighbors, min_dist, metric, random_state):
+def run_umap(features, n_neighbors, min_dist, metric, random_state, n_components):
     try:
         from sklearn.preprocessing import StandardScaler
         import umap
@@ -474,7 +482,7 @@ def run_umap(features, n_neighbors, min_dist, metric, random_state):
     n_neighbors = min(max(2, int(n_neighbors)), len(features) - 1)
     scaled = StandardScaler().fit_transform(features)
     reducer = umap.UMAP(
-        n_components=2,
+        n_components=n_components,
         n_neighbors=n_neighbors,
         min_dist=float(min_dist),
         metric=metric,
@@ -484,8 +492,11 @@ def run_umap(features, n_neighbors, min_dist, metric, random_state):
 
 
 def save_metadata_csv(path, metadata, embeddings):
+    umap_fields = ["umap_x", "umap_y"]
+    if embeddings.shape[1] == 3:
+        umap_fields.append("umap_z")
     fieldnames = sorted({key for row in metadata for key in row})
-    fieldnames = ["umap_x", "umap_y"] + fieldnames
+    fieldnames = umap_fields + fieldnames
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -493,6 +504,8 @@ def save_metadata_csv(path, metadata, embeddings):
             payload = dict(row)
             payload["umap_x"] = float(embedding[0])
             payload["umap_y"] = float(embedding[1])
+            if embeddings.shape[1] == 3:
+                payload["umap_z"] = float(embedding[2])
             writer.writerow(payload)
 
 
@@ -534,27 +547,33 @@ def plot_umap(path, embeddings, metadata):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    is_3d = embeddings.shape[1] == 3
     labels = [row["class_name"] for row in metadata]
     unique_labels = sorted(set(labels))
     cmap = plt.get_cmap("tab20", max(1, len(unique_labels)))
     label_to_color = {label: cmap(index) for index, label in enumerate(unique_labels)}
 
-    fig, ax = plt.subplots(figsize=(12, 9))
+    subplot_kw = {"projection": "3d"} if is_3d else {}
+    fig, ax = plt.subplots(figsize=(12, 9), subplot_kw=subplot_kw)
     for label in unique_labels:
         indices = [index for index, value in enumerate(labels) if value == label]
         points = embeddings[indices]
-        ax.scatter(
-            points[:, 0],
-            points[:, 1],
-            s=16,
-            alpha=0.78,
-            color=label_to_color[label],
-            label=f"{label} ({len(indices)})",
-            edgecolors="none",
-        )
-    ax.set_title("RF-DETR backbone features UMAP")
+        scatter_kwargs = {
+            "s": 16,
+            "alpha": 0.78,
+            "color": label_to_color[label],
+            "label": f"{label} ({len(indices)})",
+            "edgecolors": "none",
+        }
+        if is_3d:
+            ax.scatter(points[:, 0], points[:, 1], points[:, 2], **scatter_kwargs)
+        else:
+            ax.scatter(points[:, 0], points[:, 1], **scatter_kwargs)
+    ax.set_title(f"RF-DETR backbone features {embeddings.shape[1]}D UMAP")
     ax.set_xlabel("UMAP 1")
     ax.set_ylabel("UMAP 2")
+    if is_3d:
+        ax.set_zlabel("UMAP 3")
     ax.grid(True, alpha=0.2)
     if len(unique_labels) <= 35:
         ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
@@ -607,6 +626,7 @@ def main():
         args.min_dist,
         args.umap_metric,
         args.random_state,
+        args.umap_dimensions,
     )
     clustering_metrics = compute_clustering_metrics(features, embeddings, metadata)
 
@@ -634,6 +654,7 @@ def main():
         "n_neighbors": used_n_neighbors,
         "min_dist": args.min_dist,
         "umap_metric": args.umap_metric,
+        "umap_dimensions": args.umap_dimensions,
         "class_counts": dict(Counter(row["class_name"] for row in metadata)),
         "selected_image_count": len({row["image_key"] for row in metadata}),
         "required_image_classes": args.require_image_classes,
