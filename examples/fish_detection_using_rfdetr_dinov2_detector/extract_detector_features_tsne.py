@@ -10,7 +10,8 @@ COCO ground-truth boxes, one point per annotated object::
         --annotation-file datasets/fathomnet/train_dataset.json \
         --checkpoint /path/to/checkpoint.weights.h5 \
         --detector large \
-        --point-source gt_boxes
+        --point-source gt_boxes \
+        --tsne-dimensions 3
 
 In-house Labelimage_Fish COCO dataset, ignoring category id 0/background::
 
@@ -116,6 +117,13 @@ def parse_args():
     parser.add_argument("--max-points", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--perplexity", type=float, default=30.0)
+    parser.add_argument(
+        "--tsne-dimensions",
+        type=int,
+        choices=(2, 3),
+        default=2,
+        help="Number of t-SNE embedding dimensions to compute and plot.",
+    )
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--min-box-size", type=float, default=4.0)
     parser.add_argument(
@@ -442,7 +450,7 @@ def extract_features(detector, records, batch_size):
     return np.stack(features, axis=0), metadata
 
 
-def run_tsne(features, perplexity, random_state):
+def run_tsne(features, perplexity, random_state, n_components):
     try:
         from sklearn.manifold import TSNE
         from sklearn.preprocessing import StandardScaler
@@ -457,7 +465,7 @@ def run_tsne(features, perplexity, random_state):
     perplexity = min(float(perplexity), max(1.0, (len(features) - 1) / 3.0))
     scaled = StandardScaler().fit_transform(features)
     tsne = TSNE(
-        n_components=2,
+        n_components=n_components,
         perplexity=perplexity,
         init="pca",
         learning_rate="auto",
@@ -467,8 +475,11 @@ def run_tsne(features, perplexity, random_state):
 
 
 def save_metadata_csv(path, metadata, embeddings):
+    tsne_fields = ["tsne_x", "tsne_y"]
+    if embeddings.shape[1] == 3:
+        tsne_fields.append("tsne_z")
     fieldnames = sorted({key for row in metadata for key in row})
-    fieldnames = ["tsne_x", "tsne_y"] + fieldnames
+    fieldnames = tsne_fields + fieldnames
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -476,6 +487,8 @@ def save_metadata_csv(path, metadata, embeddings):
             payload = dict(row)
             payload["tsne_x"] = float(embedding[0])
             payload["tsne_y"] = float(embedding[1])
+            if embeddings.shape[1] == 3:
+                payload["tsne_z"] = float(embedding[2])
             writer.writerow(payload)
 
 
@@ -517,27 +530,33 @@ def plot_tsne(path, embeddings, metadata):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    is_3d = embeddings.shape[1] == 3
     labels = [row["class_name"] for row in metadata]
     unique_labels = sorted(set(labels))
     cmap = plt.get_cmap("tab20", max(1, len(unique_labels)))
     label_to_color = {label: cmap(index) for index, label in enumerate(unique_labels)}
 
-    fig, ax = plt.subplots(figsize=(12, 9))
+    subplot_kw = {"projection": "3d"} if is_3d else {}
+    fig, ax = plt.subplots(figsize=(12, 9), subplot_kw=subplot_kw)
     for label in unique_labels:
         indices = [index for index, value in enumerate(labels) if value == label]
         points = embeddings[indices]
-        ax.scatter(
-            points[:, 0],
-            points[:, 1],
-            s=16,
-            alpha=0.78,
-            color=label_to_color[label],
-            label=f"{label} ({len(indices)})",
-            edgecolors="none",
-        )
-    ax.set_title("RF-DETR backbone features t-SNE")
+        scatter_kwargs = {
+            "s": 16,
+            "alpha": 0.78,
+            "color": label_to_color[label],
+            "label": f"{label} ({len(indices)})",
+            "edgecolors": "none",
+        }
+        if is_3d:
+            ax.scatter(points[:, 0], points[:, 1], points[:, 2], **scatter_kwargs)
+        else:
+            ax.scatter(points[:, 0], points[:, 1], **scatter_kwargs)
+    ax.set_title(f"RF-DETR backbone features {embeddings.shape[1]}D t-SNE")
     ax.set_xlabel("t-SNE 1")
     ax.set_ylabel("t-SNE 2")
+    if is_3d:
+        ax.set_zlabel("t-SNE 3")
     ax.grid(True, alpha=0.2)
     if len(unique_labels) <= 35:
         ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
@@ -584,7 +603,12 @@ def main():
         read_class_names(args.class_names),
     )
     features, metadata = extract_features(detector, records, args.batch_size)
-    embeddings, used_perplexity = run_tsne(features, args.perplexity, args.random_state)
+    embeddings, used_perplexity = run_tsne(
+        features,
+        args.perplexity,
+        args.random_state,
+        args.tsne_dimensions,
+    )
     clustering_metrics = compute_clustering_metrics(features, embeddings, metadata)
 
     features_path = output_dir / "detector_features.npz"
@@ -609,6 +633,7 @@ def main():
         "num_points": len(metadata),
         "feature_dim": int(features.shape[1]),
         "perplexity": used_perplexity,
+        "tsne_dimensions": args.tsne_dimensions,
         "class_counts": dict(Counter(row["class_name"] for row in metadata)),
         "selected_image_count": len({row["image_key"] for row in metadata}),
         "required_image_classes": args.require_image_classes,
