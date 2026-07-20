@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """Fine-tune RF-DETR Large for binary ReefShield sea-animal detection.
 
+The pretrained model is from experiment_12/checkpoint0029.weights.h5, which is pretrained on the merged dataset of DeepFosh & Fathom dataset for sea_animal detection (binary classfication)
+
 The dataset is expected to be in COCO/RoboFlow layout:
 
     dataset_dir/
