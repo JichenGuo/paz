@@ -19,17 +19,11 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from detect_video import (  # noqa: E402
-    COUNT_BG_COLOR,
     COUNT_CLASSES,
-    COUNT_FONT_SIZE,
-    COUNT_MARGIN,
-    COUNT_PADDING,
-    COUNT_TEXT_COLOR,
     DEFAULT_CHECKPOINT,
     build_model_nano,
     build_model_large,
     detections_to_records,
-    draw_detections,
     make_writer,
     open_video,
     parse_count_classes,
@@ -39,10 +33,15 @@ from detect_video import (  # noqa: E402
 )
 
 
-TRACK_BOX_COLOR = (0, 255, 255)
-TRACK_TEXT_COLOR = (255, 255, 255)
-TRACK_TEXT_BG_COLOR = (0, 105, 130)
-TRACK_FONT_SIZE = 30
+TRACK_BOX_COLOR = (0, 90, 255)
+TRACK_TEXT_COLOR = (0, 90, 255)
+TRACK_TEXT_STROKE_COLOR = (255, 255, 255)
+MIN_TRACK_FONT_SIZE = 34
+COUNT_TEXT_COLOR = (255, 255, 255)
+COUNT_TEXT_STROKE_COLOR = (0, 0, 0)
+COUNT_BG_COLOR = (0, 35, 90)
+COUNT_BORDER_COLOR = (255, 255, 255)
+MIN_COUNT_FONT_SIZE = 34
 
 
 def parse_args():
@@ -232,12 +231,16 @@ def draw_track_overlay(
 ):
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
+    image_width, image_height = annotated.size
+    short_side = min(image_width, image_height)
+    font_size = max(MIN_TRACK_FONT_SIZE, round(short_side * 0.045))
+    box_width = max(7, round(short_side * 0.009))
+    text_stroke_width = max(2, round(font_size * 0.06))
+    label_gap = max(4, round(box_width * 0.5))
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", TRACK_FONT_SIZE)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
     except OSError:
         font = ImageFont.load_default()
-
-    image_width, image_height = annotated.size
     for track in tracks:
         if not track.is_confirmed():
             continue
@@ -254,59 +257,85 @@ def draw_track_overlay(
             continue
 
         class_name = remembered_track_class_name(track, track_class_names)
-        counted = track_id in counted_track_ids
-        if counted:
-            display_id = counted_display_ids[track_id]
-            label = f"{class_name} id:{display_id}"
-        else:
-            label = f"{class_name}"
+        label = f"{class_name} ID:{track_id}"
 
-        draw.rectangle((x1, y1, x2, y2), outline=TRACK_BOX_COLOR, width=3)
+        draw.rectangle(
+            (x1, y1, x2, y2),
+            outline=TRACK_BOX_COLOR,
+            width=box_width,
+        )
         left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
         text_width = right - left
         text_height = bottom - top
-        text_y = max(0, y1 - text_height - 6)
-        draw.rectangle(
-            (x1, text_y, x1 + text_width + 6, text_y + text_height + 4),
-            fill=TRACK_TEXT_BG_COLOR,
+        text_x = min(max(0, x1), max(0, image_width - text_width))
+        if y1 >= text_height + label_gap:
+            text_y = y1 - text_height - label_gap
+        else:
+            text_y = min(y1 + label_gap, max(0, image_height - text_height))
+        draw.text(
+            (text_x - left, text_y - top),
+            label,
+            fill=TRACK_TEXT_COLOR,
+            font=font,
+            stroke_width=text_stroke_width,
+            stroke_fill=TRACK_TEXT_STROKE_COLOR,
         )
-        draw.text((x1 + 3, text_y + 2), label, fill=TRACK_TEXT_COLOR, font=font)
     return annotated
 
 
 def draw_count_overlay(image, counts):
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated, "RGBA")
+    image_width, image_height = annotated.size
+    short_side = min(image_width, image_height)
+    font_size = max(MIN_COUNT_FONT_SIZE, round(short_side * 0.04))
+    padding = max(12, round(font_size * 0.4))
+    margin = max(12, round(short_side * 0.018))
+    line_gap = max(8, round(font_size * 0.25))
+    border_width = max(3, round(short_side * 0.004))
+    text_stroke_width = max(1, round(font_size * 0.04))
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", COUNT_FONT_SIZE)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
     except OSError:
         font = ImageFont.load_default()
 
     lines = [f"{name}: {count}" for name, count in counts.items()]
+    if not lines:
+        return annotated
     text_boxes = [draw.textbbox((0, 0), line, font=font) for line in lines]
     line_widths = [right - left for left, top, right, bottom in text_boxes]
     line_heights = [bottom - top for left, top, right, bottom in text_boxes]
-    line_gap = max(4, COUNT_FONT_SIZE // 5)
-    box_width = max(line_widths) + 2 * COUNT_PADDING
+    box_width = max(line_widths) + 2 * padding
     box_height = (
         sum(line_heights)
         + line_gap * max(0, len(lines) - 1)
-        + 2 * COUNT_PADDING
+        + 2 * padding
     )
 
-    image_width, _ = annotated.size
-    x1 = max(0, image_width - box_width - COUNT_MARGIN)
-    y1 = COUNT_MARGIN
+    x1 = max(0, image_width - box_width - margin)
+    y1 = margin
     x2 = x1 + box_width
     y2 = y1 + box_height
-    draw.rectangle((x1, y1, x2, y2), fill=(*COUNT_BG_COLOR, 170))
+    draw.rectangle(
+        (x1, y1, x2, y2),
+        fill=(*COUNT_BG_COLOR, 230),
+        outline=(*COUNT_BORDER_COLOR, 255),
+        width=border_width,
+    )
 
-    y = y1 + COUNT_PADDING
+    y = y1 + padding
     for line, line_height, text_box in zip(lines, line_heights, text_boxes):
-        left, _, right, _ = text_box
+        left, top, right, bottom = text_box
         text_width = right - left
-        x = x2 - COUNT_PADDING - text_width
-        draw.text((x, y), line, fill=COUNT_TEXT_COLOR, font=font)
+        x = x2 - padding - text_width
+        draw.text(
+            (x - left, y - top),
+            line,
+            fill=COUNT_TEXT_COLOR,
+            font=font,
+            stroke_width=text_stroke_width,
+            stroke_fill=COUNT_TEXT_STROKE_COLOR,
+        )
         y += line_height + line_gap
 
     return annotated
@@ -406,7 +435,8 @@ def annotate_frame(
         min_track_frames,
     )
 
-    annotated = draw_detections(Image.fromarray(frame_rgb), result, class_names)
+    # Draw only confirmed tracks; raw detector boxes and labels stay hidden.
+    annotated = Image.fromarray(frame_rgb)
     annotated = draw_track_overlay(
         annotated,
         tracks,
