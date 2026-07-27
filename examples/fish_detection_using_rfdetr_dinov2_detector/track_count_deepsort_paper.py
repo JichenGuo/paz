@@ -257,7 +257,10 @@ def draw_track_overlay(
             continue
 
         class_name = remembered_track_class_name(track, track_class_names)
-        label = f"{class_name} ID:{track_id}"
+        if track_id in counted_track_ids:
+            label = f"{class_name} ID {counted_display_ids[track_id]}"
+        else:
+            label = class_name
 
         draw.rectangle(
             (x1, y1, x2, y2),
@@ -367,8 +370,8 @@ def count_tracks_once(
             continue
 
         counted_name = count_lookup[normalized_class]
-        counted_display_ids[track_id] = counts[counted_name]
         counts[counted_name] += 1
+        counted_display_ids[track_id] = counts[counted_name]
         counted_track_ids.add(track_id)
         newly_counted.append(track_id)
     return newly_counted
