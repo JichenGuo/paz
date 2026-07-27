@@ -31,10 +31,15 @@ from paz.models.detection.dino_v2_object_detection.detr import RFDETRNano, RFDET
 DEFAULT_CHECKPOINT = _SCRIPT_DIR / "checkpoints" / "rfdetr_nano_best.weights.h5"
 DEFAULT_CLASS_NAMES = ["fish"]
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-BOX_COLOR = (255, 0, 0)
-TEXT_COLOR = (255, 0, 0)
-TEXT_BG_COLOR = (0, 120, 170)
-TEXT_FONT_SIZE = 32
+# Publication-friendly annotation style. Yellow remains visible on both dark
+# underwater scenes and blue/green backgrounds; the black outline preserves
+# contrast when figures are reduced for a paper.
+BOX_COLOR = (255, 215, 0)
+BOX_OUTLINE_COLOR = (0, 0, 0)
+TEXT_COLOR = (0, 0, 0)
+TEXT_BG_COLOR = (255, 215, 0)
+TEXT_BORDER_COLOR = (0, 0, 0)
+MIN_TEXT_FONT_SIZE = 32
 
 
 def parse_args():
@@ -231,11 +236,23 @@ def label_name(label, class_names):
 def draw_detections(image, detections, class_names):
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
+    width, height = annotated.size
+
+    # Scale annotations with the image so they remain readable when a
+    # high-resolution result is reduced to a single- or double-column figure.
+    short_side = min(width, height)
+    font_size = max(MIN_TEXT_FONT_SIZE, round(short_side * 0.04))
+    box_width = max(6, round(short_side * 0.008))
+    outer_width = box_width + max(2, round(box_width * 0.5))
+    padding_x = max(8, round(font_size * 0.30))
+    padding_y = max(5, round(font_size * 0.18))
+    label_gap = max(3, round(box_width * 0.5))
+    border_width = max(2, round(box_width * 0.35))
+
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", TEXT_FONT_SIZE)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
     except OSError:
         font = ImageFont.load_default()
-    width, height = annotated.size
 
     for box, score, label in zip(
         detections["boxes"], detections["scores"], detections["labels"]
@@ -249,17 +266,40 @@ def draw_detections(image, detections, class_names):
             continue
 
         text = f"{label_name(label, class_names)} {float(score):.2f}"
-        draw.rectangle((x1, y1, x2, y2), outline=BOX_COLOR, width=3)
+        # A black outer stroke followed by a bright inner stroke prevents the
+        # bounding box from disappearing against either light or dark regions.
+        draw.rectangle(
+            (x1, y1, x2, y2),
+            outline=BOX_OUTLINE_COLOR,
+            width=outer_width,
+        )
+        draw.rectangle((x1, y1, x2, y2), outline=BOX_COLOR, width=box_width)
 
         left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
         text_w = right - left
         text_h = bottom - top
-        text_y = max(0, y1 - text_h - 6)
+        label_w = text_w + 2 * padding_x
+        label_h = text_h + 2 * padding_y
+        text_x = min(max(0, x1), max(0, width - label_w))
+        if y1 >= label_h + label_gap:
+            text_y = y1 - label_h - label_gap
+        else:
+            text_y = min(y1 + label_gap, max(0, height - label_h))
+
         draw.rectangle(
-            (x1, text_y, x1 + text_w + 6, text_y + text_h + 4),
+            (text_x, text_y, text_x + label_w, text_y + label_h),
             fill=TEXT_BG_COLOR,
+            outline=TEXT_BORDER_COLOR,
+            width=border_width,
         )
-        draw.text((x1 + 3, text_y + 2), text, fill=TEXT_COLOR, font=font)
+        draw.text(
+            (text_x + padding_x - left, text_y + padding_y - top),
+            text,
+            fill=TEXT_COLOR,
+            font=font,
+            stroke_width=max(1, round(font_size * 0.025)),
+            stroke_fill=TEXT_COLOR,
+        )
 
     return annotated
 
