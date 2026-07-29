@@ -33,9 +33,15 @@ from detect_video import (  # noqa: E402
 )
 
 
-TRACK_BOX_COLOR = (0, 90, 255)
-TRACK_TEXT_COLOR = (0, 90, 255)
-TRACK_TEXT_STROKE_COLOR = (255, 255, 255)
+TRACK_CLASS_COLORS = {
+    "fish": (0, 90, 255),
+    "crab": (145, 40, 200),
+    "lobster": (255, 110, 0),
+}
+DEFAULT_TRACK_COLOR = (0, 160, 180)
+TRACK_TEXT_COLOR = (255, 255, 255)
+TRACK_TEXT_STROKE_COLOR = (0, 0, 0)
+TRACK_LABEL_BORDER_COLOR = (255, 255, 255)
 MIN_TRACK_FONT_SIZE = 34
 COUNT_TEXT_COLOR = (255, 255, 255)
 COUNT_TEXT_STROKE_COLOR = (0, 0, 0)
@@ -237,6 +243,9 @@ def draw_track_overlay(
     box_width = max(7, round(short_side * 0.009))
     text_stroke_width = max(2, round(font_size * 0.06))
     label_gap = max(4, round(box_width * 0.5))
+    padding_x = max(9, round(font_size * 0.3))
+    padding_y = max(6, round(font_size * 0.18))
+    label_border_width = max(2, round(box_width * 0.35))
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
     except OSError:
@@ -261,22 +270,33 @@ def draw_track_overlay(
             label = f"{class_name} ID {counted_display_ids[track_id]}"
         else:
             label = class_name
+        track_color = TRACK_CLASS_COLORS.get(
+            class_name.lower(), DEFAULT_TRACK_COLOR
+        )
 
         draw.rectangle(
             (x1, y1, x2, y2),
-            outline=TRACK_BOX_COLOR,
+            outline=track_color,
             width=box_width,
         )
         left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
         text_width = right - left
         text_height = bottom - top
-        text_x = min(max(0, x1), max(0, image_width - text_width))
-        if y1 >= text_height + label_gap:
-            text_y = y1 - text_height - label_gap
+        label_width = text_width + 2 * padding_x
+        label_height = text_height + 2 * padding_y
+        label_x = min(max(0, x1), max(0, image_width - label_width))
+        if y1 >= label_height + label_gap:
+            label_y = y1 - label_height - label_gap
         else:
-            text_y = min(y1 + label_gap, max(0, image_height - text_height))
+            label_y = min(y1 + label_gap, max(0, image_height - label_height))
+        draw.rectangle(
+            (label_x, label_y, label_x + label_width, label_y + label_height),
+            fill=track_color,
+            outline=TRACK_LABEL_BORDER_COLOR,
+            width=label_border_width,
+        )
         draw.text(
-            (text_x - left, text_y - top),
+            (label_x + padding_x - left, label_y + padding_y - top),
             label,
             fill=TRACK_TEXT_COLOR,
             font=font,
