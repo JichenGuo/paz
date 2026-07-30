@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -434,6 +435,7 @@ def annotate_frame(
     min_track_frames,
     max_draw_missed_frames,
 ):
+    pipeline_start = time.perf_counter()
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     result = detector.predict(frame_rgb, threshold=threshold)[0]
     detection_records = detections_to_records(result, class_names)
@@ -471,13 +473,21 @@ def annotate_frame(
     )
     annotated = draw_count_overlay(annotated, counts)
     annotated_bgr = cv2.cvtColor(np.asarray(annotated), cv2.COLOR_RGB2BGR)
-    return annotated_bgr, detection_records, tracks_to_records(
+    track_records = tracks_to_records(
         tracks,
         track_lengths,
         counted_track_ids,
         counted_display_ids,
         track_class_names,
-    ), newly_counted
+    )
+    pipeline_time_ms = (time.perf_counter() - pipeline_start) * 1000.0
+    return (
+        annotated_bgr,
+        detection_records,
+        track_records,
+        newly_counted,
+        pipeline_time_ms,
+    )
 
 
 def main():
@@ -550,6 +560,7 @@ def main():
     }
 
     processed = 0
+    pipeline_times_ms = []
     try:
         while True:
             if args.max_frames is not None and processed >= args.max_frames:
@@ -560,7 +571,13 @@ def main():
                 break
 
             frame_index = args.start_frame + processed
-            annotated, detections, tracks, newly_counted = annotate_frame(
+            (
+                annotated,
+                detections,
+                tracks,
+                newly_counted,
+                pipeline_time_ms,
+            ) = annotate_frame(
                 frame,
                 detector,
                 tracker,
@@ -575,12 +592,14 @@ def main():
                 args.min_track_frames,
                 args.max_draw_missed_frames,
             )
+            pipeline_times_ms.append(pipeline_time_ms)
             writer.write(annotated)
 
             if json_path is not None:
                 payload["frames"].append(
                     {
                         "frame_index": frame_index,
+                        "pipeline_inference_time_ms": pipeline_time_ms,
                         "num_detections": len(detections),
                         "num_tracks": len(tracks),
                         "counts": dict(counts),
@@ -594,7 +613,8 @@ def main():
             if processed == 1 or processed % 25 == 0:
                 print(
                     f"Processed {processed} frames "
-                    f"(active tracks: {len(tracks)}, counts: {dict(counts)})"
+                    f"(active tracks: {len(tracks)}, counts: {dict(counts)}, "
+                    f"pipeline: {pipeline_time_ms:.1f} ms)"
                 )
     finally:
         capture.release()
@@ -605,10 +625,43 @@ def main():
     payload["counted_track_ids"] = sorted(counted_track_ids)
     payload["counted_display_ids"] = counted_display_ids
     payload["track_class_names"] = track_class_names
+    timing_scope = (
+        "preprocessing, detection, DeepSORT tracking, counting, and overlay "
+        "rendering; excludes video decoding and writing"
+    )
+    if pipeline_times_ms:
+        total_pipeline_seconds = sum(pipeline_times_ms) / 1000.0
+        timing_summary = {
+            "scope": timing_scope,
+            "total_seconds": total_pipeline_seconds,
+            "mean_ms_per_frame": float(np.mean(pipeline_times_ms)),
+            "median_ms_per_frame": float(np.median(pipeline_times_ms)),
+            "p95_ms_per_frame": float(np.percentile(pipeline_times_ms, 95)),
+            "pipeline_fps": processed / total_pipeline_seconds,
+        }
+    else:
+        timing_summary = {
+            "scope": timing_scope,
+            "total_seconds": 0.0,
+            "mean_ms_per_frame": None,
+            "median_ms_per_frame": None,
+            "p95_ms_per_frame": None,
+            "pipeline_fps": None,
+        }
+    payload["pipeline_timing"] = timing_summary
     write_json(json_path, payload)
 
     print(f"Processed frames: {processed}")
     print(f"Final counts: {dict(counts)}")
+    if pipeline_times_ms:
+        print(
+            "Pipeline timing: "
+            f"total={timing_summary['total_seconds']:.3f} s, "
+            f"mean={timing_summary['mean_ms_per_frame']:.2f} ms/frame, "
+            f"median={timing_summary['median_ms_per_frame']:.2f} ms/frame, "
+            f"p95={timing_summary['p95_ms_per_frame']:.2f} ms/frame, "
+            f"FPS={timing_summary['pipeline_fps']:.2f}"
+        )
     print(f"Tracked video: {output_path}")
     if json_path is not None:
         print(f"Tracking JSON: {json_path}")
