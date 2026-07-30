@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 # Must be set before importing keras/paz.
@@ -327,13 +328,19 @@ def main():
     }
 
     total_detections = 0
+    inference_times_ms = []
     for index, image_path in enumerate(image_paths, start=1):
         output_path = output_paths[image_path]
         print(f"[{index}/{len(image_paths)}] Detecting: {image_path}")
 
         image, image_array = load_rgb_image(image_path)
+        inference_start = time.perf_counter()
         result = detector.predict(image_array, threshold=args.threshold)[0]
+        # Converting outputs to Python values also synchronizes asynchronous
+        # accelerator work before stopping the timer.
         records = detections_to_records(result, class_names)
+        inference_time_ms = (time.perf_counter() - inference_start) * 1000.0
+        inference_times_ms.append(inference_time_ms)
         total_detections += len(records)
 
         annotated = draw_detections(image, result, class_names)
@@ -343,12 +350,16 @@ def main():
             {
                 "image": str(image_path),
                 "annotated_image": str(output_path),
+                "inference_time_ms": inference_time_ms,
                 "num_detections": len(records),
                 "detections": records,
             }
         )
 
-        print(f"  Detections: {len(records)}")
+        print(
+            f"  Detections: {len(records)}; "
+            f"inference: {inference_time_ms:.2f} ms"
+        )
         for record in records:
             box = ", ".join(f"{v:.1f}" for v in record["box_xyxy"])
             print(
@@ -357,11 +368,32 @@ def main():
             )
 
     payload["total_detections"] = total_detections
+    total_inference_seconds = sum(inference_times_ms) / 1000.0
+    payload["inference_timing"] = {
+        "scope": (
+            "detector prediction and output materialization; excludes image "
+            "loading, annotation drawing, and file writing"
+        ),
+        "total_seconds": total_inference_seconds,
+        "mean_ms_per_image": float(np.mean(inference_times_ms)),
+        "median_ms_per_image": float(np.median(inference_times_ms)),
+        "p95_ms_per_image": float(np.percentile(inference_times_ms, 95)),
+        "inference_fps": len(inference_times_ms) / total_inference_seconds,
+    }
     with open(json_path, "w") as f:
         json.dump(payload, f, indent=2)
 
     print(f"Processed images: {len(image_paths)}")
     print(f"Total detections: {total_detections}")
+    timing = payload["inference_timing"]
+    print(
+        "Inference timing: "
+        f"total={timing['total_seconds']:.3f} s, "
+        f"mean={timing['mean_ms_per_image']:.2f} ms/image, "
+        f"median={timing['median_ms_per_image']:.2f} ms/image, "
+        f"p95={timing['p95_ms_per_image']:.2f} ms/image, "
+        f"FPS={timing['inference_fps']:.2f}"
+    )
     print(f"Detection JSON: {json_path}")
 
 
