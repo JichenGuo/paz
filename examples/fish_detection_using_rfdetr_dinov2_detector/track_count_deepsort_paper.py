@@ -43,12 +43,12 @@ DEFAULT_TRACK_COLOR = (0, 160, 180)
 TRACK_TEXT_COLOR = (255, 255, 255)
 TRACK_TEXT_STROKE_COLOR = (0, 0, 0)
 TRACK_LABEL_BORDER_COLOR = (255, 255, 255)
-MIN_TRACK_FONT_SIZE = 42
+MIN_TRACK_FONT_SIZE = 48
 COUNT_TEXT_COLOR = (255, 255, 255)
 COUNT_TEXT_STROKE_COLOR = (0, 0, 0)
 COUNT_BG_COLOR = (0, 35, 90)
 COUNT_BORDER_COLOR = (255, 255, 255)
-MIN_COUNT_FONT_SIZE = 42
+MIN_COUNT_FONT_SIZE = 48
 
 
 def parse_args():
@@ -240,7 +240,7 @@ def draw_track_overlay(
     draw = ImageDraw.Draw(annotated)
     image_width, image_height = annotated.size
     short_side = min(image_width, image_height)
-    font_size = max(MIN_TRACK_FONT_SIZE, round(short_side * 0.055))
+    font_size = max(MIN_TRACK_FONT_SIZE, round(short_side * 0.065))
     box_width = max(7, round(short_side * 0.009))
     text_stroke_width = max(2, round(font_size * 0.06))
     label_gap = max(4, round(box_width * 0.5))
@@ -312,7 +312,7 @@ def draw_count_overlay(image, counts):
     draw = ImageDraw.Draw(annotated, "RGBA")
     image_width, image_height = annotated.size
     short_side = min(image_width, image_height)
-    font_size = max(MIN_COUNT_FONT_SIZE, round(short_side * 0.05))
+    font_size = max(MIN_COUNT_FONT_SIZE, round(short_side * 0.06))
     padding = max(12, round(font_size * 0.4))
     margin = max(12, round(short_side * 0.018))
     line_gap = max(8, round(font_size * 0.25))
