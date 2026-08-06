@@ -258,7 +258,8 @@ def draw_detections(image, detections, class_names):
         if x2 <= x1 or y2 <= y1:
             continue
 
-        text = label_name(label, class_names)
+        #text = label_name(label, class_names)
+        text = f"{label_name(label, class_names)} {float(score):.2f}"
         draw.rectangle((x1, y1, x2, y2), outline=BOX_COLOR, width=box_width)
 
         left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
