@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 # Must be set before importing keras/paz.
@@ -317,7 +318,9 @@ def annotate_frame(
     threshold,
 ):
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    inference_start = time.perf_counter()
     result = detector.predict(frame_rgb, threshold=threshold)[0]
+    inference_time_ms = (time.perf_counter() - inference_start) * 1000.0
     records = detections_to_records(result, class_names)
     counts = count_records(records, count_classes)
     for name, count in counts.items():
@@ -327,7 +330,7 @@ def annotate_frame(
     )
     annotated = draw_count_overlay(annotated, maxn_counts)
     annotated_bgr = cv2.cvtColor(np.asarray(annotated), cv2.COLOR_RGB2BGR)
-    return annotated_bgr, records, counts
+    return annotated_bgr, records, counts, inference_time_ms
 
 
 def write_json(json_path, payload):
@@ -388,6 +391,7 @@ def main():
     processed = 0
     total_detections = 0
     maxn_counts = {name: 0 for name in count_classes}
+    inference_times_ms = []
     try:
         while True:
             if args.max_frames is not None and processed >= args.max_frames:
@@ -398,7 +402,7 @@ def main():
                 break
 
             frame_index = args.start_frame + processed
-            annotated, records, counts = annotate_frame(
+            annotated, records, counts, inference_time_ms = annotate_frame(
                 frame,
                 detector,
                 class_names,
@@ -407,6 +411,7 @@ def main():
                 maxn_counts,
                 threshold=args.threshold,
             )
+            inference_times_ms.append(inference_time_ms)
             writer.write(annotated)
 
             total_detections += len(records)
@@ -415,6 +420,12 @@ def main():
                     {
                         "frame_index": frame_index,
                         "num_detections": len(records),
+                        "inference_time_ms": inference_time_ms,
+                        "inference_fps": (
+                            1000.0 / inference_time_ms
+                            if inference_time_ms > 0.0
+                            else None
+                        ),
                         "counts": counts,
                         "maxn": dict(maxn_counts),
                         "detections": records,
@@ -426,7 +437,8 @@ def main():
                 print(
                     f"Processed {processed} frames "
                     f"(last frame detections: {len(records)}, "
-                    f"MaxN: {dict(maxn_counts)})"
+                    f"MaxN: {dict(maxn_counts)}, "
+                    f"inference: {inference_time_ms:.1f} ms)"
                 )
     finally:
         capture.release()
@@ -435,11 +447,40 @@ def main():
     payload["processed_frames"] = processed
     payload["total_detections"] = total_detections
     payload["final_maxn"] = dict(maxn_counts)
+    if inference_times_ms:
+        total_inference_seconds = sum(inference_times_ms) / 1000.0
+        inference_summary = {
+            "scope": "detector.predict only; excludes video I/O and rendering",
+            "total_seconds": total_inference_seconds,
+            "mean_ms_per_frame": float(np.mean(inference_times_ms)),
+            "median_ms_per_frame": float(np.median(inference_times_ms)),
+            "p95_ms_per_frame": float(np.percentile(inference_times_ms, 95)),
+            "inference_fps": processed / total_inference_seconds,
+        }
+    else:
+        inference_summary = {
+            "scope": "detector.predict only; excludes video I/O and rendering",
+            "total_seconds": 0.0,
+            "mean_ms_per_frame": None,
+            "median_ms_per_frame": None,
+            "p95_ms_per_frame": None,
+            "inference_fps": None,
+        }
+    payload["inference_timing"] = inference_summary
     write_json(json_path, payload)
 
     print(f"Processed frames: {processed}")
     print(f"Total detections: {total_detections}")
     print(f"Final MaxN: {dict(maxn_counts)}")
+    if inference_times_ms:
+        print(
+            "Inference timing: "
+            f"total={inference_summary['total_seconds']:.3f} s, "
+            f"mean={inference_summary['mean_ms_per_frame']:.2f} ms/frame, "
+            f"median={inference_summary['median_ms_per_frame']:.2f} ms/frame, "
+            f"p95={inference_summary['p95_ms_per_frame']:.2f} ms/frame, "
+            f"FPS={inference_summary['inference_fps']:.2f}"
+        )
     print(f"Annotated video: {output_path}")
     if json_path is not None:
         print(f"Detection JSON: {json_path}")
