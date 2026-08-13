@@ -1,8 +1,9 @@
 #!/usr/bin/env python
-"""Fine-tune only the RF-DETR Large detection head.
+"""Fine-tune the RF-DETR Large decoder and detection heads.
 
-The DINOv2 backbone, transformer, and learned query embeddings are frozen.
-Only the classification and bounding-box detection heads are updated.
+The DINOv2 encoder and feature projector are frozen. The transformer decoder,
+classification and bounding-box heads, and learned query embeddings are
+updated.
 
 The new dataset is expected to be in COCO/RoboFlow layout:
 
@@ -54,11 +55,7 @@ if str(_PAZ_ROOT) not in sys.path:
 
 from paz.models.detection.dino_v2_object_detection.config import TrainConfig
 from paz.models.detection.dino_v2_object_detection.detr import RFDETRLarge
-from src.training_helpers import (
-    apply_train_mode,
-    count_component_parameters,
-    count_parameters,
-)
+from src.training_helpers import apply_train_mode
 
 
 DEFAULT_SOURCE_CHECKPOINT = (
@@ -72,8 +69,8 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Load an RF-DETR Large checkpoint and fine-tune only its detection "
-            "head while keeping DINOv2 and the transformer frozen."
+            "Load an RF-DETR Large checkpoint and fine-tune its decoder and "
+            "detection heads while keeping the DINOv2 backbone frozen."
         )
     )
     parser.add_argument(
@@ -939,58 +936,52 @@ def build_detector(num_classes, checkpoint_path, allow_class_mismatch):
     return detector
 
 
-def freeze_for_head_only_training(detector):
-    """Make the classification and bounding-box heads the only trainable part."""
+def freeze_for_decoder_only_training(detector):
+    """Freeze the backbone while training the decoder and detection heads."""
     model = detector.model.model
-    apply_train_mode(model, "head_only")
+    freeze_summary = apply_train_mode(model, "decoder_only")
+    component_params = freeze_summary["component_params"]
 
-    # The repository's generic head_only mode keeps learned queries trainable.
-    # Freeze them as well so this script trains the detection heads strictly.
-    model.refpoint_embed._trainable = False
-    model.query_feat._trainable = False
-
-    component_params = count_component_parameters(model)
-    expected_frozen = {"backbone", "transformer", "query_embeddings"}
-    for component in expected_frozen:
-        trainable = component_params.get(component, {}).get("trainable", 0)
-        if trainable:
-            raise RuntimeError(
-                f"Head-only freezing failed: {component} still has "
-                f"{trainable:,} trainable parameters"
-            )
-
-    unexpected_components = {
-        component
-        for component, counts in component_params.items()
-        if component != "detection_head" and counts["trainable"] > 0
-    }
-    if unexpected_components:
+    backbone_trainable = component_params.get("backbone", {}).get("trainable", 0)
+    if backbone_trainable:
         raise RuntimeError(
-            "Head-only freezing failed; unexpected trainable components: "
-            f"{sorted(unexpected_components)}"
+            "Decoder-only freezing failed: backbone still has "
+            f"{backbone_trainable:,} trainable parameters"
         )
-    if component_params.get("detection_head", {}).get("trainable", 0) == 0:
-        raise RuntimeError("Detection head has no trainable parameters")
 
-    params = count_parameters(model)
-    print("Training mode: detection head only", flush=True)
+    expected_trainable = {
+        "transformer",
+        "detection_head",
+        "query_embeddings",
+    }
+    missing_trainable = {
+        component
+        for component in expected_trainable
+        if component_params.get(component, {}).get("trainable", 0) == 0
+    }
+    if missing_trainable:
+        raise RuntimeError(
+            "Decoder-only freezing failed; components have no trainable "
+            f"parameters: {sorted(missing_trainable)}"
+        )
+
+    params = freeze_summary["params"]
+    print("Training mode: decoder only", flush=True)
     print(
-        "  Frozen: DINOv2 backbone, feature projector, transformer, queries",
+        "  Frozen: DINOv2 backbone and feature projector",
         flush=True,
     )
-    print("  Trainable: classification and bounding-box heads", flush=True)
+    print(
+        "  Trainable: transformer decoder, detection heads, query embeddings",
+        flush=True,
+    )
     print(
         f"  Parameters: {params['trainable']:,} trainable / "
         f"{params['total']:,} total "
         f"({params['pct_trainable']:.2f}% trainable)",
         flush=True,
     )
-    return {
-        "frozen_components": sorted(expected_frozen),
-        "trainable_components": ["detection_head"],
-        "params": params,
-        "component_params": component_params,
-    }
+    return freeze_summary
 
 
 def save_finetune_config(args, output_dir, class_names):
@@ -1012,14 +1003,16 @@ def save_finetune_config(args, output_dir, class_names):
         "effective_batch_size": args.batch_size * args.grad_accum_steps,
         "lr": args.lr,
         "lr_encoder": args.lr_encoder,
-        "train_mode": "head_only",
+        "train_mode": "decoder_only",
         "frozen_components": [
             "dinov2_encoder",
             "backbone_projector",
+        ],
+        "trainable_components": [
             "transformer",
+            "detection_head",
             "query_embeddings",
         ],
-        "trainable_components": ["detection_head"],
         "augmentation": "native RF-DETR (make_coco_transforms_square_div_64)",
         "warmup_epochs": args.warmup_epochs,
         "weight_decay": args.weight_decay,
@@ -1073,7 +1066,7 @@ def main():
         allow_class_mismatch=args.allow_class_mismatch,
     )
     detector.model.class_names = class_names
-    freeze_for_head_only_training(detector)
+    freeze_for_decoder_only_training(detector)
 
     config = TrainConfig(
         dataset_dir=str(dataset_dir),
