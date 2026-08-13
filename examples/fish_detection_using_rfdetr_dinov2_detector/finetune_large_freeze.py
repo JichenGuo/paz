@@ -1,5 +1,8 @@
 #!/usr/bin/env python
-"""Fine-tune RF-DETR Large model.
+"""Fine-tune only the RF-DETR Large detection head.
+
+The DINOv2 backbone, transformer, and learned query embeddings are frozen.
+Only the classification and bounding-box detection heads are updated.
 
 The new dataset is expected to be in COCO/RoboFlow layout:
 
@@ -51,6 +54,11 @@ if str(_PAZ_ROOT) not in sys.path:
 
 from paz.models.detection.dino_v2_object_detection.config import TrainConfig
 from paz.models.detection.dino_v2_object_detection.detr import RFDETRLarge
+from src.training_helpers import (
+    apply_train_mode,
+    count_component_parameters,
+    count_parameters,
+)
 
 
 DEFAULT_SOURCE_CHECKPOINT = (
@@ -64,8 +72,8 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Load the best Experiment 12 RF-DETR Large checkpoint and fine-tune "
-            "it on a new COCO-format dataset."
+            "Load an RF-DETR Large checkpoint and fine-tune only its detection "
+            "head while keeping DINOv2 and the transformer frozen."
         )
     )
     parser.add_argument(
@@ -931,6 +939,60 @@ def build_detector(num_classes, checkpoint_path, allow_class_mismatch):
     return detector
 
 
+def freeze_for_head_only_training(detector):
+    """Make the classification and bounding-box heads the only trainable part."""
+    model = detector.model.model
+    apply_train_mode(model, "head_only")
+
+    # The repository's generic head_only mode keeps learned queries trainable.
+    # Freeze them as well so this script trains the detection heads strictly.
+    model.refpoint_embed._trainable = False
+    model.query_feat._trainable = False
+
+    component_params = count_component_parameters(model)
+    expected_frozen = {"backbone", "transformer", "query_embeddings"}
+    for component in expected_frozen:
+        trainable = component_params.get(component, {}).get("trainable", 0)
+        if trainable:
+            raise RuntimeError(
+                f"Head-only freezing failed: {component} still has "
+                f"{trainable:,} trainable parameters"
+            )
+
+    unexpected_components = {
+        component
+        for component, counts in component_params.items()
+        if component != "detection_head" and counts["trainable"] > 0
+    }
+    if unexpected_components:
+        raise RuntimeError(
+            "Head-only freezing failed; unexpected trainable components: "
+            f"{sorted(unexpected_components)}"
+        )
+    if component_params.get("detection_head", {}).get("trainable", 0) == 0:
+        raise RuntimeError("Detection head has no trainable parameters")
+
+    params = count_parameters(model)
+    print("Training mode: detection head only", flush=True)
+    print(
+        "  Frozen: DINOv2 backbone, feature projector, transformer, queries",
+        flush=True,
+    )
+    print("  Trainable: classification and bounding-box heads", flush=True)
+    print(
+        f"  Parameters: {params['trainable']:,} trainable / "
+        f"{params['total']:,} total "
+        f"({params['pct_trainable']:.2f}% trainable)",
+        flush=True,
+    )
+    return {
+        "frozen_components": sorted(expected_frozen),
+        "trainable_components": ["detection_head"],
+        "params": params,
+        "component_params": component_params,
+    }
+
+
 def save_finetune_config(args, output_dir, class_names):
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -950,6 +1012,14 @@ def save_finetune_config(args, output_dir, class_names):
         "effective_batch_size": args.batch_size * args.grad_accum_steps,
         "lr": args.lr,
         "lr_encoder": args.lr_encoder,
+        "train_mode": "head_only",
+        "frozen_components": [
+            "dinov2_encoder",
+            "backbone_projector",
+            "transformer",
+            "query_embeddings",
+        ],
+        "trainable_components": ["detection_head"],
         "augmentation": "native RF-DETR (make_coco_transforms_square_div_64)",
         "warmup_epochs": args.warmup_epochs,
         "weight_decay": args.weight_decay,
@@ -1003,6 +1073,7 @@ def main():
         allow_class_mismatch=args.allow_class_mismatch,
     )
     detector.model.class_names = class_names
+    freeze_for_head_only_training(detector)
 
     config = TrainConfig(
         dataset_dir=str(dataset_dir),
