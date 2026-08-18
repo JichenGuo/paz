@@ -15,7 +15,6 @@ from pathlib import Path
 
 import jax.numpy as jp
 import numpy as np
-from scipy.spatial.transform import Rotation
 import trimesh
 
 import paz
@@ -121,20 +120,6 @@ def jsonify(value):
     return value
 
 
-def decompose_transform(transform):
-    """Returns translation, XYZ Euler orientation, and scale from a transform."""
-    transform = np.asarray(transform, dtype=np.float64)
-    linear = transform[:3, :3]
-    scale = np.linalg.norm(linear, axis=0)
-    rotation = linear / scale
-    euler_xyz = Rotation.from_matrix(rotation).as_euler("xyz")
-    return {
-        "translation_xyz": transform[:3, 3],
-        "orientation_euler_xyz_radians": euler_xyz,
-        "scale_xyz": scale,
-    }
-
-
 def rotation_matrix_to_6d(rotation):
     """Encodes a rotation as its first two object axes in the target frame."""
     rotation = np.asarray(rotation, dtype=np.float64)
@@ -185,44 +170,29 @@ def generate_sample(output, index, parameters, image_size, y_fov,
     mesh = build_mesh(parameters["shape"], object_transform)
     mesh.export(output / "meshes" / f"{stem}.ply")
 
-    height, width = image_size
-    intrinsics = paz.graphics.camera.compute_intrinsics(y_fov, height, width)
-    world_to_camera_parameters = decompose_transform(world_to_camera)
     object_to_camera = np.asarray(world_to_camera) @ np.asarray(object_transform)
-    object_to_camera_parameters = decompose_transform(object_to_camera)
-    object_scale = object_to_camera_parameters["scale_xyz"]
+    object_scale = parameters["object_scale"]
     object_rotation = object_to_camera[:3, :3] / object_scale
     vector_a, vector_b = rotation_matrix_to_6d(object_rotation)
+    light_world = np.append(parameters["light_position"], 1.0)
+    light_camera = np.asarray(world_to_camera) @ light_world
     metadata = {
-        "location": {
-            "camera_position": parameters["camera_position"],
-            "camera_target": parameters["camera_target"],
-            "world_to_camera": {
-                "matrix_4x4": world_to_camera,
-                **world_to_camera_parameters,
+        "object": {
+            "translation_camera_xyz": object_to_camera[:3, 3],
+            "orientation_camera_6d": {
+                "vector_a": vector_a,
+                "vector_b": vector_b,
             },
-            "object_in_camera": {
-                "translation_xyz": object_to_camera_parameters[
-                    "translation_xyz"
-                ],
-                "orientation_6d": {
-                    "vector_a": vector_a,
-                    "vector_b": vector_b,
-                },
-                "scale_xyz": object_scale,
-            },
+            "scale": object_scale,
         },
         "light": {
-            "type": "point",
-            "position": parameters["light_position"],
-            "intensity_rgb": np.full(3, parameters["light_intensity"]),
+            "position_camera_xyz": light_camera[:3],
+            "intensity": parameters["light_intensity"],
         },
         "shape": {
             "type": parameters["shape"],
-            "object_scale": parameters["object_scale"],
         },
         "material": {
-            "model": "phong",
             "color_rgb": parameters["color"],
             "ambient": parameters["ambient"],
             "diffuse": parameters["diffuse"],
@@ -231,9 +201,7 @@ def generate_sample(output, index, parameters, image_size, y_fov,
         },
         "rgb": f"rgb/{stem}.png",
         "depth": f"depth/{stem}.npy",
-        "mesh": f"meshes/{stem}.ply",
         "depth_unit": "metre",
-        "camera_intrinsics_3x4": np.asarray(intrinsics).tolist(),
     }
     with (output / "metadata" / f"{stem}.json").open("w") as file:
         json.dump(jsonify(metadata), file, indent=2)
