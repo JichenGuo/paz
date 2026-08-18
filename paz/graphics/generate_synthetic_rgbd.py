@@ -135,6 +135,31 @@ def decompose_transform(transform):
     }
 
 
+def rotation_matrix_to_6d(rotation):
+    """Encodes a rotation as its first two object axes in the target frame."""
+    rotation = np.asarray(rotation, dtype=np.float64)
+    if rotation.shape != (3, 3):
+        raise ValueError("rotation must have shape (3, 3)")
+    return rotation[:, 0], rotation[:, 1]
+
+
+def rotation_6d_to_matrix(vector_a, vector_b, epsilon=1e-8):
+    """Maps two unconstrained vectors to SO(3) using Gram--Schmidt."""
+    vector_a = np.asarray(vector_a, dtype=np.float64)
+    vector_b = np.asarray(vector_b, dtype=np.float64)
+    norm_a = np.linalg.norm(vector_a)
+    if norm_a < epsilon:
+        raise ValueError("vector_a must be non-zero")
+    axis_x = vector_a / norm_a
+    orthogonal_b = vector_b - np.dot(axis_x, vector_b) * axis_x
+    norm_b = np.linalg.norm(orthogonal_b)
+    if norm_b < epsilon:
+        raise ValueError("vector_b must not be parallel to vector_a")
+    axis_y = orthogonal_b / norm_b
+    axis_z = np.cross(axis_x, axis_y)
+    return np.column_stack([axis_x, axis_y, axis_z])
+
+
 def generate_sample(output, index, parameters, image_size, y_fov,
                     shadows=True):
     """Renders and writes a single dataset sample."""
@@ -163,7 +188,11 @@ def generate_sample(output, index, parameters, image_size, y_fov,
     height, width = image_size
     intrinsics = paz.graphics.camera.compute_intrinsics(y_fov, height, width)
     world_to_camera_parameters = decompose_transform(world_to_camera)
-    object_to_world_parameters = decompose_transform(object_transform)
+    object_to_camera = np.asarray(world_to_camera) @ np.asarray(object_transform)
+    object_to_camera_parameters = decompose_transform(object_to_camera)
+    object_scale = object_to_camera_parameters["scale_xyz"]
+    object_rotation = object_to_camera[:3, :3] / object_scale
+    vector_a, vector_b = rotation_matrix_to_6d(object_rotation)
     metadata = {
         "location": {
             "camera_position": parameters["camera_position"],
@@ -172,9 +201,15 @@ def generate_sample(output, index, parameters, image_size, y_fov,
                 "matrix_4x4": world_to_camera,
                 **world_to_camera_parameters,
             },
-            "object_to_world": {
-                "matrix_4x4": object_transform,
-                **object_to_world_parameters,
+            "object_in_camera": {
+                "translation_xyz": object_to_camera_parameters[
+                    "translation_xyz"
+                ],
+                "orientation_6d": {
+                    "vector_a": vector_a,
+                    "vector_b": vector_b,
+                },
+                "scale_xyz": object_scale,
             },
         },
         "light": {
