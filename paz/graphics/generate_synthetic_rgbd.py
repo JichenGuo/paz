@@ -25,10 +25,6 @@ COLORS = np.array(
     [[0.85, 0.25, 0.20], [0.20, 0.55, 0.90], [0.25, 0.75, 0.40]],
     dtype=np.float32,
 )
-TEXTURE_COLORS = np.array(
-    [[0.95, 0.95, 0.95], [0.08, 0.08, 0.08], [0.95, 0.75, 0.20]],
-    dtype=np.float32,
-)
 SHAPE_BUILDERS = {
     "cube": paz.graphics.Cube,
     "cylinder": paz.graphics.Cylinder,
@@ -68,9 +64,6 @@ def sample_parameters(rng, shape_names):
         "diffuse": float(rng.uniform(0.55, 0.95)),
         "specular": float(rng.uniform(0.0, 0.8)),
         "shininess": float(rng.uniform(20.0, 200.0)),
-        "texture_type": str(rng.choice(["solid", "checker"])),
-        "texture_color": TEXTURE_COLORS[rng.integers(len(TEXTURE_COLORS))],
-        "texture_frequency": int(rng.integers(4, 13)),
         "camera_position": camera,
         "camera_target": target,
         "light_position": light,
@@ -90,36 +83,14 @@ def build_scene(parameters):
         parameters["diffuse"], parameters["specular"],
         parameters["shininess"],
     )
-    pattern = build_pattern(parameters)
     primitive = SHAPE_BUILDERS[parameters["shape"]](
-        object_transform, material, pattern
+        object_transform, material
     )
     floor_material = paz.graphics.Material(
         jp.array([0.72, 0.72, 0.72]), 0.18, 0.72, 0.05, 30.0
     )
     return paz.graphics.Scene([paz.graphics.Plane(material=floor_material),
                                primitive]), object_transform
-
-
-def build_pattern(parameters):
-    """Builds the sampled solid or checker texture for a primitive."""
-    if parameters["texture_type"] == "solid":
-        return paz.graphics.Pattern()
-    frequency = parameters["texture_frequency"]
-    cells = np.indices((frequency, frequency)).sum(axis=0) % 2
-    primary = np.asarray(parameters["color"])
-    secondary = np.asarray(parameters["texture_color"])
-    image = primary[None, None, :] * cells[..., None]
-    image += secondary[None, None, :] * (1 - cells[..., None])
-    image = jp.array(image.astype(np.float32))
-    pattern_builders = {
-        "cube": paz.graphics.PlanarPattern,
-        "cylinder": paz.graphics.CylindricalPattern,
-        "sphere": paz.graphics.SphericalPattern,
-    }
-    return pattern_builders[parameters["shape"]](image)
-
-
 def build_mesh(shape_name, transform, sections=64):
     """Creates a triangle mesh matching the rendered analytic primitive."""
     if shape_name == "cube":
@@ -224,9 +195,7 @@ def generate_sample(output, index, parameters, image_size, y_fov,
             "shininess": parameters["shininess"],
         },
         "texture": {
-            "type": parameters["texture_type"],
-            "secondary_color_rgb": parameters["texture_color"],
-            "frequency": parameters["texture_frequency"],
+            "type": "none",
         },
         "rgb": f"rgb/{stem}.png",
         "depth": f"depth/{stem}.npy",
