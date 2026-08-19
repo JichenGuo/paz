@@ -170,6 +170,47 @@ def convolution_block(inputs, filters, stride=2):
     return keras.layers.Activation("relu")(x)
 
 
+def normalize_vectors(vectors, epsilon=1e-8):
+    """Normalizes vectors while keeping degenerate predictions finite."""
+    norms = keras.ops.linalg.norm(vectors, axis=-1, keepdims=True)
+    return vectors / keras.ops.maximum(norms, epsilon)
+
+
+@keras.saving.register_keras_serializable("synthetic_rgbd")
+def rotation_6d_to_matrix(rotation_6d):
+    """Maps unconstrained (..., 6) vectors to (..., 3, 3) rotations."""
+    vector_a = rotation_6d[..., :3]
+    vector_b = rotation_6d[..., 3:]
+    axis_x = normalize_vectors(vector_a)
+    projection = keras.ops.sum(
+        axis_x * vector_b, axis=-1, keepdims=True
+    )
+    axis_y = normalize_vectors(vector_b - projection * axis_x)
+    axis_z = keras.ops.cross(axis_x, axis_y)
+    return keras.ops.stack([axis_x, axis_y, axis_z], axis=-1)
+
+
+@keras.saving.register_keras_serializable("synthetic_rgbd")
+def rotation_matrix_loss(target_6d, predicted_6d):
+    """Chordal SO(3) loss after Gram--Schmidt reconstruction."""
+    target_rotation = rotation_6d_to_matrix(target_6d)
+    predicted_rotation = rotation_6d_to_matrix(predicted_6d)
+    squared_error = keras.ops.square(predicted_rotation - target_rotation)
+    return 0.5 * keras.ops.sum(squared_error, axis=(-2, -1))
+
+
+@keras.saving.register_keras_serializable("synthetic_rgbd")
+def geodesic_angle(target_6d, predicted_6d):
+    """Returns the SO(3) geodesic error angle in radians."""
+    target_rotation = rotation_6d_to_matrix(target_6d)
+    predicted_rotation = rotation_6d_to_matrix(predicted_6d)
+    target_transpose = keras.ops.transpose(target_rotation, (0, 2, 1))
+    relative_rotation = keras.ops.matmul(target_transpose, predicted_rotation)
+    trace = keras.ops.trace(relative_rotation, axis1=-2, axis2=-1)
+    cosine = keras.ops.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+    return keras.ops.arccos(cosine)
+
+
 def build_model(input_shape, num_shapes=len(SHAPE_NAMES)):
     """Builds a shared CNN encoder with classification/regression heads."""
     inputs = keras.Input(input_shape, name="rgbd")
@@ -198,8 +239,10 @@ def build_model(input_shape, num_shapes=len(SHAPE_NAMES)):
 def compile_model(model, learning_rate):
     losses = {name: "mse" for name in model.output_names}
     losses["shape"] = "categorical_crossentropy"
+    losses["object_orientation_6d"] = rotation_matrix_loss
     metrics = {name: ["mae"] for name in model.output_names}
     metrics["shape"] = ["accuracy"]
+    metrics["object_orientation_6d"] = [geodesic_angle]
     optimizer = keras.optimizers.Adam(learning_rate)
     model.compile(optimizer=optimizer, loss=losses, metrics=metrics)
 
