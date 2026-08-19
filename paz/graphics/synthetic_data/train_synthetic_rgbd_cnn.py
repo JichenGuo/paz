@@ -220,9 +220,10 @@ class LossPlot(keras.callbacks.Callback):
         plt.close(figure)
 
 
-def convolution_block(inputs, filters, stride=2):
+def convolution_block(inputs, filters, regularizer, stride=2):
     x = keras.layers.Conv2D(filters, 3, strides=stride, padding="same",
-                            use_bias=False)(inputs)
+                            use_bias=False,
+                            kernel_regularizer=regularizer)(inputs)
     x = keras.layers.BatchNormalization()(x)
     return keras.layers.Activation("relu")(x)
 
@@ -303,39 +304,51 @@ def symmetry_rotation_loss(target_6d_and_shape, predicted_6d):
     return keras.ops.square(angles)
 
 
-def build_model(input_shape, num_shapes=len(SHAPE_NAMES)):
+def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
+                l2_regularization=1e-4):
     """Builds a shared CNN encoder with classification/regression heads."""
     inputs = keras.Input(input_shape, name="rgbd")
-    x = convolution_block(inputs, 32)
-    x = convolution_block(x, 64)
-    x = convolution_block(x, 128)
-    x = convolution_block(x, 256)
+    regularizer = keras.regularizers.L2(l2_regularization)
+    x = convolution_block(inputs, 16, regularizer)
+    x = convolution_block(x, 32, regularizer)
+    x = convolution_block(x, 64, regularizer)
+    x = convolution_block(x, 128, regularizer)
     x = keras.layers.GlobalAveragePooling2D()(x)
-    x = keras.layers.Dense(256, activation="relu")(x)
+    x = keras.layers.Dense(
+        128, activation="relu", kernel_regularizer=regularizer
+    )(x)
     x = keras.layers.Dropout(0.2)(x)
     outputs = {
         "object_translation": keras.layers.Dense(
-            3, name="object_translation")(x),
+            3, name="object_translation", kernel_regularizer=regularizer)(x),
         "object_orientation_6d": keras.layers.Dense(
-            6, name="object_orientation_6d")(x),
-        "object_scale": keras.layers.Dense(1, name="object_scale")(x),
-        "light_position": keras.layers.Dense(3, name="light_position")(x),
-        "light_intensity": keras.layers.Dense(1, name="light_intensity")(x),
+            6, name="object_orientation_6d",
+            kernel_regularizer=regularizer)(x),
+        "object_scale": keras.layers.Dense(
+            1, name="object_scale", kernel_regularizer=regularizer)(x),
+        "light_position": keras.layers.Dense(
+            3, name="light_position", kernel_regularizer=regularizer)(x),
+        "light_intensity": keras.layers.Dense(
+            1, name="light_intensity", kernel_regularizer=regularizer)(x),
         "shape": keras.layers.Dense(
-            num_shapes, activation="softmax", name="shape")(x),
-        "material": keras.layers.Dense(7, name="material")(x),
+            num_shapes, activation="softmax", name="shape",
+            kernel_regularizer=regularizer)(x),
+        "material": keras.layers.Dense(
+            7, name="material", kernel_regularizer=regularizer)(x),
     }
     return keras.Model(inputs, outputs, name="synthetic_rgbd_cnn")
 
 
-def compile_model(model, learning_rate):
+def compile_model(model, learning_rate, weight_decay=1e-4):
     losses = {name: "mse" for name in model.output_names}
     losses["shape"] = "categorical_crossentropy"
     losses["object_orientation_6d"] = symmetry_rotation_loss
     metrics = {name: ["mae"] for name in model.output_names}
     metrics["shape"] = ["accuracy"]
     metrics["object_orientation_6d"] = [symmetry_geodesic_angle]
-    optimizer = keras.optimizers.Adam(learning_rate, global_clipnorm=1.0)
+    optimizer = keras.optimizers.AdamW(
+        learning_rate, weight_decay=weight_decay, global_clipnorm=1.0
+    )
     model.compile(optimizer=optimizer, loss=losses, metrics=metrics)
 
 
@@ -397,6 +410,8 @@ def make_parser():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--l2-regularization", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--max-depth", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -410,6 +425,8 @@ def main(argv=None):
     args = make_parser().parse_args(argv)
     if args.batch_size < 1 or args.epochs < 1 or args.max_depth <= 0:
         raise ValueError("batch-size, epochs, and max-depth must be positive")
+    if args.l2_regularization < 0 or args.weight_decay < 0:
+        raise ValueError("regularization and weight decay must be nonnegative")
     args.output.mkdir(parents=True, exist_ok=True)
     cpu_device = jax.devices("cpu")[0]
     jax.config.update("jax_default_device", cpu_device)
@@ -434,8 +451,8 @@ def main(argv=None):
     valid = RGBDDataset(valid_records, normalizer, args.batch_size,
                         args.max_depth)
     input_shape = train[0][0].shape[1:]
-    model = build_model(input_shape)
-    compile_model(model, args.learning_rate)
+    model = build_model(input_shape, l2_regularization=args.l2_regularization)
+    compile_model(model, args.learning_rate, args.weight_decay)
     model.summary()
     callbacks = [
         keras.callbacks.CSVLogger(args.output / "training.csv"),
