@@ -532,6 +532,56 @@ class CoordinateChannels(keras.layers.Layer):
         return (*input_shape[:-1], input_shape[-1] + 2)
 
 
+@keras.saving.register_keras_serializable("synthetic_rgbd")
+class SpatialSoftArgmax2D(keras.layers.Layer):
+    """Converts each feature heatmap into its expected normalized X/Y."""
+
+    def __init__(self, temperature=1.0, **kwargs):
+        super().__init__(**kwargs)
+        if temperature <= 0.0:
+            raise ValueError("temperature must be positive")
+        self.temperature = float(temperature)
+
+    def build(self, input_shape):
+        self.height, self.width, self.channels = input_shape[1:]
+        if None in (self.height, self.width, self.channels):
+            raise ValueError("SpatialSoftArgmax2D requires fixed feature size")
+        coordinate_x = np.linspace(
+            -1.0, 1.0, self.width, dtype=np.float32
+        )
+        coordinate_y = np.linspace(
+            -1.0, 1.0, self.height, dtype=np.float32
+        )
+        grid_x, grid_y = np.meshgrid(coordinate_x, coordinate_y)
+        coordinates = np.stack([grid_x, grid_y], axis=-1).reshape(-1, 2)
+        self.coordinates = self.add_weight(
+            name="coordinates",
+            shape=coordinates.shape,
+            initializer=keras.initializers.Constant(coordinates),
+            trainable=False,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        batch_size = keras.ops.shape(inputs)[0]
+        logits = keras.ops.reshape(
+            inputs, (batch_size, self.height * self.width, self.channels)
+        )
+        logits = keras.ops.transpose(logits, (0, 2, 1))
+        probabilities = keras.ops.softmax(logits / self.temperature, axis=-1)
+        coordinates = keras.ops.cast(self.coordinates, inputs.dtype)
+        expected_xy = keras.ops.matmul(probabilities, coordinates)
+        return keras.ops.reshape(expected_xy, (-1, self.channels * 2))
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], input_shape[-1] * 2)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"temperature": self.temperature})
+        return config
+
+
 def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
                 l2_regularization=1e-4):
     """Builds spatial pose and global appearance branches over RGB-D."""
@@ -542,18 +592,29 @@ def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
     x = convolution_block(x, 64, regularizer)
     x = convolution_block(x, 128, regularizer)
 
-    # CoordConv supplies explicit image location to the pose heads. Retaining
-    # and flattening a compact spatial feature grid avoids the translation
-    # invariance introduced by global average pooling.
+    # CoordConv supplies explicit image location to the pose heads. Learned
+    # heatmaps are reduced to expected X/Y coordinates instead of flattening
+    # the whole grid, substantially reducing pose-branch capacity.
     pose = CoordinateChannels(name="pose_coordinates")(x)
     pose = keras.layers.Conv2D(
         32, 3, padding="same", activation="relu",
         kernel_regularizer=regularizer, name="pose_spatial_conv",
     )(pose)
-    pose = keras.layers.MaxPooling2D(2, name="pose_spatial_pool")(pose)
-    pose = keras.layers.Flatten(name="pose_spatial_flatten")(pose)
+    pose_logits = keras.layers.Conv2D(
+        16, 1, padding="same", kernel_regularizer=regularizer,
+        name="pose_heatmaps",
+    )(pose)
+    pose_coordinates = SpatialSoftArgmax2D(
+        name="pose_spatial_soft_argmax"
+    )(pose_logits)
+    pose_context = keras.layers.GlobalAveragePooling2D(
+        name="pose_global_context"
+    )(pose)
+    pose = keras.layers.Concatenate(name="pose_coordinate_context")(
+        [pose_coordinates, pose_context]
+    )
     pose = keras.layers.Dense(
-        128, activation="relu", kernel_regularizer=regularizer,
+        64, activation="relu", kernel_regularizer=regularizer,
         name="pose_features",
     )(pose)
     pose = keras.layers.Dropout(0.2, name="pose_dropout")(pose)
