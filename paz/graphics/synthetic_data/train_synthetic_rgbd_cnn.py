@@ -503,37 +503,91 @@ class PhysicalMAE(PhysicalMetric):
         self.accumulate(absolute_error, sample_weight)
 
 
+@keras.saving.register_keras_serializable("synthetic_rgbd")
+class CoordinateChannels(keras.layers.Layer):
+    """Appends fixed X/Y image coordinates normalized to [-1, 1]."""
+
+    def build(self, input_shape):
+        height, width = input_shape[1], input_shape[2]
+        if height is None or width is None:
+            raise ValueError("CoordinateChannels requires fixed spatial size")
+        coordinate_x = np.linspace(-1.0, 1.0, width, dtype=np.float32)
+        coordinate_y = np.linspace(-1.0, 1.0, height, dtype=np.float32)
+        grid_x, grid_y = np.meshgrid(coordinate_x, coordinate_y)
+        coordinates = np.stack([grid_x, grid_y], axis=-1)[None]
+        self.coordinates = self.add_weight(
+            name="coordinates",
+            shape=coordinates.shape,
+            initializer=keras.initializers.Constant(coordinates),
+            trainable=False,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # Multiplication broadcasts the fixed grid across the dynamic batch.
+        coordinates = keras.ops.ones_like(inputs[..., :1]) * self.coordinates
+        return keras.ops.concatenate([inputs, coordinates], axis=-1)
+
+    def compute_output_shape(self, input_shape):
+        return (*input_shape[:-1], input_shape[-1] + 2)
+
+
 def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
                 l2_regularization=1e-4):
-    """Builds a shared CNN encoder with classification/regression heads."""
+    """Builds spatial pose and global appearance branches over RGB-D."""
     inputs = keras.Input(input_shape, name="rgbd")
     regularizer = keras.regularizers.L2(l2_regularization)
     x = convolution_block(inputs, 16, regularizer)
     x = convolution_block(x, 32, regularizer)
     x = convolution_block(x, 64, regularizer)
     x = convolution_block(x, 128, regularizer)
-    x = keras.layers.GlobalAveragePooling2D()(x)
-    x = keras.layers.Dense(
-        128, activation="relu", kernel_regularizer=regularizer
+
+    # CoordConv supplies explicit image location to the pose heads. Retaining
+    # and flattening a compact spatial feature grid avoids the translation
+    # invariance introduced by global average pooling.
+    pose = CoordinateChannels(name="pose_coordinates")(x)
+    pose = keras.layers.Conv2D(
+        32, 3, padding="same", activation="relu",
+        kernel_regularizer=regularizer, name="pose_spatial_conv",
+    )(pose)
+    pose = keras.layers.MaxPooling2D(2, name="pose_spatial_pool")(pose)
+    pose = keras.layers.Flatten(name="pose_spatial_flatten")(pose)
+    pose = keras.layers.Dense(
+        128, activation="relu", kernel_regularizer=regularizer,
+        name="pose_features",
+    )(pose)
+    pose = keras.layers.Dropout(0.2, name="pose_dropout")(pose)
+
+    global_features = keras.layers.GlobalAveragePooling2D(
+        name="global_average_pool"
     )(x)
-    x = keras.layers.Dropout(0.2)(x)
+    global_features = keras.layers.Dense(
+        128, activation="relu", kernel_regularizer=regularizer
+    )(global_features)
+    global_features = keras.layers.Dropout(
+        0.2, name="global_dropout"
+    )(global_features)
     outputs = {
         "object_translation": keras.layers.Dense(
-            3, name="object_translation", kernel_regularizer=regularizer)(x),
+            3, name="object_translation",
+            kernel_regularizer=regularizer)(pose),
         "object_orientation_6d": keras.layers.Dense(
             6, name="object_orientation_6d",
-            kernel_regularizer=regularizer)(x),
+            kernel_regularizer=regularizer)(pose),
         "object_scale": keras.layers.Dense(
-            1, name="object_scale", kernel_regularizer=regularizer)(x),
+            1, name="object_scale", kernel_regularizer=regularizer)(pose),
         "light_position": keras.layers.Dense(
-            3, name="light_position", kernel_regularizer=regularizer)(x),
+            3, name="light_position",
+            kernel_regularizer=regularizer)(global_features),
         "light_intensity": keras.layers.Dense(
-            1, name="light_intensity", kernel_regularizer=regularizer)(x),
+            1, name="light_intensity",
+            kernel_regularizer=regularizer)(global_features),
         "shape": keras.layers.Dense(
             num_shapes, activation="softmax", name="shape",
-            kernel_regularizer=regularizer)(x),
+            kernel_regularizer=regularizer)(global_features),
         "material": keras.layers.Dense(
-            7, name="material", kernel_regularizer=regularizer)(x),
+            7, name="material",
+            kernel_regularizer=regularizer)(global_features),
     }
     return keras.Model(inputs, outputs, name="synthetic_rgbd_cnn")
 
