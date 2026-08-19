@@ -193,9 +193,18 @@ def convolution_block(inputs, filters, stride=2):
 
 
 def normalize_vectors(vectors, epsilon=1e-8):
-    """Normalizes vectors while keeping degenerate predictions finite."""
-    norms = keras.ops.linalg.norm(vectors, axis=-1, keepdims=True)
-    return vectors / keras.ops.maximum(norms, epsilon)
+    """Normalizes vectors with finite gradients at zero magnitude."""
+    squared_norm = keras.ops.sum(
+        keras.ops.square(vectors), axis=-1, keepdims=True
+    )
+    safe_norm = keras.ops.sqrt(squared_norm + epsilon)
+    return vectors / safe_norm
+
+
+def stable_angle_from_cosine(cosine, epsilon=1e-6):
+    """Computes acos away from its infinite-gradient endpoints."""
+    cosine = keras.ops.clip(cosine, -1.0 + epsilon, 1.0 - epsilon)
+    return keras.ops.arccos(cosine)
 
 
 @keras.saving.register_keras_serializable("synthetic_rgbd")
@@ -235,15 +244,17 @@ def symmetry_geodesic_angle(target_6d_and_shape, predicted_6d):
         keras.ops.expand_dims(predicted_rotation, axis=1),
     )
     cube_traces = keras.ops.trace(relative_cubes, axis1=-2, axis2=-1)
-    cube_cosines = keras.ops.clip((cube_traces - 1.0) / 2.0, -1.0, 1.0)
-    cube_angles = keras.ops.min(keras.ops.arccos(cube_cosines), axis=-1)
+    cube_cosines = (cube_traces - 1.0) / 2.0
+    cube_angles = keras.ops.min(
+        stable_angle_from_cosine(cube_cosines), axis=-1
+    )
 
     target_axis = target_rotation[..., :, 1]
     predicted_axis = predicted_rotation[..., :, 1]
     axis_cosine = keras.ops.sum(target_axis * predicted_axis, axis=-1)
     # A plain, closed cylinder is unchanged by reversing its vertical axis.
-    cylinder_cosine = keras.ops.clip(keras.ops.abs(axis_cosine), 0.0, 1.0)
-    cylinder_angles = keras.ops.arccos(cylinder_cosine)
+    cylinder_cosine = keras.ops.abs(axis_cosine)
+    cylinder_angles = stable_angle_from_cosine(cylinder_cosine)
 
     shape_arg = keras.ops.argmax(shape, axis=-1)
     angles = keras.ops.where(shape_arg == 0, cube_angles, cylinder_angles)
@@ -289,7 +300,7 @@ def compile_model(model, learning_rate):
     metrics = {name: ["mae"] for name in model.output_names}
     metrics["shape"] = ["accuracy"]
     metrics["object_orientation_6d"] = [symmetry_geodesic_angle]
-    optimizer = keras.optimizers.Adam(learning_rate)
+    optimizer = keras.optimizers.Adam(learning_rate, global_clipnorm=1.0)
     model.compile(optimizer=optimizer, loss=losses, metrics=metrics)
 
 
@@ -343,6 +354,7 @@ def main(argv=None):
     model.summary()
     callbacks = [
         keras.callbacks.CSVLogger(args.output / "training.csv"),
+        keras.callbacks.TerminateOnNaN(),
         keras.callbacks.ModelCheckpoint(
             args.output / "best.keras", save_best_only=True
         ),
