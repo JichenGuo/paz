@@ -42,12 +42,25 @@ def sample_parameters(rng, shape_names):
     azimuth = float(rng.uniform(-np.pi, np.pi))
     elevation = float(rng.uniform(np.deg2rad(20.0), np.deg2rad(65.0)))
     distance = float(rng.uniform(3.0, 5.5))
-    target = np.array([0.0, object_scale, 0.0])
-    camera = target + distance * np.array(
+    object_center = np.array([0.0, object_scale, 0.0])
+    camera = object_center + distance * np.array(
         [np.cos(elevation) * np.sin(azimuth),
          np.sin(elevation),
          np.cos(elevation) * np.cos(azimuth)]
     )
+
+    # Aim near, rather than exactly at, the object center. Sampling the offset
+    # in the nominal camera image plane produces non-zero camera-frame X and Y
+    # object translations while keeping the object reliably inside the view.
+    view_direction = object_center - camera
+    view_direction /= np.linalg.norm(view_direction)
+    world_up = np.array([0.0, 1.0, 0.0])
+    camera_right = np.cross(view_direction, world_up)
+    camera_right /= np.linalg.norm(camera_right)
+    camera_up = np.cross(camera_right, view_direction)
+    target_offset_xy = rng.uniform(-0.5, 0.5, size=2) * object_scale
+    target = (object_center + target_offset_xy[0] * camera_right
+              + target_offset_xy[1] * camera_up)
 
     light_azimuth = float(rng.uniform(-np.pi, np.pi))
     light_radius = float(rng.uniform(2.0, 4.5))
