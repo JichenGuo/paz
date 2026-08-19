@@ -335,11 +335,11 @@ def symmetry_rotation_loss(target_6d_and_shape, predicted_6d):
 
 
 @keras.saving.register_keras_serializable("synthetic_rgbd")
-class PhysicalTranslationMSE(keras.losses.Loss):
-    """Squared Euclidean camera-frame translation error in square metres."""
+class PhysicalVectorMSE(keras.losses.Loss):
+    """Squared Euclidean error after restoring physical target units."""
 
-    def __init__(self, standard_deviation=(1.0, 1.0, 1.0),
-                 name="physical_translation_mse", **kwargs):
+    def __init__(self, standard_deviation=(1.0,),
+                 name="physical_vector_mse", **kwargs):
         super().__init__(name=name, **kwargs)
         self.standard_deviation = tuple(float(value)
                                         for value in standard_deviation)
@@ -349,13 +349,22 @@ class PhysicalTranslationMSE(keras.losses.Loss):
             keras.ops.convert_to_tensor(self.standard_deviation),
             prediction.dtype,
         )
-        error_metres = (prediction - target) * scale
-        return keras.ops.sum(keras.ops.square(error_metres), axis=-1)
+        physical_error = (prediction - target) * scale
+        return keras.ops.sum(keras.ops.square(physical_error), axis=-1)
 
     def get_config(self):
         config = super().get_config()
         config.update({"standard_deviation": self.standard_deviation})
         return config
+
+
+@keras.saving.register_keras_serializable("synthetic_rgbd")
+class PhysicalTranslationMSE(PhysicalVectorMSE):
+    """Backward-compatible physical translation loss."""
+
+    def __init__(self, standard_deviation=(1.0, 1.0, 1.0),
+                 name="physical_translation_mse", **kwargs):
+        super().__init__(standard_deviation, name=name, **kwargs)
 
 
 def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
@@ -394,12 +403,22 @@ def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
 
 
 def compile_model(model, learning_rate, weight_decay=1e-4,
-                  translation_standard_deviation=(1.0, 1.0, 1.0)):
+                  translation_standard_deviation=(1.0, 1.0, 1.0),
+                  light_position_standard_deviation=(1.0, 1.0, 1.0),
+                  light_intensity_standard_deviation=(1.0,)):
     losses = {name: "mse" for name in model.output_names}
     losses["shape"] = "categorical_crossentropy"
     losses["object_orientation_6d"] = symmetry_rotation_loss
-    losses["object_translation"] = PhysicalTranslationMSE(
-        translation_standard_deviation
+    losses["object_translation"] = PhysicalVectorMSE(
+        translation_standard_deviation, name="physical_translation_mse"
+    )
+    losses["light_position"] = PhysicalVectorMSE(
+        light_position_standard_deviation,
+        name="physical_light_position_mse",
+    )
+    losses["light_intensity"] = PhysicalVectorMSE(
+        light_intensity_standard_deviation,
+        name="physical_light_intensity_mse",
     )
     metrics = {name: ["mae"] for name in model.output_names}
     metrics["shape"] = ["accuracy"]
@@ -513,8 +532,15 @@ def main(argv=None):
     translation_std = normalizer.statistics[
         "object_translation"
     ]["standard_deviation"]
+    light_position_std = normalizer.statistics[
+        "light_position"
+    ]["standard_deviation"]
+    light_intensity_std = normalizer.statistics[
+        "light_intensity"
+    ]["standard_deviation"]
     compile_model(
-        model, args.learning_rate, args.weight_decay, translation_std
+        model, args.learning_rate, args.weight_decay, translation_std,
+        light_position_std, light_intensity_std,
     )
     model.summary()
     callbacks = [
