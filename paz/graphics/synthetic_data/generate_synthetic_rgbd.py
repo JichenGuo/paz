@@ -10,9 +10,11 @@ pose, and lighting parameters.  Depth value zero denotes no intersection.
 """
 
 import argparse
+import gc
 import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jp
 import numpy as np
 import trimesh
@@ -146,7 +148,7 @@ def rotation_6d_to_matrix(vector_a, vector_b, epsilon=1e-8):
 
 
 def generate_sample(output, index, parameters, image_size, y_fov,
-                    shadows=True):
+                    shadows=True, tiles=(1, 1), chunk_size=1024):
     """Renders and writes a single dataset sample."""
     scene, object_transform = build_scene(parameters)
     world_to_camera = paz.SE3.view_transform(
@@ -159,7 +161,7 @@ def generate_sample(output, index, parameters, image_size, y_fov,
     )
     rgb, depth = paz.graphics.render(
         image_size, y_fov, world_to_camera, scene, None, light,
-        tiles=(1, 1), chunk_size=1024, shadows=shadows,
+        tiles=tiles, chunk_size=chunk_size, shadows=shadows,
     )
 
     stem = f"{index:06d}"
@@ -219,22 +221,53 @@ def make_parser():
                         default=list(SHAPE_BUILDERS))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-shadows", action="store_true")
+    parser.add_argument("--tiles", type=int, default=2,
+                        help="Tiles per image axis; larger values use less RAM.")
+    parser.add_argument("--chunk-size", type=int, default=256,
+                        help="Rays processed together; smaller uses less RAM.")
+    parser.add_argument("--clear-caches-every", type=int, default=10,
+                        help="Clear JAX caches every N generated samples.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip samples whose four output files exist.")
     return parser
+
+
+def sample_is_complete(output, index):
+    """Checks whether every output belonging to a sample already exists."""
+    stem = f"{index:06d}"
+    paths = [
+        output / "rgb" / f"{stem}.png",
+        output / "depth" / f"{stem}.npy",
+        output / "meshes" / f"{stem}.ply",
+        output / "metadata" / f"{stem}.json",
+    ]
+    return all(path.is_file() for path in paths)
 
 
 def main(argv=None):
     args = make_parser().parse_args(argv)
-    if args.num_samples < 1 or args.height < 1 or args.width < 1:
-        raise ValueError("num-samples, height, and width must be positive")
+    positive = (args.num_samples, args.height, args.width, args.tiles,
+                args.chunk_size)
+    if any(value < 1 for value in positive) or args.clear_caches_every < 0:
+        raise ValueError("sizes must be positive and cache interval nonnegative")
     for directory in ("rgb", "depth", "meshes", "metadata"):
         (args.output / directory).mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     for index in range(args.num_samples):
         parameters = sample_parameters(rng, args.shapes)
+        if args.resume and sample_is_complete(args.output, index):
+            print(f"Skipped {index + 1}/{args.num_samples} (already complete)")
+            continue
         generate_sample(args.output, index, parameters,
                         (args.height, args.width), np.deg2rad(args.y_fov),
-                        not args.no_shadows)
+                        not args.no_shadows, (args.tiles, args.tiles),
+                        args.chunk_size)
         print(f"Generated {index + 1}/{args.num_samples}")
+        completed = index + 1
+        if (args.clear_caches_every > 0
+                and completed % args.clear_caches_every == 0):
+            jax.clear_caches()
+            gc.collect()
 
 
 if __name__ == "__main__":

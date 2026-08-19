@@ -4,6 +4,7 @@ from paz.graphics.synthetic_data.generate_synthetic_rgbd import (
     build_mesh,
     rotation_6d_to_matrix,
     rotation_matrix_to_6d,
+    sample_is_complete,
     sample_parameters,
 )
 
@@ -48,3 +49,18 @@ def test_mesh_rests_on_floor():
     _, transform = build_scene(parameters)
     mesh = build_mesh("cylinder", transform)
     assert np.isclose(mesh.bounds[0, 1], 0.0, atol=1e-6)
+
+
+def test_sample_is_complete_requires_every_output(tmp_path):
+    paths = [
+        tmp_path / "rgb" / "000000.png",
+        tmp_path / "depth" / "000000.npy",
+        tmp_path / "meshes" / "000000.ply",
+        tmp_path / "metadata" / "000000.json",
+    ]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    assert sample_is_complete(tmp_path, 0)
+    paths[-1].unlink()
+    assert not sample_is_complete(tmp_path, 0)
