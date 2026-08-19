@@ -335,6 +335,13 @@ def symmetry_rotation_loss(target_6d_and_shape, predicted_6d):
 
 
 @keras.saving.register_keras_serializable("synthetic_rgbd")
+def symmetry_geodesic_angle_degrees(target_6d_and_shape, predicted_6d):
+    """Symmetry-aware geodesic rotation error reported in degrees."""
+    radians = symmetry_geodesic_angle(target_6d_and_shape, predicted_6d)
+    return radians * (180.0 / np.pi)
+
+
+@keras.saving.register_keras_serializable("synthetic_rgbd")
 class PhysicalVectorMSE(keras.losses.Loss):
     """Squared Euclidean error after restoring physical target units."""
 
@@ -365,6 +372,88 @@ class PhysicalTranslationMSE(PhysicalVectorMSE):
     def __init__(self, standard_deviation=(1.0, 1.0, 1.0),
                  name="physical_translation_mse", **kwargs):
         super().__init__(standard_deviation, name=name, **kwargs)
+
+
+class PhysicalMetric(keras.metrics.Metric):
+    """Base class accumulating a mean metric in restored physical units."""
+
+    def __init__(self, standard_deviation=(1.0,), component_index=None,
+                 name="physical_metric", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.standard_deviation = tuple(float(value)
+                                        for value in standard_deviation)
+        self.component_index = component_index
+        self.total = self.add_weight(name="total", initializer="zeros")
+        self.count = self.add_weight(name="count", initializer="zeros")
+
+    def physical_error(self, target, prediction):
+        scale = keras.ops.cast(
+            keras.ops.convert_to_tensor(self.standard_deviation),
+            prediction.dtype,
+        )
+        error = (prediction - target) * scale
+        if self.component_index is not None:
+            error = error[..., self.component_index]
+        return error
+
+    def accumulate(self, values, sample_weight=None):
+        values = keras.ops.cast(values, self.dtype)
+        weights = keras.ops.ones_like(values)
+        if sample_weight is not None:
+            sample_weight = keras.ops.cast(sample_weight, self.dtype)
+            weights = weights * sample_weight
+        self.total.assign_add(keras.ops.sum(values * weights))
+        self.count.assign_add(keras.ops.sum(weights))
+
+    def result(self):
+        return keras.ops.divide_no_nan(self.total, self.count)
+
+    def reset_state(self):
+        self.total.assign(0.0)
+        self.count.assign(0.0)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "standard_deviation": self.standard_deviation,
+            "component_index": self.component_index,
+        })
+        return config
+
+
+@keras.saving.register_keras_serializable("synthetic_rgbd")
+class PhysicalEuclideanDistance(PhysicalMetric):
+    """Mean Euclidean vector error in restored physical units."""
+
+    def __init__(self, standard_deviation=(1.0, 1.0, 1.0),
+                 component_index=None, name="physical_distance", **kwargs):
+        super().__init__(
+            standard_deviation, component_index, name=name, **kwargs
+        )
+
+    def update_state(self, target, prediction, sample_weight=None):
+        error = self.physical_error(target, prediction)
+        distance = keras.ops.sqrt(
+            keras.ops.sum(keras.ops.square(error), axis=-1)
+        )
+        self.accumulate(distance, sample_weight)
+
+
+@keras.saving.register_keras_serializable("synthetic_rgbd")
+class PhysicalMAE(PhysicalMetric):
+    """Mean absolute component error in restored physical units."""
+
+    def __init__(self, standard_deviation=(1.0,), component_index=None,
+                 name="physical_mae", **kwargs):
+        super().__init__(
+            standard_deviation, component_index, name=name, **kwargs
+        )
+
+    def update_state(self, target, prediction, sample_weight=None):
+        absolute_error = keras.ops.abs(
+            self.physical_error(target, prediction)
+        )
+        self.accumulate(absolute_error, sample_weight)
 
 
 def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
@@ -405,7 +494,9 @@ def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
 def compile_model(model, learning_rate, weight_decay=1e-4,
                   translation_standard_deviation=(1.0, 1.0, 1.0),
                   light_position_standard_deviation=(1.0, 1.0, 1.0),
-                  light_intensity_standard_deviation=(1.0,)):
+                  light_intensity_standard_deviation=(1.0,),
+                  object_scale_standard_deviation=(1.0,),
+                  material_standard_deviation=(1.0,) * 7):
     losses = {name: "mse" for name in model.output_names}
     losses["shape"] = "categorical_crossentropy"
     losses["object_orientation_6d"] = symmetry_rotation_loss
@@ -420,9 +511,46 @@ def compile_model(model, learning_rate, weight_decay=1e-4,
         light_intensity_standard_deviation,
         name="physical_light_intensity_mse",
     )
-    metrics = {name: ["mae"] for name in model.output_names}
+    metrics = {
+        "object_translation": [
+            PhysicalEuclideanDistance(
+                translation_standard_deviation,
+                name="euclidean_distance_m",
+            )
+        ],
+        "object_scale": [
+            PhysicalMAE(
+                object_scale_standard_deviation,
+                name="absolute_scale_error",
+            )
+        ],
+        "light_position": [
+            PhysicalEuclideanDistance(
+                light_position_standard_deviation,
+                name="euclidean_distance_m",
+            )
+        ],
+        "light_intensity": [
+            PhysicalMAE(
+                light_intensity_standard_deviation,
+                name="physical_mae",
+            )
+        ],
+        "material": [
+            PhysicalMAE(
+                material_standard_deviation, component_index=index,
+                name=f"{name}_physical_mae",
+            )
+            for index, name in enumerate((
+                "color_r", "color_g", "color_b", "ambient", "diffuse",
+                "specular", "shininess",
+            ))
+        ],
+    }
     metrics["shape"] = ["accuracy"]
-    metrics["object_orientation_6d"] = [symmetry_geodesic_angle]
+    metrics["object_orientation_6d"] = [
+        symmetry_geodesic_angle_degrees
+    ]
     optimizer = keras.optimizers.AdamW(
         learning_rate, weight_decay=weight_decay, global_clipnorm=1.0
     )
@@ -538,9 +666,16 @@ def main(argv=None):
     light_intensity_std = normalizer.statistics[
         "light_intensity"
     ]["standard_deviation"]
+    object_scale_std = normalizer.statistics[
+        "object_scale"
+    ]["standard_deviation"]
+    material_std = normalizer.statistics[
+        "material"
+    ]["standard_deviation"]
     compile_model(
         model, args.learning_rate, args.weight_decay, translation_std,
-        light_position_std, light_intensity_std,
+        light_position_std, light_intensity_std, object_scale_std,
+        material_std,
     )
     model.summary()
     callbacks = [
