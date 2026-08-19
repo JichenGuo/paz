@@ -550,10 +550,10 @@ def compile_model(model, learning_rate, weight_decay=1e-4,
     losses["object_translation"] = PhysicalVectorMSE(
         translation_standard_deviation, name="physical_translation_mse"
     )
-    losses["light_position"] = PhysicalVectorMSE(
-        light_position_standard_deviation,
-        name="physical_light_position_mse",
-    )
+    # Light position is standardized by the dataset. Huber keeps this
+    # difficult head from dominating the shared representation with large
+    # physical-coordinate outliers.
+    losses["light_position"] = keras.losses.Huber(delta=1.0)
     losses["light_intensity"] = PhysicalVectorMSE(
         light_intensity_standard_deviation,
         name="physical_light_intensity_mse",
@@ -601,7 +601,21 @@ def compile_model(model, learning_rate, weight_decay=1e-4,
     optimizer = keras.optimizers.AdamW(
         learning_rate, weight_decay=weight_decay, global_clipnorm=1.0
     )
-    model.compile(optimizer=optimizer, loss=losses, metrics=metrics)
+    loss_weights = {
+        "object_translation": 1.0,
+        "object_orientation_6d": 1.0,
+        "object_scale": 1.0,
+        "light_position": 0.25,
+        "light_intensity": 1.0,
+        "shape": 1.0,
+        "material": 1.0,
+    }
+    model.compile(
+        optimizer=optimizer,
+        loss=losses,
+        loss_weights=loss_weights,
+        metrics=metrics,
+    )
 
 
 def split_records(records, seed):
