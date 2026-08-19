@@ -334,6 +334,30 @@ def symmetry_rotation_loss(target_6d_and_shape, predicted_6d):
     return keras.ops.square(angles)
 
 
+@keras.saving.register_keras_serializable("synthetic_rgbd")
+class PhysicalTranslationMSE(keras.losses.Loss):
+    """Squared Euclidean camera-frame translation error in square metres."""
+
+    def __init__(self, standard_deviation=(1.0, 1.0, 1.0),
+                 name="physical_translation_mse", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.standard_deviation = tuple(float(value)
+                                        for value in standard_deviation)
+
+    def call(self, target, prediction):
+        scale = keras.ops.cast(
+            keras.ops.convert_to_tensor(self.standard_deviation),
+            prediction.dtype,
+        )
+        error_metres = (prediction - target) * scale
+        return keras.ops.sum(keras.ops.square(error_metres), axis=-1)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"standard_deviation": self.standard_deviation})
+        return config
+
+
 def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
                 l2_regularization=1e-4):
     """Builds a shared CNN encoder with classification/regression heads."""
@@ -369,10 +393,14 @@ def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
     return keras.Model(inputs, outputs, name="synthetic_rgbd_cnn")
 
 
-def compile_model(model, learning_rate, weight_decay=1e-4):
+def compile_model(model, learning_rate, weight_decay=1e-4,
+                  translation_standard_deviation=(1.0, 1.0, 1.0)):
     losses = {name: "mse" for name in model.output_names}
     losses["shape"] = "categorical_crossentropy"
     losses["object_orientation_6d"] = symmetry_rotation_loss
+    losses["object_translation"] = PhysicalTranslationMSE(
+        translation_standard_deviation
+    )
     metrics = {name: ["mae"] for name in model.output_names}
     metrics["shape"] = ["accuracy"]
     metrics["object_orientation_6d"] = [symmetry_geodesic_angle]
@@ -482,7 +510,12 @@ def main(argv=None):
                         args.max_depth)
     input_shape = train[0][0].shape[1:]
     model = build_model(input_shape, l2_regularization=args.l2_regularization)
-    compile_model(model, args.learning_rate, args.weight_decay)
+    translation_std = normalizer.statistics[
+        "object_translation"
+    ]["standard_deviation"]
+    compile_model(
+        model, args.learning_rate, args.weight_decay, translation_std
+    )
     model.summary()
     callbacks = [
         keras.callbacks.CSVLogger(args.output / "training.csv"),
