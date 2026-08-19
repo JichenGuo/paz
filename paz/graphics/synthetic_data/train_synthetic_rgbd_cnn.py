@@ -1,9 +1,10 @@
 """Train a multi-task CNN on data from generate_synthetic_rgbd.py.
 
 Example:
-    KERAS_BACKEND=jax python -m \
+    KERAS_BACKEND=jax JAX_PLATFORMS=cpu python -m \
         paz.graphics.synthetic_data.train_synthetic_rgbd_cnn \
-        --dataset synthetic_rgbd --output experiments/rgbd_cnn
+        --dataset synthetic_rgbd_1000 --output experiments/rgbd_cnn \
+        --test-output synthetic_rgbd_1000_test
 
 RGB and metric depth are combined into a four-channel input. Continuous
 targets, except the 6D orientation, are standardized using the training split.
@@ -13,14 +14,17 @@ The saved ``normalization.json`` is required to decode model predictions.
 import os
 
 os.environ.setdefault("KERAS_BACKEND", "jax")
+os.environ["JAX_PLATFORMS"] = "cpu"
 
 import argparse
 import itertools
 import json
 import math
 from pathlib import Path
+import shutil
 
 import cv2
+import jax
 import keras
 import numpy as np
 
@@ -60,6 +64,7 @@ def load_records(dataset_path):
         with metadata_path.open() as file:
             record = json.load(file)
         record["_root"] = str(dataset_path)
+        record["_metadata_path"] = str(metadata_path)
         records.append(record)
     return records
 
@@ -305,17 +310,54 @@ def compile_model(model, learning_rate):
     model.compile(optimizer=optimizer, loss=losses, metrics=metrics)
 
 
-def split_records(records, validation_fraction, seed):
-    if len(records) < 2:
-        raise ValueError("At least two generated samples are required")
+def split_records(records, seed):
+    """Randomly splits records into 60% train, 20% validation, 20% test."""
+    if len(records) < 5:
+        raise ValueError("At least five generated samples are required")
     indices = np.random.default_rng(seed).permutation(len(records))
-    validation_count = max(1, round(len(records) * validation_fraction))
-    validation_count = min(validation_count, len(records) - 1)
-    validation_indices = indices[:validation_count]
-    training_indices = indices[validation_count:]
+    validation_count = round(len(records) * 0.2)
+    test_count = round(len(records) * 0.2)
+    training_count = len(records) - validation_count - test_count
+    training_indices = indices[:training_count]
+    validation_end = training_count + validation_count
+    validation_indices = indices[training_count:validation_end]
+    test_indices = indices[validation_end:]
     train = [records[index] for index in training_indices]
     valid = [records[index] for index in validation_indices]
-    return train, valid
+    test = [records[index] for index in test_indices]
+    return train, valid, test
+
+
+def export_test_split(records, destination):
+    """Copies test RGB, depth, and metadata into a standalone directory."""
+    for directory in ("rgb", "depth", "metadata"):
+        (destination / directory).mkdir(parents=True, exist_ok=True)
+    for record in records:
+        root = Path(record["_root"])
+        rgb_source = root / record["rgb"]
+        depth_source = root / record["depth"]
+        metadata_source = Path(record["_metadata_path"])
+        shutil.copy2(rgb_source, destination / "rgb" / rgb_source.name)
+        shutil.copy2(depth_source, destination / "depth" / depth_source.name)
+        shutil.copy2(
+            metadata_source, destination / "metadata" / metadata_source.name
+        )
+
+
+def save_split_manifest(path, train, valid, test, seed):
+    """Saves sample IDs so the random split can be reproduced exactly."""
+    def names(records):
+        return [Path(record["_metadata_path"]).stem for record in records]
+
+    manifest = {
+        "seed": seed,
+        "ratio": {"train": 0.6, "validation": 0.2, "test": 0.2},
+        "train": names(train),
+        "validation": names(valid),
+        "test": names(test),
+    }
+    with path.open("w") as file:
+        json.dump(manifest, file, indent=2)
 
 
 def make_parser():
@@ -326,9 +368,12 @@ def make_parser():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--max-depth", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--test-output", type=Path, default=None,
+        help="Test export directory; defaults to <output>/test_split.",
+    )
     return parser
 
 
@@ -336,13 +381,23 @@ def main(argv=None):
     args = make_parser().parse_args(argv)
     if args.batch_size < 1 or args.epochs < 1 or args.max_depth <= 0:
         raise ValueError("batch-size, epochs, and max-depth must be positive")
-    if not 0.0 < args.validation_fraction < 1.0:
-        raise ValueError("validation-fraction must be between zero and one")
     args.output.mkdir(parents=True, exist_ok=True)
+    cpu_device = jax.devices("cpu")[0]
+    jax.config.update("jax_default_device", cpu_device)
+    print(f"Training with Keras {keras.backend.backend()} on {cpu_device}")
     records = load_records(args.dataset)
-    train_records, valid_records = split_records(
-        records, args.validation_fraction, args.seed
+    train_records, valid_records, test_records = split_records(
+        records, args.seed
     )
+    test_output = args.test_output or args.output / "test_split"
+    export_test_split(test_records, test_output)
+    save_split_manifest(
+        args.output / "split.json", train_records, valid_records,
+        test_records, args.seed,
+    )
+    print(f"Split: {len(train_records)} train, {len(valid_records)} "
+          f"validation, {len(test_records)} test")
+    print(f"Exported test split to {test_output}")
     normalizer = TargetNormalizer.fit(train_records)
     normalizer.save(args.output / "normalization.json")
     train = RGBDDataset(train_records, normalizer, args.batch_size,
