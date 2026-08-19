@@ -14,6 +14,7 @@ import os
 os.environ.setdefault("KERAS_BACKEND", "jax")
 
 import argparse
+import itertools
 import json
 import math
 from pathlib import Path
@@ -31,6 +32,21 @@ REGRESSION_NAMES = (
     "light_intensity",
     "material",
 )
+
+
+def build_cube_symmetries():
+    """Returns the 24 orientation-preserving symmetries of a cube."""
+    symmetries = []
+    for permutation in itertools.permutations(range(3)):
+        for signs in itertools.product((-1.0, 1.0), repeat=3):
+            matrix = np.zeros((3, 3), dtype=np.float32)
+            matrix[permutation, range(3)] = signs
+            if np.linalg.det(matrix) > 0.0:
+                symmetries.append(matrix)
+    return np.stack(symmetries)
+
+
+CUBE_SYMMETRIES = build_cube_symmetries()
 
 
 def load_records(dataset_path):
@@ -52,12 +68,18 @@ def extract_targets(record):
     orientation = record["object"]["orientation_camera_6d"]
     material = record["material"]
     shape_arg = SHAPE_NAMES.index(record["shape"]["type"])
+    shape_target = np.eye(len(SHAPE_NAMES), dtype=np.float32)[shape_arg]
+    orientation_target = np.asarray(
+        orientation["vector_a"] + orientation["vector_b"], np.float32
+    )
     return {
         "object_translation": np.asarray(
             record["object"]["translation_camera_xyz"], np.float32
         ),
-        "object_orientation_6d": np.asarray(
-            orientation["vector_a"] + orientation["vector_b"], np.float32
+        # Shape is appended only to let the loss choose a symmetry group.
+        # The CNN orientation head still predicts exactly six values.
+        "object_orientation_6d": np.concatenate(
+            [orientation_target, shape_target]
         ),
         "object_scale": np.asarray([record["object"]["scale"]], np.float32),
         "light_position": np.asarray(
@@ -66,7 +88,7 @@ def extract_targets(record):
         "light_intensity": np.asarray(
             [record["light"]["intensity"]], np.float32
         ),
-        "shape": np.eye(len(SHAPE_NAMES), dtype=np.float32)[shape_arg],
+        "shape": shape_target,
         "material": np.asarray(
             material["color_rgb"]
             + [material["ambient"], material["diffuse"],
@@ -191,24 +213,48 @@ def rotation_6d_to_matrix(rotation_6d):
 
 
 @keras.saving.register_keras_serializable("synthetic_rgbd")
-def rotation_matrix_loss(target_6d, predicted_6d):
-    """Chordal SO(3) loss after Gram--Schmidt reconstruction."""
+def symmetry_geodesic_angle(target_6d_and_shape, predicted_6d):
+    """Minimum geodesic error under each primitive's symmetry group."""
+    target_6d = target_6d_and_shape[..., :6]
+    shape = target_6d_and_shape[..., 6:]
     target_rotation = rotation_6d_to_matrix(target_6d)
     predicted_rotation = rotation_6d_to_matrix(predicted_6d)
-    squared_error = keras.ops.square(predicted_rotation - target_rotation)
-    return 0.5 * keras.ops.sum(squared_error, axis=(-2, -1))
+
+    cube_symmetries = keras.ops.cast(
+        keras.ops.convert_to_tensor(CUBE_SYMMETRIES), target_rotation.dtype
+    )
+    equivalent_cubes = keras.ops.matmul(
+        keras.ops.expand_dims(target_rotation, axis=1),
+        keras.ops.expand_dims(cube_symmetries, axis=0),
+    )
+    equivalent_transpose = keras.ops.transpose(
+        equivalent_cubes, (0, 1, 3, 2)
+    )
+    relative_cubes = keras.ops.matmul(
+        equivalent_transpose,
+        keras.ops.expand_dims(predicted_rotation, axis=1),
+    )
+    cube_traces = keras.ops.trace(relative_cubes, axis1=-2, axis2=-1)
+    cube_cosines = keras.ops.clip((cube_traces - 1.0) / 2.0, -1.0, 1.0)
+    cube_angles = keras.ops.min(keras.ops.arccos(cube_cosines), axis=-1)
+
+    target_axis = target_rotation[..., :, 1]
+    predicted_axis = predicted_rotation[..., :, 1]
+    axis_cosine = keras.ops.sum(target_axis * predicted_axis, axis=-1)
+    # A plain, closed cylinder is unchanged by reversing its vertical axis.
+    cylinder_cosine = keras.ops.clip(keras.ops.abs(axis_cosine), 0.0, 1.0)
+    cylinder_angles = keras.ops.arccos(cylinder_cosine)
+
+    shape_arg = keras.ops.argmax(shape, axis=-1)
+    angles = keras.ops.where(shape_arg == 0, cube_angles, cylinder_angles)
+    return keras.ops.where(shape_arg == 2, keras.ops.zeros_like(angles), angles)
 
 
 @keras.saving.register_keras_serializable("synthetic_rgbd")
-def geodesic_angle(target_6d, predicted_6d):
-    """Returns the SO(3) geodesic error angle in radians."""
-    target_rotation = rotation_6d_to_matrix(target_6d)
-    predicted_rotation = rotation_6d_to_matrix(predicted_6d)
-    target_transpose = keras.ops.transpose(target_rotation, (0, 2, 1))
-    relative_rotation = keras.ops.matmul(target_transpose, predicted_rotation)
-    trace = keras.ops.trace(relative_rotation, axis1=-2, axis2=-1)
-    cosine = keras.ops.clip((trace - 1.0) / 2.0, -1.0, 1.0)
-    return keras.ops.arccos(cosine)
+def symmetry_rotation_loss(target_6d_and_shape, predicted_6d):
+    """Squared minimum SO(3) geodesic distance under object symmetry."""
+    angles = symmetry_geodesic_angle(target_6d_and_shape, predicted_6d)
+    return keras.ops.square(angles)
 
 
 def build_model(input_shape, num_shapes=len(SHAPE_NAMES)):
@@ -239,10 +285,10 @@ def build_model(input_shape, num_shapes=len(SHAPE_NAMES)):
 def compile_model(model, learning_rate):
     losses = {name: "mse" for name in model.output_names}
     losses["shape"] = "categorical_crossentropy"
-    losses["object_orientation_6d"] = rotation_matrix_loss
+    losses["object_orientation_6d"] = symmetry_rotation_loss
     metrics = {name: ["mae"] for name in model.output_names}
     metrics["shape"] = ["accuracy"]
-    metrics["object_orientation_6d"] = [geodesic_angle]
+    metrics["object_orientation_6d"] = [symmetry_geodesic_angle]
     optimizer = keras.optimizers.Adam(learning_rate)
     model.compile(optimizer=optimizer, loss=losses, metrics=metrics)
 
