@@ -26,7 +26,11 @@ import shutil
 import cv2
 import jax
 import keras
+import matplotlib
 import numpy as np
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 SHAPE_NAMES = ("cube", "cylinder", "sphere")
@@ -189,6 +193,31 @@ class RGBDDataset(keras.utils.PyDataset):
     def on_epoch_end(self):
         if self.shuffle:
             self.rng.shuffle(self.indices)
+
+
+class LossPlot(keras.callbacks.Callback):
+    """Updates a PNG of training and validation loss after every epoch."""
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = Path(path)
+        self.training_loss = []
+        self.validation_loss = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        self.training_loss.append(logs.get("loss", np.nan))
+        self.validation_loss.append(logs.get("val_loss", np.nan))
+        epochs = np.arange(1, len(self.training_loss) + 1)
+        figure, axis = plt.subplots(figsize=(7, 5))
+        axis.plot(epochs, self.training_loss, label="Training loss")
+        axis.plot(epochs, self.validation_loss, label="Validation loss")
+        axis.set(xlabel="Epoch", ylabel="Total loss", title="Training loss")
+        axis.grid(alpha=0.3)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(self.path, dpi=150)
+        plt.close(figure)
 
 
 def convolution_block(inputs, filters, stride=2):
@@ -410,6 +439,7 @@ def main(argv=None):
     model.summary()
     callbacks = [
         keras.callbacks.CSVLogger(args.output / "training.csv"),
+        LossPlot(args.output / "loss.png"),
         keras.callbacks.TerminateOnNaN(),
         keras.callbacks.ModelCheckpoint(
             args.output / "best.keras", save_best_only=True
