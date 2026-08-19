@@ -41,6 +41,15 @@ REGRESSION_NAMES = (
     "light_intensity",
     "material",
 )
+LOSS_HEAD_NAMES = (
+    "object_translation",
+    "object_orientation_6d",
+    "object_scale",
+    "light_position",
+    "light_intensity",
+    "shape",
+    "material",
+)
 
 
 def build_cube_symmetries():
@@ -196,25 +205,46 @@ class RGBDDataset(keras.utils.PyDataset):
 
 
 class LossPlot(keras.callbacks.Callback):
-    """Updates a PNG of training and validation loss after every epoch."""
+    """Updates one figure containing total and per-head loss subplots."""
 
     def __init__(self, path):
         super().__init__()
         self.path = Path(path)
         self.training_loss = []
         self.validation_loss = []
+        self.component_history = {
+            name: {"train": [], "validation": []}
+            for name in LOSS_HEAD_NAMES
+        }
 
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
         self.training_loss.append(logs.get("loss", np.nan))
         self.validation_loss.append(logs.get("val_loss", np.nan))
+        for name, history in self.component_history.items():
+            history["train"].append(logs.get(f"{name}_loss", np.nan))
+            history["validation"].append(
+                logs.get(f"val_{name}_loss", np.nan)
+            )
         epochs = np.arange(1, len(self.training_loss) + 1)
-        figure, axis = plt.subplots(figsize=(7, 5))
-        axis.plot(epochs, self.training_loss, label="Training loss")
-        axis.plot(epochs, self.validation_loss, label="Validation loss")
-        axis.set(xlabel="Epoch", ylabel="Total loss", title="Training loss")
-        axis.grid(alpha=0.3)
-        axis.legend()
+        curves = [
+            ("Total multi-task loss", self.training_loss,
+             self.validation_loss)
+        ]
+        curves.extend([
+            (name.replace("_", " ").title(), history["train"],
+             history["validation"])
+            for name, history in self.component_history.items()
+        ])
+        figure, axes = plt.subplots(4, 2, figsize=(14, 16), sharex=True)
+        for axis, (title, training, validation) in zip(axes.flat, curves):
+            axis.plot(epochs, training, label="Training")
+            axis.plot(epochs, validation, label="Validation")
+            axis.set(title=title, ylabel="Loss")
+            axis.grid(alpha=0.3)
+            axis.legend()
+        for axis in axes[-1]:
+            axis.set_xlabel("Epoch")
         figure.tight_layout()
         figure.savefig(self.path, dpi=150)
         plt.close(figure)
