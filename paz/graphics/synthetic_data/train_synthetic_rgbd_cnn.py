@@ -1,7 +1,8 @@
 """Train a multi-task CNN on data from generate_synthetic_rgbd.py.
 
 Example:
-    KERAS_BACKEND=jax python paz/graphics/train_synthetic_rgbd_cnn.py \
+    KERAS_BACKEND=jax python -m \
+        paz.graphics.synthetic_data.train_synthetic_rgbd_cnn \
         --dataset synthetic_rgbd --output experiments/rgbd_cnn
 
 RGB and metric depth are combined into a four-channel input. Continuous

@@ -1,6 +1,6 @@
 import numpy as np
 
-from paz.graphics.generate_synthetic_rgbd import (
+from paz.graphics.synthetic_data.generate_synthetic_rgbd import (
     build_mesh,
     rotation_6d_to_matrix,
     rotation_matrix_to_6d,
@@ -43,7 +43,7 @@ def test_rotation_6d_orthogonalizes_raw_vectors():
 
 def test_mesh_rests_on_floor():
     parameters = sample_parameters(np.random.default_rng(3), ["cylinder"])
-    from paz.graphics.generate_synthetic_rgbd import build_scene
+    from paz.graphics.synthetic_data.generate_synthetic_rgbd import build_scene
 
     _, transform = build_scene(parameters)
     mesh = build_mesh("cylinder", transform)

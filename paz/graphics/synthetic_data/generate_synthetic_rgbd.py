@@ -1,7 +1,7 @@
 """Generate RGB-D observations of one primitive resting on a floor.
 
 Example:
-    python -m paz.graphics.generate_synthetic_rgbd \
+    python -m paz.graphics.synthetic_data.generate_synthetic_rgbd \
         --output synthetic_rgbd --num-samples 100 --shapes cube cylinder sphere
 
 Each sample contains an RGB PNG, metric depth as ``.npy``, the object mesh as
