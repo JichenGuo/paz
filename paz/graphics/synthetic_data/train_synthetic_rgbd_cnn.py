@@ -50,6 +50,24 @@ LOSS_HEAD_NAMES = (
     "shape",
     "material",
 )
+METRIC_CURVES = (
+    ("Object translation distance (m)",
+     "object_translation_euclidean_distance_m"),
+    ("Orientation geodesic angle (degrees)",
+     "object_orientation_6d_symmetry_geodesic_angle_degrees"),
+    ("Object absolute scale error", "object_scale_absolute_scale_error"),
+    ("Light position distance (m)",
+     "light_position_euclidean_distance_m"),
+    ("Light intensity MAE", "light_intensity_physical_mae"),
+    ("Shape accuracy", "shape_accuracy"),
+    ("Material red MAE", "material_color_r_physical_mae"),
+    ("Material green MAE", "material_color_g_physical_mae"),
+    ("Material blue MAE", "material_color_b_physical_mae"),
+    ("Material ambient MAE", "material_ambient_physical_mae"),
+    ("Material diffuse MAE", "material_diffuse_physical_mae"),
+    ("Material specular MAE", "material_specular_physical_mae"),
+    ("Material shininess MAE", "material_shininess_physical_mae"),
+)
 
 
 def build_cube_symmetries():
@@ -205,16 +223,24 @@ class RGBDDataset(keras.utils.PyDataset):
 
 
 class LossPlot(keras.callbacks.Callback):
-    """Updates one figure containing total and per-head loss subplots."""
+    """Updates consolidated loss and physical-metric figures."""
 
-    def __init__(self, path):
+    def __init__(self, path, metric_path=None):
         super().__init__()
         self.path = Path(path)
+        self.metric_path = (
+            Path(metric_path) if metric_path is not None
+            else self.path.with_name("metrics.png")
+        )
         self.training_loss = []
         self.validation_loss = []
         self.component_history = {
             name: {"train": [], "validation": []}
             for name in LOSS_HEAD_NAMES
+        }
+        self.metric_history = {
+            log_name: {"train": [], "validation": []}
+            for _, log_name in METRIC_CURVES
         }
 
     def on_epoch_end(self, epoch, logs=None):
@@ -225,6 +251,11 @@ class LossPlot(keras.callbacks.Callback):
             history["train"].append(logs.get(f"{name}_loss", np.nan))
             history["validation"].append(
                 logs.get(f"val_{name}_loss", np.nan)
+            )
+        for name, history in self.metric_history.items():
+            history["train"].append(logs.get(name, np.nan))
+            history["validation"].append(
+                logs.get(f"val_{name}", np.nan)
             )
         epochs = np.arange(1, len(self.training_loss) + 1)
         curves = [
@@ -247,6 +278,22 @@ class LossPlot(keras.callbacks.Callback):
             axis.set_xlabel("Epoch")
         figure.tight_layout()
         figure.savefig(self.path, dpi=150)
+        plt.close(figure)
+
+        figure, axes = plt.subplots(4, 4, figsize=(18, 16), sharex=True)
+        for axis, (title, log_name) in zip(axes.flat, METRIC_CURVES):
+            history = self.metric_history[log_name]
+            axis.plot(epochs, history["train"], label="Training")
+            axis.plot(epochs, history["validation"], label="Validation")
+            axis.set(title=title, ylabel="Metric")
+            axis.grid(alpha=0.3)
+            axis.legend()
+        for axis in axes.flat[len(METRIC_CURVES):]:
+            axis.set_visible(False)
+        for axis in axes[-1]:
+            axis.set_xlabel("Epoch")
+        figure.tight_layout()
+        figure.savefig(self.metric_path, dpi=150)
         plt.close(figure)
 
 
