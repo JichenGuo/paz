@@ -36,8 +36,6 @@ from paz.graphics.synthetic_data.train_synthetic_rgbd_cnn import (
     export_test_split,
     extract_targets,
     load_records,
-    save_split_manifest,
-    split_records,
     symmetry_geodesic_angle_degrees,
     symmetry_rotation_loss,
 )
@@ -164,10 +162,9 @@ class ObjectHistoryPlot(keras.callbacks.Callback):
         epochs = np.arange(1, epoch + 2)
         for axis, name in zip(axes.flat, names):
             axis.plot(epochs, self.history.get(name, []), label="Training")
-            axis.plot(
-                epochs, self.history.get(f"val_{name}", []),
-                label="Validation",
-            )
+            validation = self.history.get(f"val_{name}")
+            if validation is not None:
+                axis.plot(epochs, validation, label="Validation")
             axis.set_title(name.replace("_", " ").title())
             axis.grid(alpha=0.3)
             axis.legend()
@@ -274,6 +271,33 @@ def compile_model(model, learning_rate, weight_decay, statistics):
     model.compile(optimizer=optimizer, loss=losses, metrics=metrics)
 
 
+def split_train_test(records, seed):
+    """Randomly splits records into 80% training and 20% held-out test."""
+    if len(records) < 2:
+        raise ValueError("At least two generated samples are required")
+    indices = np.random.default_rng(seed).permutation(len(records))
+    test_count = max(1, round(len(records) * 0.2))
+    training_count = len(records) - test_count
+    training = [records[index] for index in indices[:training_count]]
+    test = [records[index] for index in indices[training_count:]]
+    return training, test
+
+
+def save_split_manifest(path, training, test, seed):
+    """Saves the reproducible 80/20 split without a validation partition."""
+    def names(records):
+        return [Path(record["_metadata_path"]).stem for record in records]
+
+    payload = {
+        "seed": seed,
+        "ratio": {"train": 0.8, "test": 0.2},
+        "train": names(training),
+        "test": names(test),
+    }
+    with path.open("w") as file:
+        json.dump(payload, file, indent=2)
+
+
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
@@ -298,23 +322,17 @@ def main(argv=None):
     cpu = jax.devices("cpu")[0]
     jax.config.update("jax_default_device", cpu)
     records = load_records(args.dataset)
-    training_records, validation_records, test_records = split_records(
-        records, args.seed
-    )
+    training_records, test_records = split_train_test(records, args.seed)
     test_output = args.test_output or args.output / "test_split"
     export_test_split(test_records, test_output)
     save_split_manifest(
-        args.output / "split.json", training_records, validation_records,
-        test_records, args.seed,
+        args.output / "split.json", training_records, test_records, args.seed
     )
     normalizer = ObjectNormalizer.fit(training_records)
     normalizer.save(args.output / "normalization.json")
     training = ObjectRGBDDataset(
         training_records, normalizer, args.batch_size, args.max_depth,
         shuffle=True, seed=args.seed,
-    )
-    validation = ObjectRGBDDataset(
-        validation_records, normalizer, args.batch_size, args.max_depth
     )
     model = build_model(
         training[0][0].shape[1:], args.l2_regularization
@@ -328,22 +346,16 @@ def main(argv=None):
         ObjectHistoryPlot(args.output / "loss.png"),
         keras.callbacks.TerminateOnNaN(),
         keras.callbacks.ModelCheckpoint(
-            args.output / "best.keras", save_best_only=True
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", patience=5, factor=0.5
-        ),
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=10, restore_best_weights=True
+            args.output / "best.keras", monitor="loss", mode="min",
+            save_best_only=True,
         ),
     ]
     print(
         f"Training on {cpu}: {len(training_records)} train, "
-        f"{len(validation_records)} validation, {len(test_records)} test"
+        f"{len(test_records)} held-out test; no validation split"
     )
     model.fit(
-        training, validation_data=validation, epochs=args.epochs,
-        callbacks=callbacks,
+        training, epochs=args.epochs, callbacks=callbacks
     )
     model.save(args.output / "final.keras")
 
