@@ -88,7 +88,10 @@ def sample_parameters(rng, shape_names):
 def build_scene(parameters):
     """Builds an analytic PAZ scene and returns it with the object transform."""
     object_scale = parameters["object_scale"]
-    translation = paz.SE3.translation(jp.array([0.0, object_scale, 0.0]))
+    object_translation = parameters.get(
+        "object_translation_world", [0.0, object_scale, 0.0]
+    )
+    translation = paz.SE3.translation(jp.array(object_translation))
     rotation = paz.SE3.rotation_y(parameters["object_yaw"])
     scaling = paz.SE3.scaling(jp.full(3, object_scale))
     object_transform = translation @ rotation @ scaling
