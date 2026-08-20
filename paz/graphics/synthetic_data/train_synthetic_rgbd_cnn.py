@@ -234,6 +234,7 @@ class LossPlot(keras.callbacks.Callback):
         )
         self.training_loss = []
         self.validation_loss = []
+        self.has_validation = False
         self.component_history = {
             name: {"train": [], "validation": []}
             for name in LOSS_HEAD_NAMES
@@ -245,6 +246,7 @@ class LossPlot(keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
+        self.has_validation = self.has_validation or "val_loss" in logs
         self.training_loss.append(logs.get("loss", np.nan))
         self.validation_loss.append(logs.get("val_loss", np.nan))
         for name, history in self.component_history.items():
@@ -270,7 +272,8 @@ class LossPlot(keras.callbacks.Callback):
         figure, axes = plt.subplots(4, 2, figsize=(14, 16), sharex=True)
         for axis, (title, training, validation) in zip(axes.flat, curves):
             axis.plot(epochs, training, label="Training")
-            axis.plot(epochs, validation, label="Validation")
+            if self.has_validation:
+                axis.plot(epochs, validation, label="Validation")
             axis.set(title=title, ylabel="Loss")
             axis.grid(alpha=0.3)
             axis.legend()
@@ -284,7 +287,10 @@ class LossPlot(keras.callbacks.Callback):
         for axis, (title, log_name) in zip(axes.flat, METRIC_CURVES):
             history = self.metric_history[log_name]
             axis.plot(epochs, history["train"], label="Training")
-            axis.plot(epochs, history["validation"], label="Validation")
+            if self.has_validation:
+                axis.plot(
+                    epochs, history["validation"], label="Validation"
+                )
             axis.set(title=title, ylabel="Metric")
             axis.grid(alpha=0.3)
             axis.legend()
@@ -584,32 +590,25 @@ class SpatialSoftArgmax2D(keras.layers.Layer):
 
 def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
                 l2_regularization=1e-4):
-    """Builds spatial pose and global appearance branches over RGB-D."""
+    """Builds compact pose and complete physical-parameter branches."""
     inputs = keras.Input(input_shape, name="rgbd")
     regularizer = keras.regularizers.L2(l2_regularization)
-    x = convolution_block(inputs, 16, regularizer)
+    # Match the compact object CNN: coordinates are present before any
+    # downsampling, preserving small image-plane object displacements.
+    x = CoordinateChannels(name="input_coordinates")(inputs)
+    x = convolution_block(x, 16, regularizer)
     x = convolution_block(x, 32, regularizer)
-    x = convolution_block(x, 64, regularizer)
-    x = convolution_block(x, 128, regularizer)
+    pose_map = convolution_block(x, 64, regularizer)
 
-    # CoordConv supplies explicit image location to the pose heads. Learned
-    # heatmaps are reduced to expected X/Y coordinates instead of flattening
-    # the whole grid, substantially reducing pose-branch capacity.
-    pose = CoordinateChannels(name="pose_coordinates")(x)
-    pose = keras.layers.Conv2D(
-        32, 3, padding="same", activation="relu",
-        kernel_regularizer=regularizer, name="pose_spatial_conv",
-    )(pose)
     pose_logits = keras.layers.Conv2D(
-        16, 1, padding="same", kernel_regularizer=regularizer,
-        name="pose_heatmaps",
-    )(pose)
+        16, 1, kernel_regularizer=regularizer, name="object_heatmaps"
+    )(pose_map)
     pose_coordinates = SpatialSoftArgmax2D(
-        name="pose_spatial_soft_argmax"
+        name="object_spatial_soft_argmax"
     )(pose_logits)
     pose_context = keras.layers.GlobalAveragePooling2D(
         name="pose_global_context"
-    )(pose)
+    )(pose_map)
     pose = keras.layers.Concatenate(name="pose_coordinate_context")(
         [pose_coordinates, pose_context]
     )
@@ -619,11 +618,12 @@ def build_model(input_shape, num_shapes=len(SHAPE_NAMES),
     )(pose)
     pose = keras.layers.Dropout(0.2, name="pose_dropout")(pose)
 
+    global_features = convolution_block(pose_map, 96, regularizer)
     global_features = keras.layers.GlobalAveragePooling2D(
         name="global_average_pool"
-    )(x)
+    )(global_features)
     global_features = keras.layers.Dense(
-        128, activation="relu", kernel_regularizer=regularizer
+        64, activation="relu", kernel_regularizer=regularizer
     )(global_features)
     global_features = keras.layers.Dropout(
         0.2, name="global_dropout"
@@ -751,6 +751,18 @@ def split_records(records, seed):
     return train, valid, test
 
 
+def split_train_test(records, seed):
+    """Randomly splits records into 80% training and 20% held-out test."""
+    if len(records) < 2:
+        raise ValueError("At least two generated samples are required")
+    indices = np.random.default_rng(seed).permutation(len(records))
+    test_count = max(1, round(len(records) * 0.2))
+    training_count = len(records) - test_count
+    train = [records[index] for index in indices[:training_count]]
+    test = [records[index] for index in indices[training_count:]]
+    return train, test
+
+
 def export_test_split(records, destination):
     """Copies test RGB, depth, and metadata into a standalone directory."""
     for directory in ("rgb", "depth", "metadata"):
@@ -777,6 +789,21 @@ def save_split_manifest(path, train, valid, test, seed):
         "ratio": {"train": 0.6, "validation": 0.2, "test": 0.2},
         "train": names(train),
         "validation": names(valid),
+        "test": names(test),
+    }
+    with path.open("w") as file:
+        json.dump(manifest, file, indent=2)
+
+
+def save_train_test_manifest(path, train, test, seed):
+    """Saves sample IDs for the reproducible 80/20 train/test split."""
+    def names(records):
+        return [Path(record["_metadata_path"]).stem for record in records]
+
+    manifest = {
+        "seed": seed,
+        "ratio": {"train": 0.8, "test": 0.2},
+        "train": names(train),
         "test": names(test),
     }
     with path.open("w") as file:
@@ -813,24 +840,19 @@ def main(argv=None):
     jax.config.update("jax_default_device", cpu_device)
     print(f"Training with Keras {keras.backend.backend()} on {cpu_device}")
     records = load_records(args.dataset)
-    train_records, valid_records, test_records = split_records(
-        records, args.seed
-    )
+    train_records, test_records = split_train_test(records, args.seed)
     test_output = args.test_output or args.output / "test_split"
     export_test_split(test_records, test_output)
-    save_split_manifest(
-        args.output / "split.json", train_records, valid_records,
-        test_records, args.seed,
+    save_train_test_manifest(
+        args.output / "split.json", train_records, test_records, args.seed
     )
-    print(f"Split: {len(train_records)} train, {len(valid_records)} "
-          f"validation, {len(test_records)} test")
+    print(f"Split: {len(train_records)} train, {len(test_records)} "
+          "held-out test; no validation split")
     print(f"Exported test split to {test_output}")
     normalizer = TargetNormalizer.fit(train_records)
     normalizer.save(args.output / "normalization.json")
     train = RGBDDataset(train_records, normalizer, args.batch_size,
                         args.max_depth, shuffle=True, seed=args.seed)
-    valid = RGBDDataset(valid_records, normalizer, args.batch_size,
-                        args.max_depth)
     input_shape = train[0][0].shape[1:]
     model = build_model(input_shape, l2_regularization=args.l2_regularization)
     translation_std = normalizer.statistics[
@@ -859,17 +881,11 @@ def main(argv=None):
         LossPlot(args.output / "loss.png"),
         keras.callbacks.TerminateOnNaN(),
         keras.callbacks.ModelCheckpoint(
-            args.output / "best.keras", save_best_only=True
-        ),
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=10, restore_best_weights=True
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", patience=5, factor=0.5
+            args.output / "best.keras", monitor="loss", mode="min",
+            save_best_only=True,
         ),
     ]
-    model.fit(train, validation_data=valid, epochs=args.epochs,
-              callbacks=callbacks)
+    model.fit(train, epochs=args.epochs, callbacks=callbacks)
     model.save(args.output / "final.keras")
 
 
