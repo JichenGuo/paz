@@ -18,10 +18,31 @@ def test_sample_parameters_is_reproducible():
     assert np.allclose(first["light_position"], second["light_position"])
 
 
-def test_camera_targets_object_center():
+def test_camera_target_is_offset_in_nominal_image_plane():
     parameters = sample_parameters(np.random.default_rng(9), ["sphere"])
-    expected = np.array([0.0, parameters["object_scale"], 0.0])
-    assert np.allclose(parameters["camera_target"], expected)
+    center = np.array([0.0, parameters["object_scale"], 0.0])
+    offset = parameters["camera_target"] - center
+    view_direction = center - parameters["camera_position"]
+
+    assert not np.allclose(offset, 0.0)
+    assert np.isclose(np.dot(offset, view_direction), 0.0, atol=1e-7)
+    assert np.linalg.norm(offset) <= np.sqrt(0.5) * parameters["object_scale"]
+
+
+def test_camera_target_offsets_vary_in_two_dimensions():
+    offsets = []
+    for seed in range(32):
+        parameters = sample_parameters(np.random.default_rng(seed), ["cube"])
+        center = np.array([0.0, parameters["object_scale"], 0.0])
+        view = center - parameters["camera_position"]
+        view /= np.linalg.norm(view)
+        right = np.cross(view, [0.0, 1.0, 0.0])
+        right /= np.linalg.norm(right)
+        up = np.cross(right, view)
+        offset = parameters["camera_target"] - center
+        offsets.append([np.dot(offset, right), np.dot(offset, up)])
+
+    assert np.all(np.std(offsets, axis=0) > 0.05)
 
 
 def test_rotation_6d_round_trip():
