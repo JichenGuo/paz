@@ -195,6 +195,10 @@ def generate_sample(output, index, parameters, image_size, y_fov,
     light_world = np.append(parameters["light_position"], 1.0)
     light_camera = np.asarray(world_to_camera) @ light_world
     metadata = {
+        "camera": {
+            "position_world_xyz": parameters["camera_position"],
+            "target_world_xyz": parameters["camera_target"],
+        },
         "object": {
             "translation_camera_xyz": object_to_camera[:3, 3],
             "orientation_camera_6d": {
