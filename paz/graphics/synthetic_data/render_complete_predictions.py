@@ -17,6 +17,7 @@ os.environ.setdefault("KERAS_BACKEND", "jax")
 os.environ["JAX_PLATFORMS"] = "cpu"
 
 import argparse
+import csv
 import gc
 import json
 from pathlib import Path
@@ -34,6 +35,15 @@ from paz.graphics.synthetic_data.generate_synthetic_rgbd import (
     rotation_6d_to_matrix,
 )
 from paz.graphics.synthetic_data.train_synthetic_rgbd_cnn import SHAPE_NAMES
+from paz.graphics.synthetic_data.train_synthetic_rgbd_cnn import (
+    CUBE_SYMMETRIES,
+)
+
+
+MATERIAL_NAMES = (
+    "color_r", "color_g", "color_b", "ambient", "diffuse", "specular",
+    "shininess",
+)
 
 
 def load_json(path):
@@ -60,9 +70,11 @@ def load_rgbd(record, test_split, max_depth):
     if depth.shape != rgb.shape[:2]:
         raise ValueError(f"RGB/depth shape mismatch for {rgb_path}")
     normalized_depth = np.clip(depth / max_depth, 0.0, 1.0)
-    return np.concatenate(
-        [rgb, normalized_depth[..., None]], axis=-1
-    ), rgb
+    return (
+        np.concatenate([rgb, normalized_depth[..., None]], axis=-1),
+        rgb,
+        depth,
+    )
 
 
 def decode_predictions(raw, statistics):
@@ -181,6 +193,130 @@ def render_prediction(prediction, camera, image_size, y_fov, shadows, tiles,
     )
 
 
+def stable_rotation_angle(rotation):
+    cosine = np.clip((np.trace(rotation) - 1.0) / 2.0, -1.0, 1.0)
+    return float(np.arccos(cosine))
+
+
+def symmetry_rotation_error_degrees(predicted, target, shape):
+    """Returns the minimum physically distinct rotation error in degrees."""
+    if shape == "sphere":
+        return 0.0
+    if shape == "cube":
+        angles = [
+            stable_rotation_angle((target @ symmetry).T @ predicted)
+            for symmetry in CUBE_SYMMETRIES
+        ]
+        return float(np.rad2deg(min(angles)))
+    # A closed cylinder is invariant to rotation around its vertical axis and
+    # to reversing that axis, so only the unoriented Y axis is observable.
+    cosine = np.clip(
+        abs(np.dot(target[:, 1], predicted[:, 1])), -1.0, 1.0
+    )
+    return float(np.rad2deg(np.arccos(cosine)))
+
+
+def evaluate_parameters(prediction, ground_truth):
+    """Computes unit-aware errors for every predicted physical parameter."""
+    target_orientation = ground_truth["object"]["orientation_camera_6d"]
+    target_rotation = rotation_6d_to_matrix(
+        target_orientation["vector_a"], target_orientation["vector_b"]
+    )
+    predicted_object = prediction["object"]
+    target_translation = np.asarray(
+        ground_truth["object"]["translation_camera_xyz"]
+    )
+    predicted_translation = np.asarray(
+        predicted_object["translation_camera_xyz"]
+    )
+    target_light = np.asarray(
+        ground_truth["light"]["position_camera_xyz"]
+    )
+    predicted_light = np.asarray(
+        prediction["light"]["position_camera_xyz"]
+    )
+    target_material = ground_truth["material"]
+    predicted_material = prediction["material"]
+    metrics = {
+        "translation_error_m": float(np.linalg.norm(
+            predicted_translation - target_translation
+        )),
+        "orientation_error_degrees": symmetry_rotation_error_degrees(
+            predicted_object["rotation_camera_3x3"], target_rotation,
+            ground_truth["shape"]["type"],
+        ),
+        "scale_absolute_error": float(abs(
+            predicted_object["scale"] - ground_truth["object"]["scale"]
+        )),
+        "shape_correct": int(
+            prediction["shape"]["type"] == ground_truth["shape"]["type"]
+        ),
+        "light_position_error_m": float(np.linalg.norm(
+            predicted_light - target_light
+        )),
+        "light_intensity_absolute_error": float(abs(
+            prediction["light"]["intensity"]
+            - ground_truth["light"]["intensity"]
+        )),
+    }
+    target_values = (
+        list(target_material["color_rgb"])
+        + [target_material["ambient"], target_material["diffuse"],
+           target_material["specular"], target_material["shininess"]]
+    )
+    predicted_values = (
+        list(predicted_material["color_rgb"])
+        + [predicted_material["ambient"], predicted_material["diffuse"],
+           predicted_material["specular"], predicted_material["shininess"]]
+    )
+    for name, predicted_value, target_value in zip(
+            MATERIAL_NAMES, predicted_values, target_values):
+        metrics[f"material_{name}_absolute_error"] = float(
+            abs(predicted_value - target_value)
+        )
+    return metrics
+
+
+def evaluate_render(rendered_rgb, target_rgb, rendered_depth, target_depth):
+    """Computes image fidelity and metric-depth reconstruction errors."""
+    rgb_error = rendered_rgb.astype(np.float64) - target_rgb.astype(np.float64)
+    rgb_mse = float(np.mean(np.square(rgb_error)))
+    valid_depth = (target_depth > 0.0) & (rendered_depth > 0.0)
+    if np.any(valid_depth):
+        depth_error = (
+            rendered_depth[valid_depth] - target_depth[valid_depth]
+        )
+        depth_mae = float(np.mean(np.abs(depth_error)))
+        depth_rmse = float(np.sqrt(np.mean(np.square(depth_error))))
+    else:
+        depth_mae, depth_rmse = float("nan"), float("nan")
+    return {
+        "rgb_mae_0_1": float(np.mean(np.abs(rgb_error))),
+        "rgb_psnr_db": (
+            100.0 if rgb_mse < 1e-10 else float(-10.0 * np.log10(rgb_mse))
+        ),
+        "depth_mae_m": depth_mae,
+        "depth_rmse_m": depth_rmse,
+    }
+
+
+def summarize_metrics(rows):
+    """Aggregates continuous errors and classification accuracy."""
+    summary = {"num_samples": len(rows)}
+    for name in rows[0]:
+        values = np.asarray([row[name] for row in rows], dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        if name == "shape_correct":
+            summary["shape_accuracy"] = float(np.mean(values))
+        elif finite.size:
+            summary[name] = {
+                "mean": float(np.mean(finite)),
+                "median": float(np.median(finite)),
+                "standard_deviation": float(np.std(finite)),
+            }
+    return summary
+
+
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", type=Path, required=True)
@@ -221,6 +357,7 @@ def main(argv=None):
     )["targets"]
     model = keras.models.load_model(model_path, compile=False)
     print(f"Loaded {model_path}; rendering {len(metadata_paths)} test samples")
+    metric_rows = []
 
     for item_index, metadata_path in enumerate(metadata_paths):
         sample_id = metadata_path.stem
@@ -234,7 +371,9 @@ def main(argv=None):
                 args.dataset / "metadata" / f"{sample_id}.json"
             )
             record["camera"] = load_json(source_metadata)["camera"]
-        rgbd, input_rgb = load_rgbd(record, test_split, args.max_depth)
+        rgbd, input_rgb, target_depth = load_rgbd(
+            record, test_split, args.max_depth
+        )
         raw = model.predict(rgbd[None], verbose=0)
         prediction = decode_predictions(raw, statistics)
         (rendered_rgb, rendered_depth, object_to_camera, object_to_world,
@@ -247,6 +386,11 @@ def main(argv=None):
         ).astype(np.uint8)
         input_uint8 = np.clip(input_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
         comparison = np.concatenate([input_uint8, rendered_uint8], axis=1)
+        metrics = evaluate_parameters(prediction, record)
+        metrics.update(evaluate_render(
+            rendered_rgb, input_rgb, rendered_depth, target_depth
+        ))
+        metric_rows.append({"sample_id": sample_id, **metrics})
         paz.image.write(
             str(output / "rendered_rgb" / f"{sample_id}.png"),
             rendered_uint8,
@@ -266,6 +410,7 @@ def main(argv=None):
             "object_to_world_4x4": object_to_world,
             "light_position_world_xyz": light_world,
             "render_coordinate_frame": "world",
+            "metrics": metrics,
             "rendered_rgb": f"rendered_rgb/{sample_id}.png",
             "rendered_depth": f"rendered_depth/{sample_id}.npy",
             "comparison": f"comparison/{sample_id}.png",
@@ -277,6 +422,18 @@ def main(argv=None):
                 and (item_index + 1) % args.clear_caches_every == 0):
             jax.clear_caches()
             gc.collect()
+
+    with (output / "metrics.csv").open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=metric_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(metric_rows)
+    summary = summarize_metrics([
+        {key: value for key, value in row.items() if key != "sample_id"}
+        for row in metric_rows
+    ])
+    with (output / "metrics_summary.json").open("w") as file:
+        json.dump(jsonify(summary), file, indent=2)
+    print(f"Saved evaluation summary to {output / 'metrics_summary.json'}")
 
 
 if __name__ == "__main__":
