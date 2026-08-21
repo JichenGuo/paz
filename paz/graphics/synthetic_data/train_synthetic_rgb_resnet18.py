@@ -212,6 +212,28 @@ class TrainingPlot(keras.callbacks.Callback):
         plt.close(figure)
 
 
+class PeriodicWeightsCheckpoint(keras.callbacks.Callback):
+    """Saves model weights at a fixed epoch interval."""
+
+    def __init__(self, directory, interval=10):
+        super().__init__()
+        if interval < 1:
+            raise ValueError("checkpoint interval must be positive")
+        self.directory = Path(directory)
+        self.interval = interval
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def on_epoch_end(self, epoch, logs=None):
+        completed_epoch = epoch + 1
+        if completed_epoch % self.interval == 0:
+            path = (
+                self.directory
+                / f"epoch_{completed_epoch:04d}.weights.h5"
+            )
+            self.model.save_weights(path)
+            print(f"Saved periodic weights to {path}")
+
+
 def basic_block(inputs, filters, stride, regularizer, name):
     """Standard two-convolution ResNet basic block."""
     shortcut = inputs
@@ -370,14 +392,18 @@ def make_parser():
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--l2-regularization", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--checkpoint-every", type=int, default=10,
+                        help="Save weights every N completed epochs.")
     parser.add_argument("--seed", type=int, default=0)
     return parser
 
 
 def main(argv=None):
     args = make_parser().parse_args(argv)
-    if args.batch_size < 1 or args.epochs < 1:
-        raise ValueError("batch size and epochs must be positive")
+    if min(args.batch_size, args.epochs, args.checkpoint_every) < 1:
+        raise ValueError(
+            "batch size, epochs, and checkpoint interval must be positive"
+        )
     args.output.mkdir(parents=True, exist_ok=True)
     cpu = jax.devices("cpu")[0]
     jax.config.update("jax_default_device", cpu)
@@ -405,6 +431,9 @@ def main(argv=None):
         keras.callbacks.CSVLogger(args.output / "training.csv"),
         TrainingPlot(args.output / "loss.png"),
         keras.callbacks.TerminateOnNaN(),
+        PeriodicWeightsCheckpoint(
+            args.output / "checkpoints", args.checkpoint_every
+        ),
         keras.callbacks.ModelCheckpoint(
             args.output / "best.keras", monitor="loss", mode="min",
             save_best_only=True,
