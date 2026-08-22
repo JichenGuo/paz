@@ -1,14 +1,14 @@
-"""Train a ResNet-18 to predict complete renderer parameters from RGB.
+"""Train a two-stream ResNet-18 to predict parameters from RGB and depth.
 
-The 512-D encoder feature feeds separate geometry, material, and lighting
-MLPs. The material head matches generator metadata: color RGB followed by
-scalar diffuse, specular, and ambient coefficients.
+Separate RGB and depth encoders produce 512-D features. Their fused 512-D
+representation feeds separate geometry, material, and lighting MLPs. Depth is
+converted from metres to [0, 1] by clipping to ``--max-depth``.
 
 Example:
     KERAS_BACKEND=jax JAX_PLATFORMS=cpu python -m \
         paz.graphics.synthetic_data.train_synthetic_rgb_resnet18 \
         --dataset datasets/synthetic_rgbd_1000_v3 \
-        --output experiments/resnet18_physical_no_validation
+        --output experiments/resnet18_rgbd_physical_no_validation
 """
 
 import os
@@ -146,14 +146,16 @@ class TargetNormalizer:
             json.dump(payload, file, indent=2)
 
 
-class RGBDataset(keras.utils.PyDataset):
-    """Loads RGB images and complete renderer targets."""
+class RGBDDataset(keras.utils.PyDataset):
+    """Loads separate RGB/depth inputs and complete renderer targets."""
 
-    def __init__(self, records, normalizer, batch_size, shuffle=False, seed=0):
+    def __init__(self, records, normalizer, batch_size, max_depth,
+                 shuffle=False, seed=0):
         super().__init__()
         self.records = list(records)
         self.normalizer = normalizer
         self.batch_size = batch_size
+        self.max_depth = max_depth
         self.shuffle = shuffle
         self.rng = np.random.default_rng(seed)
         self.indices = np.arange(len(records))
@@ -165,7 +167,7 @@ class RGBDataset(keras.utils.PyDataset):
     def __getitem__(self, batch_index):
         begin = batch_index * self.batch_size
         indices = self.indices[begin:begin + self.batch_size]
-        images, targets = [], []
+        rgb_images, depth_images, targets = [], [], []
         for index in indices:
             record = self.records[index]
             root = Path(record["_root"])
@@ -174,7 +176,17 @@ class RGBDataset(keras.utils.PyDataset):
             if image is None:
                 raise FileNotFoundError(image_path)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            images.append(image.astype(np.float32) / 255.0)
+            rgb = image.astype(np.float32) / 255.0
+            depth_path = root / record["depth"]
+            depth = np.load(depth_path).astype(np.float32)
+            if depth.shape != rgb.shape[:2]:
+                raise ValueError(
+                    f"RGB/depth shape mismatch for {image_path} and "
+                    f"{depth_path}"
+                )
+            depth = np.clip(depth / self.max_depth, 0.0, 1.0)[..., None]
+            rgb_images.append(rgb)
+            depth_images.append(depth)
             targets.append(
                 self.normalizer.normalize(extract_targets(record))
             )
@@ -182,7 +194,11 @@ class RGBDataset(keras.utils.PyDataset):
             name: np.stack([target[name] for target in targets])
             for name in OUTPUT_NAMES
         }
-        return np.stack(images), stacked
+        inputs = {
+            "rgb": np.stack(rgb_images),
+            "depth": np.stack(depth_images),
+        }
+        return inputs, stacked
 
     def on_epoch_end(self):
         if self.shuffle:
@@ -260,26 +276,26 @@ def basic_block(inputs, filters, stride, regularizer, name):
     return keras.layers.Activation("relu", name=f"{name}_output")(x)
 
 
-def build_encoder(inputs, regularizer):
+def build_encoder(inputs, regularizer, prefix):
     """Builds a standard ResNet-18 encoder returning a 512-D feature."""
     x = keras.layers.Conv2D(
         64, 7, strides=2, padding="same", use_bias=False,
-        kernel_regularizer=regularizer, name="stem_conv",
+        kernel_regularizer=regularizer, name=f"{prefix}_stem_conv",
     )(inputs)
-    x = keras.layers.BatchNormalization(name="stem_bn")(x)
-    x = keras.layers.Activation("relu", name="stem_relu")(x)
+    x = keras.layers.BatchNormalization(name=f"{prefix}_stem_bn")(x)
+    x = keras.layers.Activation("relu", name=f"{prefix}_stem_relu")(x)
     x = keras.layers.MaxPooling2D(
-        3, strides=2, padding="same", name="stem_pool"
+        3, strides=2, padding="same", name=f"{prefix}_stem_pool"
     )(x)
     for stage, filters in enumerate((64, 128, 256, 512), start=1):
         for block in range(2):
             stride = 2 if stage > 1 and block == 0 else 1
             x = basic_block(
                 x, filters, stride, regularizer,
-                name=f"stage{stage}_block{block + 1}",
+                name=f"{prefix}_stage{stage}_block{block + 1}",
             )
     return keras.layers.GlobalAveragePooling2D(
-        name="resnet18_512d_feature"
+        name=f"{prefix}_resnet18_512d_feature"
     )(x)
 
 
@@ -291,11 +307,20 @@ def mlp_branch(features, name, regularizer):
     return keras.layers.Dropout(0.2, name=f"{name}_dropout")(x)
 
 
-def build_model(input_shape=(256, 256, 3), l2_regularization=1e-4):
-    """Builds ResNet-18 plus geometry, material, and lighting MLPs."""
-    inputs = keras.Input(input_shape, name="rgb")
+def build_model(input_shape=(256, 256), l2_regularization=1e-4):
+    """Builds separate RGB/depth ResNet-18 encoders and fused heads."""
+    rgb = keras.Input((*input_shape, 3), name="rgb")
+    depth = keras.Input((*input_shape, 1), name="depth")
     regularizer = keras.regularizers.L2(l2_regularization)
-    features = build_encoder(inputs, regularizer)
+    rgb_features = build_encoder(rgb, regularizer, "rgb")
+    depth_features = build_encoder(depth, regularizer, "depth")
+    features = keras.layers.Concatenate(name="feature_concatenation")(
+        [rgb_features, depth_features]
+    )
+    features = keras.layers.Dense(
+        512, activation="relu", kernel_regularizer=regularizer,
+        name="fused_512d_feature",
+    )(features)
     geometry = mlp_branch(features, "geometry", regularizer)
     material = mlp_branch(features, "material", regularizer)
     lighting = mlp_branch(features, "lighting", regularizer)
@@ -321,7 +346,10 @@ def build_model(input_shape=(256, 256, 3), l2_regularization=1e-4):
             1, name="light_intensity",
             kernel_regularizer=regularizer)(lighting),
     }
-    return keras.Model(inputs, outputs, name="physical_parameter_resnet18")
+    return keras.Model(
+        {"rgb": rgb, "depth": depth}, outputs,
+        name="physical_parameter_rgb_depth_resnet18",
+    )
 
 
 def compile_model(model, learning_rate, weight_decay, statistics):
@@ -385,7 +413,7 @@ def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path,
-                        default=Path("experiments/resnet18_physical"))
+                        default=Path("experiments/resnet18_rgbd_physical"))
     parser.add_argument("--test-output", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=100)
@@ -394,6 +422,8 @@ def make_parser():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--checkpoint-every", type=int, default=10,
                         help="Save weights every N completed epochs.")
+    parser.add_argument("--max-depth", type=float, default=10.0,
+                        help="Depth in metres mapped to 1.0 (farther clips).")
     parser.add_argument("--seed", type=int, default=0)
     return parser
 
@@ -404,6 +434,8 @@ def main(argv=None):
         raise ValueError(
             "batch size, epochs, and checkpoint interval must be positive"
         )
+    if args.max_depth <= 0.0:
+        raise ValueError("max depth must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
     cpu = jax.devices("cpu")[0]
     jax.config.update("jax_default_device", cpu)
@@ -416,13 +448,16 @@ def main(argv=None):
     )
     normalizer = TargetNormalizer.fit(training_records)
     normalizer.save(args.output / "normalization.json")
-    training = RGBDataset(
-        training_records, normalizer, args.batch_size, shuffle=True,
+    with (args.output / "input_preprocessing.json").open("w") as file:
+        json.dump({"depth_unit": "metres", "max_depth": args.max_depth},
+                  file, indent=2)
+    training = RGBDDataset(
+        training_records, normalizer, args.batch_size, args.max_depth,
+        shuffle=True,
         seed=args.seed,
     )
-    model = build_model(
-        training[0][0].shape[1:], args.l2_regularization
-    )
+    rgb_shape = training[0][0]["rgb"].shape[1:3]
+    model = build_model(rgb_shape, args.l2_regularization)
     compile_model(
         model, args.learning_rate, args.weight_decay, normalizer.statistics
     )
@@ -440,7 +475,8 @@ def main(argv=None):
         ),
     ]
     print(
-        f"Training ResNet-18 on {cpu}: {len(training_records)} train, "
+        f"Training dual RGB/depth ResNet-18 on {cpu}: "
+        f"{len(training_records)} train, "
         f"{len(test_records)} held-out test; no validation split"
     )
     model.fit(training, epochs=args.epochs, callbacks=callbacks)
