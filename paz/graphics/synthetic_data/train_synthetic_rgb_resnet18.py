@@ -8,7 +8,7 @@ Example:
     KERAS_BACKEND=jax JAX_PLATFORMS=cpu python -m \
         paz.graphics.synthetic_data.train_synthetic_rgb_resnet18 \
         --dataset datasets/synthetic_rgbd_1000_v3 \
-        --output experiments/resnet18_rgbd_physical_no_validation
+        --output experiments/resnet18_rgbd_physical_validation
 """
 
 import os
@@ -37,8 +37,6 @@ from paz.graphics.synthetic_data.train_synthetic_rgbd_cnn import (
     SHAPE_NAMES,
     export_test_split,
     load_records,
-    save_train_test_manifest,
-    split_train_test,
     symmetry_geodesic_angle_degrees,
     symmetry_rotation_loss,
 )
@@ -220,7 +218,13 @@ class TrainingPlot(keras.callbacks.Callback):
         figure, axes = plt.subplots(3, 3, figsize=(15, 13), sharex=True)
         epochs = np.arange(1, epoch + 2)
         for axis, name in zip(axes.flat, names):
-            axis.plot(epochs, self.history.get(name, []))
+            axis.plot(epochs, self.history.get(name, []), label="Train")
+            validation_name = f"val_{name}"
+            if validation_name in self.history:
+                axis.plot(
+                    epochs, self.history[validation_name], label="Validation"
+                )
+                axis.legend()
             axis.set_title(name.replace("_", " ").title())
             axis.grid(alpha=0.3)
         figure.tight_layout()
@@ -409,6 +413,50 @@ def compile_model(model, learning_rate, weight_decay, statistics):
     )
 
 
+def split_records(records, seed, validation_split=0.2, test_split=0.2):
+    """Randomly splits records using fractions of the complete dataset."""
+    if len(records) < 5:
+        raise ValueError("At least five generated samples are required")
+    if not 0.0 < validation_split < 1.0 - test_split:
+        raise ValueError(
+            f"validation split must be between 0 and {1.0 - test_split}"
+        )
+    indices = np.random.default_rng(seed).permutation(len(records))
+    validation_count = max(1, round(len(records) * validation_split))
+    test_count = max(1, round(len(records) * test_split))
+    training_count = len(records) - validation_count - test_count
+    if training_count < 1:
+        raise ValueError("Split leaves no training samples")
+    validation_end = training_count + validation_count
+    train = [records[index] for index in indices[:training_count]]
+    validation = [
+        records[index] for index in indices[training_count:validation_end]
+    ]
+    test = [records[index] for index in indices[validation_end:]]
+    return train, validation, test
+
+
+def save_split_manifest(path, train, validation, test, seed,
+                        validation_split, test_split=0.2):
+    """Saves exact sample IDs and requested split fractions."""
+    def sample_ids(records):
+        return [Path(record["_metadata_path"]).stem for record in records]
+
+    payload = {
+        "seed": seed,
+        "ratio": {
+            "train": round(1.0 - validation_split - test_split, 10),
+            "validation": validation_split,
+            "test": test_split,
+        },
+        "train": sample_ids(train),
+        "validation": sample_ids(validation),
+        "test": sample_ids(test),
+    }
+    with path.open("w") as file:
+        json.dump(payload, file, indent=2)
+
+
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
@@ -418,12 +466,24 @@ def make_parser():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--lr-reduction-factor", type=float, default=0.5,
+                        help="Factor applied when validation loss plateaus.")
+    parser.add_argument("--lr-reduction-patience", type=int, default=7,
+                        help="Plateau epochs before reducing learning rate.")
+    parser.add_argument("--lr-min-delta", type=float, default=1e-3,
+                        help="Minimum val-loss improvement to reset patience.")
+    parser.add_argument("--min-learning-rate", type=float, default=1e-6)
     parser.add_argument("--l2-regularization", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--checkpoint-every", type=int, default=10,
                         help="Save weights every N completed epochs.")
     parser.add_argument("--max-depth", type=float, default=10.0,
                         help="Depth in metres mapped to 1.0 (farther clips).")
+    parser.add_argument(
+        "--validation-split", type=float, default=0.2,
+        help=("Fraction of the complete dataset used for validation. "
+              "Test always uses 0.2; the default gives 0.6/0.2/0.2."),
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser
 
@@ -434,17 +494,26 @@ def main(argv=None):
         raise ValueError(
             "batch size, epochs, and checkpoint interval must be positive"
         )
+    if args.lr_reduction_patience < 1:
+        raise ValueError("LR-reduction patience must be positive")
+    if not 0.0 < args.lr_reduction_factor < 1.0:
+        raise ValueError("LR-reduction factor must be between 0 and 1")
+    if args.lr_min_delta < 0.0 or args.min_learning_rate <= 0.0:
+        raise ValueError("LR minimum delta and minimum rate must be valid")
     if args.max_depth <= 0.0:
         raise ValueError("max depth must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
     cpu = jax.devices("cpu")[0]
     jax.config.update("jax_default_device", cpu)
     records = load_records(args.dataset)
-    training_records, test_records = split_train_test(records, args.seed)
+    training_records, validation_records, test_records = split_records(
+        records, args.seed, args.validation_split
+    )
     test_output = args.test_output or args.output / "test_split"
     export_test_split(test_records, test_output)
-    save_train_test_manifest(
-        args.output / "split.json", training_records, test_records, args.seed
+    save_split_manifest(
+        args.output / "split.json", training_records, validation_records,
+        test_records, args.seed, args.validation_split,
     )
     normalizer = TargetNormalizer.fit(training_records)
     normalizer.save(args.output / "normalization.json")
@@ -455,6 +524,10 @@ def main(argv=None):
         training_records, normalizer, args.batch_size, args.max_depth,
         shuffle=True,
         seed=args.seed,
+    )
+    validation = RGBDDataset(
+        validation_records, normalizer, args.batch_size, args.max_depth,
+        shuffle=False, seed=args.seed,
     )
     rgb_shape = training[0][0]["rgb"].shape[1:3]
     model = build_model(rgb_shape, args.l2_regularization)
@@ -470,16 +543,28 @@ def main(argv=None):
             args.output / "checkpoints", args.checkpoint_every
         ),
         keras.callbacks.ModelCheckpoint(
-            args.output / "best.keras", monitor="loss", mode="min",
+            args.output / "best.keras", monitor="val_loss", mode="min",
             save_best_only=True,
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", mode="min",
+            factor=args.lr_reduction_factor,
+            patience=args.lr_reduction_patience,
+            min_delta=args.lr_min_delta,
+            min_lr=args.min_learning_rate,
+            verbose=1,
         ),
     ]
     print(
         f"Training dual RGB/depth ResNet-18 on {cpu}: "
         f"{len(training_records)} train, "
-        f"{len(test_records)} held-out test; no validation split"
+        f"{len(validation_records)} validation, "
+        f"{len(test_records)} held-out test"
     )
-    model.fit(training, epochs=args.epochs, callbacks=callbacks)
+    model.fit(
+        training, validation_data=validation, epochs=args.epochs,
+        callbacks=callbacks,
+    )
     model.save(args.output / "final.keras")
 
 
