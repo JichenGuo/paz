@@ -6,7 +6,8 @@ Example:
 
 Each sample contains an RGB PNG, metric depth as ``.npy``, the object mesh as
 PLY, and JSON metadata containing the camera intrinsics/extrinsics, object
-pose, and lighting parameters.  Depth value zero denotes no intersection.
+pose, and lighting parameters. Depth value zero denotes no measurement,
+including scene misses and intersections beyond the simulated sensor range.
 """
 
 import argparse
@@ -163,8 +164,18 @@ def rotation_6d_to_matrix(vector_a, vector_b, epsilon=1e-8):
     return np.column_stack([axis_x, axis_y, axis_z])
 
 
+def apply_depth_range(depth, max_depth):
+    """Invalidates non-finite, non-positive, and out-of-range depths."""
+    if max_depth <= 0.0:
+        raise ValueError("max_depth must be positive")
+    depth = np.asarray(depth, dtype=np.float32)
+    valid = np.isfinite(depth) & (depth > 0.0) & (depth <= max_depth)
+    return np.where(valid, depth, 0.0).astype(np.float32)
+
+
 def generate_sample(output, index, parameters, image_size, y_fov,
-                    shadows=True, tiles=(1, 1), chunk_size=1024):
+                    shadows=True, tiles=(1, 1), chunk_size=1024,
+                    max_depth=10.0):
     """Renders and writes a single dataset sample."""
     scene, object_transform = build_scene(parameters)
     world_to_camera = paz.SE3.view_transform(
@@ -182,7 +193,7 @@ def generate_sample(output, index, parameters, image_size, y_fov,
 
     stem = f"{index:06d}"
     rgb_uint8 = np.clip(np.asarray(rgb) * 255.0, 0, 255).astype(np.uint8)
-    depth_float = np.asarray(depth, dtype=np.float32)
+    depth_float = apply_depth_range(depth, max_depth)
     paz.image.write(str(output / "rgb" / f"{stem}.png"), rgb_uint8)
     np.save(output / "depth" / f"{stem}.npy", depth_float)
     mesh = build_mesh(parameters["shape"], object_transform)
@@ -224,6 +235,8 @@ def generate_sample(output, index, parameters, image_size, y_fov,
         "rgb": f"rgb/{stem}.png",
         "depth": f"depth/{stem}.npy",
         "depth_unit": "metre",
+        "depth_range_metres": [0.0, max_depth],
+        "depth_invalid_value": 0.0,
     }
     with (output / "metadata" / f"{stem}.json").open("w") as file:
         json.dump(jsonify(metadata), file, indent=2)
@@ -237,6 +250,8 @@ def make_parser():
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--y-fov", type=float, default=45.0,
                         help="Vertical field of view in degrees.")
+    parser.add_argument("--max-depth", type=float, default=10.0,
+                        help="Maximum simulated sensor range in metres.")
     parser.add_argument("--shapes", nargs="+", choices=SHAPE_BUILDERS,
                         default=list(SHAPE_BUILDERS))
     parser.add_argument("--seed", type=int, default=0)
@@ -270,6 +285,8 @@ def main(argv=None):
                 args.chunk_size)
     if any(value < 1 for value in positive) or args.clear_caches_every < 0:
         raise ValueError("sizes must be positive and cache interval nonnegative")
+    if args.max_depth <= 0.0:
+        raise ValueError("max depth must be positive")
     for directory in ("rgb", "depth", "meshes", "metadata"):
         (args.output / directory).mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
@@ -281,7 +298,7 @@ def main(argv=None):
         generate_sample(args.output, index, parameters,
                         (args.height, args.width), np.deg2rad(args.y_fov),
                         not args.no_shadows, (args.tiles, args.tiles),
-                        args.chunk_size)
+                        args.chunk_size, args.max_depth)
         print(f"Generated {index + 1}/{args.num_samples}")
         completed = index + 1
         if (args.clear_caches_every > 0
