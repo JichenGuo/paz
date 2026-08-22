@@ -51,6 +51,28 @@ def load_json(path):
         return json.load(file)
 
 
+def load_prediction_model(model_path, test_split, metadata_path):
+    """Loads a complete Keras model or reconstructs one for weights only."""
+    model_path = Path(model_path)
+    if not model_path.name.endswith(".weights.h5"):
+        return keras.models.load_model(model_path, compile=False)
+
+    # Periodic checkpoints contain no model configuration. They are produced
+    # by train_synthetic_rgb_resnet18, so rebuild that architecture first.
+    from paz.graphics.synthetic_data.train_synthetic_rgb_resnet18 import (
+        build_model,
+    )
+
+    record = load_json(metadata_path)
+    image_path = test_split / record["rgb"]
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(image_path)
+    model = build_model(image.shape[:2])
+    model.load_weights(model_path)
+    return model
+
+
 def denormalize(prediction, statistics):
     mean = np.asarray(statistics["mean"], dtype=np.float32)
     standard_deviation = np.asarray(
@@ -77,7 +99,7 @@ def load_rgbd(record, test_split, max_depth):
     )
 
 
-def decode_predictions(raw, statistics):
+def decode_predictions(raw, statistics, material_definition=None):
     translation = denormalize(
         raw["object_translation"][0], statistics["object_translation"]
     )
@@ -94,7 +116,25 @@ def decode_predictions(raw, statistics):
     shape_probabilities = np.asarray(raw["shape"][0], dtype=np.float32)
     shape = SHAPE_NAMES[int(np.argmax(shape_probabilities))]
 
-    material = denormalize(raw["material"][0], statistics["material"])
+    material_values = denormalize(
+        raw["material"][0], statistics["material"]
+    )
+    if material_definition and "values" in material_definition:
+        names = material_definition["values"]
+        material_by_name = dict(zip(names, material_values))
+        material = np.asarray([
+            material_by_name["color_r"],
+            material_by_name["color_g"],
+            material_by_name["color_b"],
+            material_by_name["ambient"],
+            material_by_name["diffuse"],
+            material_by_name["specular"],
+            material_by_name["shininess"],
+        ], dtype=np.float32)
+    else:
+        # Legacy complete CNN order:
+        # color RGB, ambient, diffuse, specular, shininess.
+        material = np.asarray(material_values, dtype=np.float32)
     material[:6] = np.clip(material[:6], 0.0, 1.0)
     material[6] = np.clip(material[6], 1.0, 500.0)
     light_position = denormalize(
@@ -352,10 +392,21 @@ def main(argv=None):
     metadata_paths = sorted((test_split / "metadata").glob("*.json"))
     if not metadata_paths:
         raise ValueError(f"No test metadata found in {test_split}")
-    statistics = load_json(
-        args.experiment / "normalization.json"
-    )["targets"]
-    model = keras.models.load_model(model_path, compile=False)
+    normalization = load_json(args.experiment / "normalization.json")
+    statistics = normalization["targets"]
+    material_definition = normalization.get("material_definition")
+    model = load_prediction_model(model_path, test_split, metadata_paths[0])
+    dual_input = isinstance(model.input_shape, list)
+    if dual_input:
+        input_names = {tensor.name.split(":")[0] for tensor in model.inputs}
+        if input_names != {"rgb", "depth"}:
+            raise ValueError(f"Unsupported model inputs: {sorted(input_names)}")
+    else:
+        input_channels = model.input_shape[-1]
+        if input_channels not in (3, 4):
+            raise ValueError(
+                f"Expected an RGB or RGB-D model, got {input_channels} channels"
+            )
     print(f"Loaded {model_path}; rendering {len(metadata_paths)} test samples")
     metric_rows = []
 
@@ -374,8 +425,18 @@ def main(argv=None):
         rgbd, input_rgb, target_depth = load_rgbd(
             record, test_split, args.max_depth
         )
-        raw = model.predict(rgbd[None], verbose=0)
-        prediction = decode_predictions(raw, statistics)
+        if dual_input:
+            model_input = {
+                "rgb": input_rgb[None],
+                "depth": rgbd[None, ..., 3:4],
+            }
+        else:
+            model_input = input_rgb if input_channels == 3 else rgbd
+            model_input = model_input[None]
+        raw = model.predict(model_input, verbose=0)
+        prediction = decode_predictions(
+            raw, statistics, material_definition
+        )
         (rendered_rgb, rendered_depth, object_to_camera, object_to_world,
          light_world) = render_prediction(
             prediction, record["camera"], input_rgb.shape[:2], args.y_fov,
