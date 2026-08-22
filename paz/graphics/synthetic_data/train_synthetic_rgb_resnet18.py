@@ -473,6 +473,13 @@ def make_parser():
     parser.add_argument("--lr-min-delta", type=float, default=1e-3,
                         help="Minimum val-loss improvement to reset patience.")
     parser.add_argument("--min-learning-rate", type=float, default=1e-6)
+    parser.add_argument("--early-stopping-patience", type=int, default=15,
+                        help="Unimproved validation epochs before stopping.")
+    parser.add_argument("--early-stopping-min-delta", type=float,
+                        default=1e-3,
+                        help="Minimum val-loss improvement for early stopping.")
+    parser.add_argument("--early-stopping-start-epoch", type=int, default=20,
+                        help="Epoch before which early stopping is disabled.")
     parser.add_argument("--l2-regularization", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--checkpoint-every", type=int, default=10,
@@ -500,6 +507,11 @@ def main(argv=None):
         raise ValueError("LR-reduction factor must be between 0 and 1")
     if args.lr_min_delta < 0.0 or args.min_learning_rate <= 0.0:
         raise ValueError("LR minimum delta and minimum rate must be valid")
+    if args.early_stopping_patience < 1:
+        raise ValueError("early-stopping patience must be positive")
+    if (args.early_stopping_min_delta < 0.0
+            or args.early_stopping_start_epoch < 0):
+        raise ValueError("early-stopping delta and start epoch must be valid")
     if args.max_depth <= 0.0:
         raise ValueError("max depth must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -552,6 +564,14 @@ def main(argv=None):
             patience=args.lr_reduction_patience,
             min_delta=args.lr_min_delta,
             min_lr=args.min_learning_rate,
+            verbose=1,
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", mode="min",
+            patience=args.early_stopping_patience,
+            min_delta=args.early_stopping_min_delta,
+            restore_best_weights=True,
+            start_from_epoch=args.early_stopping_start_epoch,
             verbose=1,
         ),
     ]
