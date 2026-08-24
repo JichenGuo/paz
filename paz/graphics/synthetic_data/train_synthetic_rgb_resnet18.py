@@ -411,6 +411,28 @@ def compile_model(model, learning_rate, weight_decay, statistics):
             PhysicalMAE(light_intensity_std, name="physical_mae")
         ],
     }
+    # Keras versions/backends differ in whether they automatically expose
+    # individual output losses in epoch logs. Register equivalent metrics
+    # explicitly so training.csv and TrainingPlot always receive them.
+    head_loss_metrics = {
+        "object_translation": keras.metrics.MeanMetricWrapper(
+            losses["object_translation"], name="loss"
+        ),
+        "object_orientation_6d": keras.metrics.MeanMetricWrapper(
+            symmetry_rotation_loss, name="loss"
+        ),
+        "object_scale": keras.metrics.MeanSquaredError(name="loss"),
+        "shape": keras.metrics.CategoricalCrossentropy(name="loss"),
+        "material": keras.metrics.MeanSquaredError(name="loss"),
+        "light_position": keras.metrics.MeanMetricWrapper(
+            keras.losses.Huber(delta=1.0), name="loss"
+        ),
+        "light_intensity": keras.metrics.MeanMetricWrapper(
+            losses["light_intensity"], name="loss"
+        ),
+    }
+    for name, loss_metric in head_loss_metrics.items():
+        metrics[name].insert(0, loss_metric)
     loss_weights = {name: 1.0 for name in OUTPUT_NAMES}
     loss_weights["light_position"] = 0.25
     optimizer = keras.optimizers.AdamW(
@@ -482,7 +504,7 @@ def make_parser():
     parser.add_argument("--lr-min-delta", type=float, default=1e-3,
                         help="Minimum val-loss improvement to reset patience.")
     parser.add_argument("--min-learning-rate", type=float, default=1e-6)
-    parser.add_argument("--early-stopping-patience", type=int, default=15,
+    parser.add_argument("--early-stopping-patience", type=int, default=10,
                         help="Unimproved validation epochs before stopping.")
     parser.add_argument("--early-stopping-min-delta", type=float,
                         default=1e-3,
