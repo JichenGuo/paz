@@ -1,12 +1,19 @@
 import numpy as np
 
 from paz.graphics.synthetic_data.generate_synthetic_rgbd import (
+    apply_depth_range,
     build_mesh,
     rotation_6d_to_matrix,
     rotation_matrix_to_6d,
     sample_is_complete,
     sample_parameters,
 )
+
+
+def test_apply_depth_range_invalidates_misses_and_distant_surfaces():
+    depth = np.array([0.0, -1.0, 2.5, 10.0, 10.1, np.inf, np.nan])
+    filtered = apply_depth_range(depth, 10.0)
+    assert np.allclose(filtered, [0.0, 0.0, 2.5, 10.0, 0.0, 0.0, 0.0])
 
 
 def test_sample_parameters_is_reproducible():
