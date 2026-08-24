@@ -5,7 +5,7 @@ representation feeds separate geometry, material, and lighting MLPs. Depth is
 converted from metres to [0, 1] by clipping to ``--max-depth``.
 
 Example:
-    KERAS_BACKEND=jax JAX_PLATFORMS=gpu python -m \
+    KERAS_BACKEND=jax JAX_PLATFORMS=cuda python -m \
         paz.graphics.synthetic_data.train_synthetic_rgb_resnet18 \
         --dataset datasets/synthetic_rgbd_1000_v3 \
         --output experiments/resnet18_rgbd_physical_validation
@@ -14,7 +14,7 @@ Example:
 import os
 
 os.environ.setdefault("KERAS_BACKEND", "jax")
-os.environ["JAX_PLATFORMS"] = "gpu"
+os.environ["JAX_PLATFORMS"] = "cuda"
 
 import argparse
 import json
@@ -515,7 +515,7 @@ def main(argv=None):
     if args.max_depth <= 0.0:
         raise ValueError("max depth must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
-    gpu = jax.devices("gpu")[0]
+    gpu = jax.devices("cuda")[0]
     jax.config.update("jax_default_device", gpu)
     records = load_records(args.dataset)
     training_records, validation_records, test_records = split_records(
