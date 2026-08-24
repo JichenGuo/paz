@@ -34,42 +34,55 @@ def load_history(csv_path):
         rows = list(csv.DictReader(file))
     if not rows:
         raise ValueError(f"No epochs found in {csv_path}")
-    required = {"epoch"}
+    if "epoch" not in rows[0]:
+        raise ValueError(f"Missing epoch column in {csv_path}")
+    available = {"epoch"}
     for name in LOSS_NAMES:
-        required.update((name, f"val_{name}"))
-    missing = required.difference(rows[0])
-    if missing:
-        raise ValueError(f"Missing CSV columns: {sorted(missing)}")
+        for column in (name, f"val_{name}"):
+            if column in rows[0]:
+                available.add(column)
     return {
         name: np.asarray([float(row[name]) for row in rows])
-        for name in required
+        for name in available
     }
 
 
 def plot_losses(history, output_path):
     """Saves total and per-head train/validation losses in one figure."""
     epochs = history["epoch"].astype(int) + 1
-    best_arg = int(np.nanargmin(history["val_loss"]))
+    selection_name = "val_loss" if "val_loss" in history else "loss"
+    best_arg = int(np.nanargmin(history[selection_name]))
     best_epoch = epochs[best_arg]
     figure, axes = plt.subplots(4, 2, figsize=(14, 16), sharex=True)
     for axis, name in zip(axes.flat, LOSS_NAMES):
         validation_name = f"val_{name}"
-        axis.plot(epochs, history[name], label="Training")
-        axis.plot(epochs, history[validation_name], label="Validation")
+        has_curve = False
+        if name in history:
+            axis.plot(epochs, history[name], label="Training")
+            has_curve = True
+        if validation_name in history:
+            axis.plot(epochs, history[validation_name], label="Validation")
+            has_curve = True
         axis.axvline(best_epoch, color="black", linestyle="--", alpha=0.5,
                      label=f"Best total val: epoch {best_epoch}")
         title = "Total multi-task loss" if name == "loss" else name
         axis.set_title(title.replace("_", " ").title())
         axis.set_ylabel("Loss")
         axis.grid(alpha=0.3)
-        axis.legend(fontsize=8)
+        if has_curve:
+            axis.legend(fontsize=8)
+        else:
+            axis.text(
+                0.5, 0.5, "Not recorded in training.csv",
+                ha="center", va="center", transform=axis.transAxes,
+            )
     for axis in axes[-1]:
         axis.set_xlabel("Epoch")
     figure.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=150)
     plt.close(figure)
-    return best_epoch, history["val_loss"][best_arg]
+    return best_epoch, history[selection_name][best_arg]
 
 
 def make_parser():
@@ -92,8 +105,17 @@ def main(argv=None):
     output_path = args.output or args.experiment / "loss_from_csv.png"
     history = load_history(csv_path)
     best_epoch, best_loss = plot_losses(history, output_path)
+    missing = [
+        name for name in LOSS_NAMES[1:]
+        if name not in history and f"val_{name}" not in history
+    ]
     print(f"Saved loss visualization to {output_path}")
     print(f"Best total validation loss: {best_loss:.6f} at epoch {best_epoch}")
+    if missing:
+        print(
+            "Per-head losses were not recorded and cannot be reconstructed: "
+            + ", ".join(missing)
+        )
 
 
 if __name__ == "__main__":
