@@ -434,7 +434,7 @@ def compile_model(model, learning_rate, weight_decay, statistics):
     for name, loss_metric in head_loss_metrics.items():
         metrics[name].insert(0, loss_metric)
     loss_weights = {name: 1.0 for name in OUTPUT_NAMES}
-    loss_weights["light_position"] = 0.25
+    loss_weights["light_position"] = 1
     optimizer = keras.optimizers.AdamW(
         learning_rate, weight_decay=weight_decay, global_clipnorm=1.0
     )
