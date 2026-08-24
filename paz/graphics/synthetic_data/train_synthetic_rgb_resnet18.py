@@ -216,14 +216,23 @@ class TrainingPlot(keras.callbacks.Callback):
             self.history.setdefault(name, []).append(value)
         names = ("loss",) + tuple(f"{name}_loss" for name in OUTPUT_NAMES)
         figure, axes = plt.subplots(3, 3, figsize=(15, 13), sharex=True)
-        epochs = np.arange(1, epoch + 2)
         for axis, name in zip(axes.flat, names):
-            axis.plot(epochs, self.history.get(name, []), label="Train")
-            validation_name = f"val_{name}"
-            if validation_name in self.history:
+            training_values = self.history.get(name, [])
+            if training_values:
+                training_epochs = np.arange(1, len(training_values) + 1)
                 axis.plot(
-                    epochs, self.history[validation_name], label="Validation"
+                    training_epochs, training_values, label="Train"
                 )
+            validation_name = f"val_{name}"
+            validation_values = self.history.get(validation_name, [])
+            if validation_values:
+                validation_epochs = np.arange(
+                    1, len(validation_values) + 1
+                )
+                axis.plot(
+                    validation_epochs, validation_values, label="Validation"
+                )
+            if training_values or validation_values:
                 axis.legend()
             axis.set_title(name.replace("_", " ").title())
             axis.grid(alpha=0.3)
