@@ -206,16 +206,24 @@ class RGBDDataset(keras.utils.PyDataset):
 class TrainingPlot(keras.callbacks.Callback):
     """Saves total and per-head training losses after every epoch."""
 
-    def __init__(self, path):
+    def __init__(self, path, output_names=OUTPUT_NAMES):
         super().__init__()
         self.path = Path(path)
+        self.output_names = tuple(output_names)
         self.history = {}
 
     def on_epoch_end(self, epoch, logs=None):
         for name, value in (logs or {}).items():
             self.history.setdefault(name, []).append(value)
-        names = ("loss",) + tuple(f"{name}_loss" for name in OUTPUT_NAMES)
-        figure, axes = plt.subplots(3, 3, figsize=(15, 13), sharex=True)
+        names = ("loss",) + tuple(
+            f"{name}_loss" for name in self.output_names
+        )
+        columns = 3
+        rows = math.ceil(len(names) / columns)
+        figure, axes = plt.subplots(
+            rows, columns, figsize=(15, 4.3 * rows), sharex=True,
+            squeeze=False,
+        )
         for axis, name in zip(axes.flat, names):
             training_values = self.history.get(name, [])
             if training_values:
@@ -236,6 +244,8 @@ class TrainingPlot(keras.callbacks.Callback):
                 axis.legend()
             axis.set_title(name.replace("_", " ").title())
             axis.grid(alpha=0.3)
+        for axis in axes.flat[len(names):]:
+            axis.set_visible(False)
         figure.tight_layout()
         figure.savefig(self.path, dpi=150)
         plt.close(figure)
@@ -365,7 +375,9 @@ def build_model(input_shape=(256, 256), l2_regularization=1e-4):
     )
 
 
-def compile_model(model, learning_rate, weight_decay, statistics):
+def compile_model(model, learning_rate, weight_decay, statistics,
+                  extra_losses=None, extra_metrics=None,
+                  extra_loss_weights=None):
     translation_std = statistics["object_translation"]["standard_deviation"]
     scale_std = statistics["object_scale"]["standard_deviation"]
     material_std = statistics["material"]["standard_deviation"]
@@ -433,8 +445,14 @@ def compile_model(model, learning_rate, weight_decay, statistics):
     }
     for name, loss_metric in head_loss_metrics.items():
         metrics[name].insert(0, loss_metric)
+    if extra_losses:
+        losses.update(extra_losses)
+    if extra_metrics:
+        metrics.update(extra_metrics)
     loss_weights = {name: 1.0 for name in OUTPUT_NAMES}
     loss_weights["light_position"] = 1.0
+    if extra_loss_weights:
+        loss_weights.update(extra_loss_weights)
     optimizer = keras.optimizers.AdamW(
         learning_rate, weight_decay=weight_decay, global_clipnorm=1.0
     )
