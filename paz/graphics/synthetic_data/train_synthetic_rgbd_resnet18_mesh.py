@@ -227,7 +227,7 @@ def make_parser():
     parser.add_argument("--lr-reduction-factor", type=float, default=0.5)
     parser.add_argument("--lr-reduction-patience", type=int, default=7)
     parser.add_argument("--min-learning-rate", type=float, default=1e-6)
-    parser.add_argument("--early-stopping-patience", type=int, default=15)
+    parser.add_argument("--early-stopping-patience", type=int, default=10)
     parser.add_argument("--early-stopping-min-delta", type=float,
                         default=1e-3)
     parser.add_argument("--early-stopping-start-epoch", type=int, default=20)
