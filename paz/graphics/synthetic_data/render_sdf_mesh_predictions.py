@@ -29,7 +29,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import paz
-from paz.graphics.synthetic_data.train_synthetic_rgbd_cnn import SHAPE_NAMES
 # Register the custom SDF layer and metric before loading a saved model.
 from paz.graphics.synthetic_data.train_synthetic_rgbd_resnet18_sdf import (
     SDF_OUTPUT_NAME,
@@ -64,7 +63,8 @@ def rotation_6d_to_matrix(values, epsilon=1e-8):
     return np.stack([axis_x, axis_y, axis_z], axis=-1)
 
 
-def decode_prediction(raw, statistics, material_definition=None):
+def decode_prediction(raw, statistics, shape_names,
+                      material_definition=None):
     translation = denormalize(
         raw["object_translation"][0], statistics["object_translation"]
     )
@@ -94,7 +94,7 @@ def decode_prediction(raw, statistics, material_definition=None):
         "object_orientation_camera_6d": orientation,
         "object_rotation_camera_3x3": rotation_6d_to_matrix(orientation),
         "object_scale": scale,
-        "shape": SHAPE_NAMES[int(np.argmax(shape_probabilities))],
+        "shape": shape_names[int(np.argmax(shape_probabilities))],
         "shape_probabilities": shape_probabilities,
         "material": {
             "color_rgb": material_values[:3],
@@ -343,6 +343,7 @@ def main(argv=None):
 
     normalization = load_json(args.experiment / "normalization.json")
     statistics = normalization["targets"]
+    shape_names = normalization["shape_names"]
     model = keras.models.load_model(model_path, compile=False)
     input_names = {tensor.name.split(":")[0] for tensor in model.inputs}
     expected = {"rgb", "depth", "sdf_query_points"}
@@ -367,7 +368,8 @@ def main(argv=None):
             "sdf_query_points": np.zeros((1, 1, 3), dtype=np.float32),
         }, verbose=0)
         prediction = decode_prediction(
-            raw, statistics, normalization.get("material_definition")
+            raw, statistics, shape_names,
+            normalization.get("material_definition"),
         )
         mesh = load_sdf_mesh(mesh_path)
         (rendered_rgb, rendered_depth, object_to_camera, object_to_world,

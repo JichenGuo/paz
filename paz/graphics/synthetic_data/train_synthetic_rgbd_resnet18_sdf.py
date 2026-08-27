@@ -28,10 +28,11 @@ import numpy as np
 import trimesh
 
 from paz.graphics.synthetic_data.train_synthetic_rgb_resnet18 import (
+    MATERIAL_NAMES,
     OUTPUT_NAMES,
     PeriodicWeightsCheckpoint,
+    REGRESSION_NAMES,
     RGBDDataset,
-    TargetNormalizer,
     TrainingPlot,
     build_model,
     compile_model,
@@ -47,97 +48,305 @@ from paz.graphics.synthetic_data.train_synthetic_rgbd_cnn import (
 SDF_OUTPUT_NAME = "sdf_values"
 
 
-def canonical_sdf(points, shape):
-    """Returns exact canonical SDF for PAZ cube, cylinder, or sphere."""
-    points = np.asarray(points, dtype=np.float32)
-    if shape == "sphere":
-        return np.linalg.norm(points, axis=-1) - 1.0
-    if shape == "cube":
-        offset = np.abs(points) - 1.0
-        outside = np.linalg.norm(np.maximum(offset, 0.0), axis=-1)
-        inside = np.minimum(np.max(offset, axis=-1), 0.0)
-        return outside + inside
-    if shape == "cylinder":
-        offset = np.stack([
-            np.linalg.norm(points[:, (0, 2)], axis=-1) - 1.0,
-            np.abs(points[:, 1]) - 1.0,
-        ], axis=-1)
-        outside = np.linalg.norm(np.maximum(offset, 0.0), axis=-1)
-        inside = np.minimum(np.max(offset, axis=-1), 0.0)
-        return outside + inside
-    raise ValueError(f"Unsupported shape: {shape}")
+def world_to_camera_matrix(camera):
+    """Reproduces PAZ's saved look-at transform exactly."""
+    position = np.asarray(camera["position_world_xyz"], dtype=np.float64)
+    target = np.asarray(camera["target_world_xyz"], dtype=np.float64)
+    forward = target - position
+    forward /= np.linalg.norm(forward)
+    left = np.cross(forward, np.asarray([0.0, 1.0, 0.0]))
+    up = np.cross(left, forward)
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = np.stack([left, up, -forward])
+    matrix[:3, 3] = -matrix[:3, :3] @ position
+    return matrix
 
 
-def sample_surface_points(shape, count, rng):
-    """Samples exact canonical primitive surfaces for near-surface queries."""
-    if shape == "sphere":
-        points = rng.normal(size=(count, 3))
-        return points / np.linalg.norm(points, axis=-1, keepdims=True)
-    if shape == "cube":
-        points = rng.uniform(-1.0, 1.0, size=(count, 3))
-        axes = rng.integers(0, 3, size=count)
-        signs = rng.choice((-1.0, 1.0), size=count)
-        points[np.arange(count), axes] = signs
-        return points
-    if shape == "cylinder":
-        points = np.empty((count, 3), dtype=np.float64)
-        side = rng.random(count) < (2.0 / 3.0)
-        angles = rng.uniform(0.0, 2.0 * np.pi, size=count)
-        points[side, 0] = np.cos(angles[side])
-        points[side, 2] = np.sin(angles[side])
-        points[side, 1] = rng.uniform(-1.0, 1.0, size=np.count_nonzero(side))
-        caps = ~side
-        radii = np.sqrt(rng.random(np.count_nonzero(caps)))
-        points[caps, 0] = radii * np.cos(angles[caps])
-        points[caps, 2] = radii * np.sin(angles[caps])
-        points[caps, 1] = rng.choice((-1.0, 1.0), size=np.count_nonzero(caps))
-        return points
-    raise ValueError(f"Unsupported shape: {shape}")
+def rotation_from_axes(first, second, epsilon=1e-8):
+    first = first / max(np.linalg.norm(first), epsilon)
+    second = second - np.dot(first, second) * first
+    second = second / max(np.linalg.norm(second), epsilon)
+    return np.stack([first, second, np.cross(first, second)], axis=-1)
 
 
-def sample_sdf_queries(record, num_queries, extent, truncation):
-    """Samples repeatable uniform and near-surface SDF supervision."""
+def canonical_to_camera_matrix(record):
+    """Recovers the exact canonical-object to PAZ-camera transformation."""
+    view = world_to_camera_matrix(record["camera"])
+    orientation = record["object"]["orientation_camera_6d"]
+    camera_axes = np.asarray([
+        orientation["vector_a"], orientation["vector_b"]
+    ], dtype=np.float64)
+    world_axes = camera_axes @ np.linalg.inv(view[:3, :3]).T
+    object_to_world = rotation_from_axes(world_axes[0], world_axes[1])
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = (
+        view[:3, :3] @ object_to_world * record["object"]["scale"]
+    )
+    transform[:3, 3] = record["object"]["translation_camera_xyz"]
+    return transform
+
+
+def transform_vertices(vertices, matrix):
+    homogeneous = np.concatenate([
+        vertices, np.ones((len(vertices), 1), dtype=np.float64)
+    ], axis=-1)
+    return (homogeneous @ matrix.T)[:, :3]
+
+
+def load_canonical_mesh(record, mesh_frame):
+    """Loads an arbitrary triangle mesh and maps it to object coordinates."""
+    sample_id = Path(record["_metadata_path"]).stem
+    path = Path(record["_root"]) / "meshes" / f"{sample_id}.ply"
+    mesh = trimesh.load(path, force="mesh", process=True)
+    if not isinstance(mesh, trimesh.Trimesh) or not len(mesh.faces):
+        raise ValueError(f"No triangle mesh found in {path}")
+    if mesh_frame == "world":
+        world_to_camera = world_to_camera_matrix(record["camera"])
+        world_to_canonical = (
+            np.linalg.inv(canonical_to_camera_matrix(record))
+            @ world_to_camera
+        )
+        mesh.vertices = transform_vertices(mesh.vertices, world_to_canonical)
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def sample_mesh_surface(mesh, count, rng):
+    triangles = np.asarray(mesh.triangles, dtype=np.float64)
+    areas = 0.5 * np.linalg.norm(np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    ), axis=-1)
+    if not np.isfinite(areas).all() or areas.sum() <= 0.0:
+        raise ValueError("Mesh has no finite surface area")
+    chosen = triangles[rng.choice(
+        len(triangles), count, p=areas / areas.sum()
+    )]
+    first = np.sqrt(rng.random((count, 1)))
+    second = rng.random((count, 1))
+    return ((1.0 - first) * chosen[:, 0]
+            + first * (1.0 - second) * chosen[:, 1]
+            + first * second * chosen[:, 2])
+
+
+def winding_inside(points, triangles, chunk_size):
+    """Classifies points using generalized winding numbers."""
+    inside = []
+    for begin in range(0, len(points), chunk_size):
+        vectors = triangles[None] - points[
+            begin:begin + chunk_size, None, None, :
+        ]
+        first, second, third = vectors[:, :, 0], vectors[:, :, 1], vectors[:, :, 2]
+        numerator = np.einsum(
+            "...i,...i->...", first, np.cross(second, third)
+        )
+        norms = np.linalg.norm(vectors, axis=-1)
+        denominator = (
+            np.prod(norms, axis=-1)
+            + np.einsum("...i,...i->...", first, second) * norms[:, :, 2]
+            + np.einsum("...i,...i->...", second, third) * norms[:, :, 0]
+            + np.einsum("...i,...i->...", third, first) * norms[:, :, 1]
+        )
+        solid_angle = 2.0 * np.arctan2(numerator, denominator)
+        winding = np.abs(np.sum(solid_angle, axis=1)) / (4.0 * np.pi)
+        inside.append(winding > 0.5)
+    return np.concatenate(inside)
+
+
+def mesh_signed_distance(mesh, points, chunk_size):
+    """Computes dependency-free signed distances to a watertight mesh."""
+    distances = []
+    for begin in range(0, len(points), chunk_size):
+        _, distance, _ = trimesh.proximity.closest_point_naive(
+            mesh, points[begin:begin + chunk_size]
+        )
+        distances.append(distance)
+    distances = np.concatenate(distances)
+    inside = winding_inside(points, np.asarray(mesh.triangles), chunk_size)
+    distances[inside] *= -1.0
+    return distances
+
+
+def sample_sdf_queries(record, num_queries, extent, truncation, mesh_frame,
+                       distance_chunk_size):
+    """Samples repeatable SDF supervision from any watertight mesh."""
     sample_id = int(Path(record["_metadata_path"]).stem)
     rng = np.random.default_rng(sample_id)
+    mesh = load_canonical_mesh(record, mesh_frame)
+    if not mesh.is_watertight:
+        raise ValueError(
+            f"SDF requires a watertight mesh: {record['_metadata_path']}"
+        )
+    largest_coordinate = float(np.max(np.abs(mesh.bounds)))
+    if largest_coordinate >= extent:
+        raise ValueError(
+            f"Canonical mesh {record['_metadata_path']} reaches "
+            f"{largest_coordinate:.3f}, outside --sdf-extent {extent:.3f}; "
+            "increase --sdf-extent or normalize the source mesh"
+        )
     uniform_count = num_queries // 2
     surface_count = num_queries - uniform_count
     uniform = rng.uniform(-extent, extent, size=(uniform_count, 3))
-    surface = sample_surface_points(
-        record["shape"]["type"], surface_count, rng
-    )
+    surface = sample_mesh_surface(mesh, surface_count, rng)
     surface += rng.normal(0.0, 0.08, size=surface.shape)
     queries = np.concatenate([uniform, surface]).astype(np.float32)
     rng.shuffle(queries)
-    distances = canonical_sdf(queries, record["shape"]["type"])
+    distances = mesh_signed_distance(mesh, queries, distance_chunk_size)
     normalized = np.clip(distances, -truncation, truncation) / truncation
     return queries, normalized[:, None].astype(np.float32)
+
+
+def extract_generic_targets(record, shape_names):
+    shape_index = shape_names.index(record["shape"]["type"])
+    shape = np.eye(len(shape_names), dtype=np.float32)[shape_index]
+    orientation = record["object"]["orientation_camera_6d"]
+    orientation_6d = np.asarray(
+        orientation["vector_a"] + orientation["vector_b"], np.float32
+    )
+    source_material = record["material"]
+    material = np.concatenate([
+        np.asarray(source_material["color_rgb"], dtype=np.float32),
+        np.asarray([
+            source_material["diffuse"], source_material["specular"],
+            source_material["ambient"], source_material["shininess"],
+        ], dtype=np.float32),
+    ])
+    return {
+        "object_translation": np.asarray(
+            record["object"]["translation_camera_xyz"], np.float32
+        ),
+        "object_orientation_6d": np.concatenate([orientation_6d, shape]),
+        "object_scale": np.asarray([record["object"]["scale"]], np.float32),
+        "shape": shape,
+        "material": material,
+        "light_position": np.asarray(
+            record["light"]["position_camera_xyz"], np.float32
+        ),
+        "light_intensity": np.asarray(
+            [record["light"]["intensity"]], np.float32
+        ),
+    }
+
+
+class GenericTargetNormalizer:
+    """Normalizes physical targets while supporting arbitrary shape labels."""
+
+    def __init__(self, statistics, shape_names):
+        self.statistics = statistics
+        self.shape_names = tuple(shape_names)
+
+    @classmethod
+    def fit(cls, records, shape_names):
+        targets = [
+            extract_generic_targets(record, shape_names) for record in records
+        ]
+        statistics = {}
+        for name in REGRESSION_NAMES:
+            values = np.stack([target[name] for target in targets])
+            mean, deviation = values.mean(axis=0), values.std(axis=0)
+            deviation = np.where(deviation < 1e-6, 1.0, deviation)
+            statistics[name] = {
+                "mean": mean.tolist(),
+                "standard_deviation": deviation.tolist(),
+            }
+        return cls(statistics, shape_names)
+
+    def normalize(self, targets):
+        normalized = {
+            name: np.asarray(targets[name], np.float32)
+            for name in OUTPUT_NAMES
+        }
+        for name in REGRESSION_NAMES:
+            statistics = self.statistics[name]
+            mean = np.asarray(statistics["mean"], np.float32)
+            deviation = np.asarray(
+                statistics["standard_deviation"], np.float32
+            )
+            normalized[name] = (normalized[name] - mean) / deviation
+        return normalized
+
+    def save(self, path):
+        payload = {
+            "shape_names": self.shape_names,
+            "material_definition": {
+                "values": MATERIAL_NAMES,
+                "source": "generator metadata material fields",
+            },
+            "targets": self.statistics,
+        }
+        with path.open("w") as file:
+            json.dump(payload, file, indent=2)
 
 
 class RGBDSDFDataset(RGBDDataset):
     """Adds canonical XYZ queries and truncated SDF targets to RGB-D data."""
 
     def __init__(self, *args, num_sdf_queries, sdf_extent, sdf_truncation,
+                 shape_names, mesh_frame, distance_chunk_size, cache_dir,
                  **kwargs):
         self.num_sdf_queries = num_sdf_queries
         self.sdf_extent = sdf_extent
         self.sdf_truncation = sdf_truncation
+        self.shape_names = tuple(shape_names)
+        self.mesh_frame = mesh_frame
+        self.distance_chunk_size = distance_chunk_size
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         super().__init__(*args, **kwargs)
-        samples = [
-            sample_sdf_queries(
-                record, num_sdf_queries, sdf_extent, sdf_truncation
-            )
-            for record in self.records
-        ]
+        samples = [self.load_or_create_sdf(record) for record in self.records]
         self.sdf_queries = np.stack([sample[0] for sample in samples])
         self.sdf_targets = np.stack([sample[1] for sample in samples])
 
+    def load_or_create_sdf(self, record):
+        sample_id = Path(record["_metadata_path"]).stem
+        key = (
+            f"{sample_id}_q{self.num_sdf_queries}_e{self.sdf_extent:g}"
+            f"_t{self.sdf_truncation:g}_{self.mesh_frame}.npz"
+        )
+        path = self.cache_dir / key
+        if path.is_file():
+            cached = np.load(path)
+            return cached["queries"], cached["targets"]
+        sample = sample_sdf_queries(
+            record, self.num_sdf_queries, self.sdf_extent,
+            self.sdf_truncation, self.mesh_frame, self.distance_chunk_size,
+        )
+        np.savez_compressed(path, queries=sample[0], targets=sample[1])
+        return sample
+
     def __getitem__(self, batch_index):
-        inputs, targets = super().__getitem__(batch_index)
         begin = batch_index * self.batch_size
         indices = self.indices[begin:begin + self.batch_size]
-        inputs["sdf_query_points"] = self.sdf_queries[indices]
-        targets[SDF_OUTPUT_NAME] = self.sdf_targets[indices]
-        return inputs, targets
+        rgb_images, depth_images, targets = [], [], []
+        for index in indices:
+            record = self.records[index]
+            root = Path(record["_root"])
+            image_path = root / record["rgb"]
+            bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise FileNotFoundError(image_path)
+            rgb_images.append(
+                cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            )
+            depth = np.load(root / record["depth"]).astype(np.float32)
+            if depth.shape != rgb_images[-1].shape[:2]:
+                raise ValueError(f"RGB/depth mismatch for {image_path}")
+            depth_images.append(
+                np.clip(depth / self.max_depth, 0.0, 1.0)[..., None]
+            )
+            targets.append(self.normalizer.normalize(
+                extract_generic_targets(record, self.shape_names)
+            ))
+        inputs = {
+            "rgb": np.stack(rgb_images), "depth": np.stack(depth_images),
+            "sdf_query_points": self.sdf_queries[indices],
+        }
+        stacked_targets = {
+            name: np.stack([target[name] for target in targets])
+            for name in OUTPUT_NAMES
+        }
+        stacked_targets[SDF_OUTPUT_NAME] = self.sdf_targets[indices]
+        return inputs, stacked_targets
 
 
 @keras.saving.register_keras_serializable(package="paz")
@@ -171,6 +380,41 @@ class CanonicalSDFMAE(keras.metrics.Metric):
         return config
 
 
+def rotation_6d_to_matrix_ops(values, epsilon=1e-8):
+    first, second = values[..., :3], values[..., 3:6]
+    first_norm = keras.ops.linalg.norm(first, axis=-1, keepdims=True)
+    axis_x = first / keras.ops.maximum(first_norm, epsilon)
+    projection = keras.ops.sum(axis_x * second, axis=-1, keepdims=True)
+    second = second - projection * axis_x
+    second_norm = keras.ops.linalg.norm(second, axis=-1, keepdims=True)
+    axis_y = second / keras.ops.maximum(second_norm, epsilon)
+    axis_z = keras.ops.cross(axis_x, axis_y)
+    return keras.ops.stack([axis_x, axis_y, axis_z], axis=-1)
+
+
+@keras.saving.register_keras_serializable(package="paz")
+def generic_rotation_loss(target_6d_and_shape, predicted_6d):
+    """Chordal SO(3) loss without assumptions about object symmetries."""
+    target = rotation_6d_to_matrix_ops(target_6d_and_shape[..., :6])
+    prediction = rotation_6d_to_matrix_ops(predicted_6d)
+    return 0.5 * keras.ops.sum(
+        keras.ops.square(prediction - target), axis=(-2, -1)
+    )
+
+
+@keras.saving.register_keras_serializable(package="paz")
+def generic_geodesic_angle_degrees(target_6d_and_shape, predicted_6d):
+    target = rotation_6d_to_matrix_ops(target_6d_and_shape[..., :6])
+    prediction = rotation_6d_to_matrix_ops(predicted_6d)
+    relative = keras.ops.matmul(keras.ops.transpose(target, (0, 2, 1)),
+                                prediction)
+    cosine = keras.ops.clip(
+        (keras.ops.trace(relative, axis1=-2, axis2=-1) - 1.0) / 2.0,
+        -1.0, 1.0,
+    )
+    return keras.ops.arccos(cosine) * (180.0 / np.pi)
+
+
 @keras.saving.register_keras_serializable(package="paz")
 class RepeatGeometryLatent(keras.layers.Layer):
     """Broadcasts one image latent to every SDF query point."""
@@ -185,9 +429,10 @@ class RepeatGeometryLatent(keras.layers.Layer):
         return query_shape[:-1] + (latent_shape[-1],)
 
 
-def build_sdf_model(image_shape=(256, 256), l2_regularization=1e-4):
+def build_sdf_model(image_shape=(256, 256), l2_regularization=1e-4,
+                    num_shapes=3):
     """Adds a query-conditioned implicit SDF decoder to the physical model."""
-    base = build_model(image_shape, l2_regularization)
+    base = build_model(image_shape, l2_regularization, num_shapes)
     regularizer = keras.regularizers.L2(l2_regularization)
     fused = base.get_layer("fused_512d_feature").output
     latent = keras.layers.Dense(
@@ -333,6 +578,18 @@ def make_parser():
     parser.add_argument("--sdf-extent", type=float, default=1.25)
     parser.add_argument("--sdf-truncation", type=float, default=0.2)
     parser.add_argument("--sdf-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--mesh-frame", choices=("world", "canonical"), default="world",
+        help="Coordinate frame of dataset PLY files.",
+    )
+    parser.add_argument(
+        "--distance-chunk-size", type=int, default=32,
+        help="Queries per brute-force mesh-distance chunk.",
+    )
+    parser.add_argument(
+        "--sdf-cache", type=Path, default=None,
+        help="Defaults to <output>/sdf_cache.",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--validation-split", type=float, default=0.2)
@@ -361,6 +618,7 @@ def main(argv=None):
         args.num_sdf_queries, args.sdf_extent, args.sdf_truncation,
         args.sdf_loss_weight, args.batch_size, args.epochs, args.max_depth,
         args.checkpoint_every, args.mesh_resolution, args.mesh_query_chunk,
+        args.distance_chunk_size,
     )
     if any(value <= 0 for value in positive) or args.preview_meshes < 0:
         raise ValueError("sizes, ranges, and weights must be positive")
@@ -371,6 +629,9 @@ def main(argv=None):
     jax.config.update("jax_default_device", gpu)
 
     records = load_records(args.dataset)
+    shape_names = tuple(sorted({
+        record["shape"]["type"] for record in records
+    }))
     train_records, validation_records, test_records = split_records(
         records, args.seed, args.validation_split
     )
@@ -381,7 +642,7 @@ def main(argv=None):
         args.output / "split.json", train_records, validation_records,
         test_records, args.seed, args.validation_split,
     )
-    normalizer = TargetNormalizer.fit(train_records)
+    normalizer = GenericTargetNormalizer.fit(train_records, shape_names)
     normalizer.save(args.output / "normalization.json")
     with (args.output / "input_preprocessing.json").open("w") as file:
         json.dump({
@@ -390,6 +651,9 @@ def main(argv=None):
             "num_sdf_queries": args.num_sdf_queries,
             "sdf_extent": args.sdf_extent,
             "sdf_truncation": args.sdf_truncation,
+            "sdf_target_source": "ground-truth triangle meshes",
+            "mesh_frame": args.mesh_frame,
+            "shape_names": shape_names,
             "mesh_extraction": "marching tetrahedra at SDF zero level",
         }, file, indent=2)
 
@@ -398,6 +662,10 @@ def main(argv=None):
         "num_sdf_queries": args.num_sdf_queries,
         "sdf_extent": args.sdf_extent,
         "sdf_truncation": args.sdf_truncation,
+        "shape_names": shape_names,
+        "mesh_frame": args.mesh_frame,
+        "distance_chunk_size": args.distance_chunk_size,
+        "cache_dir": args.sdf_cache or args.output / "sdf_cache",
     }
     training = RGBDSDFDataset(
         train_records, *common, shuffle=True, seed=args.seed, **sdf_options
@@ -407,15 +675,28 @@ def main(argv=None):
         **sdf_options,
     )
     image_shape = training[0][0]["rgb"].shape[1:3]
-    model = build_sdf_model(image_shape, args.l2_regularization)
+    model = build_sdf_model(
+        image_shape, args.l2_regularization, len(shape_names)
+    )
     sdf_loss = keras.losses.Huber(delta=0.1, name="truncated_sdf_huber")
     compile_model(
         model, args.learning_rate, args.weight_decay, normalizer.statistics,
-        extra_losses={SDF_OUTPUT_NAME: sdf_loss},
-        extra_metrics={SDF_OUTPUT_NAME: [
-            keras.metrics.MeanMetricWrapper(sdf_loss, name="loss"),
-            CanonicalSDFMAE(args.sdf_truncation),
-        ]},
+        extra_losses={
+            "object_orientation_6d": generic_rotation_loss,
+            SDF_OUTPUT_NAME: sdf_loss,
+        },
+        extra_metrics={
+            "object_orientation_6d": [
+                keras.metrics.MeanMetricWrapper(
+                    generic_rotation_loss, name="loss"
+                ),
+                generic_geodesic_angle_degrees,
+            ],
+            SDF_OUTPUT_NAME: [
+                keras.metrics.MeanMetricWrapper(sdf_loss, name="loss"),
+                CanonicalSDFMAE(args.sdf_truncation),
+            ],
+        },
         extra_loss_weights={SDF_OUTPUT_NAME: args.sdf_loss_weight},
     )
     model.summary()
@@ -447,7 +728,8 @@ def main(argv=None):
         ),
     ]
     print(
-        f"Training conditional SDF model on {gpu}: {len(train_records)} train, "
+        f"Training mesh-supervised SDF for {shape_names} on {gpu}: "
+        f"{len(train_records)} train, "
         f"{len(validation_records)} validation, {len(test_records)} test"
     )
     model.fit(

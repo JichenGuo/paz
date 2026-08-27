@@ -330,7 +330,8 @@ def mlp_branch(features, name, regularizer):
     return keras.layers.Dropout(0.2, name=f"{name}_dropout")(x)
 
 
-def build_model(input_shape=(256, 256), l2_regularization=1e-4):
+def build_model(input_shape=(256, 256), l2_regularization=1e-4,
+                num_shapes=len(SHAPE_NAMES)):
     """Builds separate RGB/depth ResNet-18 encoders and fused heads."""
     rgb = keras.Input((*input_shape, 3), name="rgb")
     depth = keras.Input((*input_shape, 1), name="depth")
@@ -358,7 +359,7 @@ def build_model(input_shape=(256, 256), l2_regularization=1e-4):
             1, name="object_scale",
             kernel_regularizer=regularizer)(geometry),
         "shape": keras.layers.Dense(
-            len(SHAPE_NAMES), activation="softmax", name="shape",
+            num_shapes, activation="softmax", name="shape",
             kernel_regularizer=regularizer)(geometry),
         "material": keras.layers.Dense(
             7, name="material", kernel_regularizer=regularizer)(material),
