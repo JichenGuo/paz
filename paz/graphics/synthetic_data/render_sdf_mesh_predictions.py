@@ -33,6 +33,10 @@ import paz
 from paz.graphics.synthetic_data.train_synthetic_rgbd_resnet18_sdf import (
     SDF_OUTPUT_NAME,
 )
+# Register the structured sampler when loading TRELLIS-inspired experiments.
+from paz.graphics.synthetic_data.train_synthetic_rgbd_trellis import (
+    TrilinearStructuredSampler,
+)
 
 
 MATERIAL_NAMES = (
