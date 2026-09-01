@@ -369,6 +369,15 @@ def decode_center_scale(raw, statistics):
     return center.astype(np.float32), max(float(scale[0]), 1e-3)
 
 
+class MeshExtractionError(ValueError):
+    """Reports an invalid predicted SDF field with extraction diagnostics."""
+
+    def __init__(self, message, sdf_min=None, sdf_max=None):
+        super().__init__(message)
+        self.sdf_min = sdf_min
+        self.sdf_max = sdf_max
+
+
 def marching_cubes_mesh(model, rgb, voxel, statistics, extent, resolution,
                         chunk_size):
     """Evaluates camera SDF around predicted pose and applies Marching Cubes."""
@@ -398,10 +407,12 @@ def marching_cubes_mesh(model, rgb, voxel, statistics, extent, resolution,
         }, verbose=0)
         values.append(np.asarray(prediction[SDF_OUTPUT_NAME][0, :, 0]))
     field = np.concatenate(values).reshape((resolution,) * 3)
-    if not float(field.min()) <= 0.0 <= float(field.max()):
-        raise ValueError(
+    sdf_min, sdf_max = float(field.min()), float(field.max())
+    if not sdf_min <= 0.0 <= sdf_max:
+        raise MeshExtractionError(
             "Predicted SDF has no zero crossing inside the extraction cube; "
-            "check pose/scale predictions or increase --sdf-extent"
+            "check pose/scale predictions or increase --sdf-extent",
+            sdf_min=sdf_min, sdf_max=sdf_max,
         )
     spacing = tuple((upper - lower) / (resolution - 1))
     vertices, faces, normals, _ = marching_cubes(
@@ -555,21 +566,58 @@ def main(argv=None):
     model.save(args.output / "final.keras")
     preview = args.output / "marching_cubes_meshes"
     preview.mkdir(parents=True, exist_ok=True)
-    for record in test_records[:args.preview_meshes]:
+    target_meshes = min(args.preview_meshes, len(test_records))
+    extraction_failures = []
+    successful_meshes = []
+    for record in test_records:
+        if len(successful_meshes) >= target_meshes:
+            break
         sample_id = Path(record["_metadata_path"]).stem
-        root = Path(record["_root"])
-        bgr = cv2.imread(str(root / record["rgb"]), cv2.IMREAD_COLOR)
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        depth = np.load(root / record["depth"]).astype(np.float32)
-        voxel = depth_to_voxel(
-            depth, args.voxel_bounds, args.voxel_resolution, args.y_fov
-        )
-        mesh = marching_cubes_mesh(
-            model, rgb, voxel, normalizer.statistics, args.sdf_extent,
-            args.mesh_resolution, args.mesh_query_chunk,
-        )
-        mesh.export(preview / f"{sample_id}.ply")
-        print(f"Saved Marching Cubes mesh {sample_id}.ply")
+        try:
+            root = Path(record["_root"])
+            bgr = cv2.imread(str(root / record["rgb"]), cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise ValueError(f"Could not read RGB image: {root / record['rgb']}")
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            depth = np.load(root / record["depth"]).astype(np.float32)
+            voxel = depth_to_voxel(
+                depth, args.voxel_bounds, args.voxel_resolution, args.y_fov
+            )
+            mesh = marching_cubes_mesh(
+                model, rgb, voxel, normalizer.statistics, args.sdf_extent,
+                args.mesh_resolution, args.mesh_query_chunk,
+            )
+            mesh.export(preview / f"{sample_id}.ply")
+            successful_meshes.append(sample_id)
+            print(f"Saved Marching Cubes mesh {sample_id}.ply "
+                  f"({len(successful_meshes)}/{target_meshes})")
+        except Exception as error:
+            failure = {
+                "sample_id": sample_id,
+                "error_type": type(error).__name__,
+                "message": str(error),
+                "sdf_min": getattr(error, "sdf_min", None),
+                "sdf_max": getattr(error, "sdf_max", None),
+            }
+            extraction_failures.append(failure)
+            print(f"Skipped mesh {sample_id}: {failure['message']} "
+                  f"(SDF range: {failure['sdf_min']}, "
+                  f"{failure['sdf_max']})")
+
+    extraction_report = {
+        "requested_successful_meshes": args.preview_meshes,
+        "target_successful_meshes": target_meshes,
+        "num_attempted": len(successful_meshes) + len(extraction_failures),
+        "num_successful": len(successful_meshes),
+        "num_failed": len(extraction_failures),
+        "successful_sample_ids": successful_meshes,
+        "failures": extraction_failures,
+    }
+    report_path = preview / "extraction_report.json"
+    with report_path.open("w") as file:
+        json.dump(extraction_report, file, indent=2)
+    print(f"Mesh preview extraction completed: {len(successful_meshes)}/"
+          f"{target_meshes} successful; report saved to {report_path}")
 
 
 if __name__ == "__main__":
