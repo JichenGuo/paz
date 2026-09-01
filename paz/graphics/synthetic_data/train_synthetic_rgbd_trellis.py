@@ -229,13 +229,16 @@ def build_trellis_model(image_shape, num_shapes, structure_resolution, structure
     return keras.Model(dict(base.input), outputs, name="rgbd_trellis_flexicubes_mesh")
 
 
-def predict_flexicubes_mesh(model, rgb, depth, resolution, extent):
+def predict_flexicubes_mesh(model, rgb, depth, resolution, extent, raw=None):
     """Decodes dense scalar/deformation grids and extracts a triangle mesh."""
     try:
         from skimage.measure import marching_cubes
     except ImportError as error:
         raise ImportError("Mesh previews require scikit-image") from error
-    raw = model.predict({"rgb": rgb[None], "depth": depth[None]}, verbose=0)
+    if raw is None:
+        raw = model.predict(
+            {"rgb": rgb[None], "depth": depth[None]}, verbose=0
+        )
     scalar = np.asarray(raw[SCALAR_OUTPUT_NAME][0, ..., 0])
     deformation = np.asarray(raw[DEFORMATION_OUTPUT_NAME][0])
     weights = np.asarray(raw[WEIGHTS_OUTPUT_NAME][0, ..., 0])
