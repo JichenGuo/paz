@@ -15,6 +15,7 @@ import argparse
 import csv
 import gc
 import json
+import time
 from pathlib import Path
 
 import cv2
@@ -366,30 +367,49 @@ def main(argv=None):
         input_rgb, target_depth, normalized_depth = load_inputs(
             metadata, args.dataset, args.max_depth
         )
+        pipeline_start = time.perf_counter()
+        model_start = time.perf_counter()
         raw = model.predict({
             "rgb": input_rgb[None],
             "depth": normalized_depth[None],
             "sdf_query_points": np.zeros((1, 1, 3), dtype=np.float32),
         }, verbose=0)
+        jax.tree.map(
+            lambda value: jax.block_until_ready(value), raw
+        )
+        model_time_ms = (time.perf_counter() - model_start) * 1000.0
         prediction = decode_prediction(
             raw, statistics, shape_names,
             normalization.get("material_definition"),
         )
+        mesh_start = time.perf_counter()
         mesh = load_sdf_mesh(mesh_path)
+        mesh_time_ms = (time.perf_counter() - mesh_start) * 1000.0
+        render_start = time.perf_counter()
         (rendered_rgb, rendered_depth, object_to_camera, object_to_world,
          light_world) = render(
             mesh, prediction, metadata["camera"], input_rgb.shape[:2],
             args.y_fov, args.tiles, args.chunk_size, args.face_chunk_size,
             not args.no_shadows,
         )
+        jax.block_until_ready(rendered_rgb)
+        jax.block_until_ready(rendered_depth)
+        render_time_ms = (time.perf_counter() - render_start) * 1000.0
         rendered_depth = np.where(
             (rendered_depth > 0.0) & (rendered_depth <= args.max_depth),
             rendered_depth, 0.0,
         ).astype(np.float32)
         rendered_rgb = np.clip(rendered_rgb, 0.0, 1.0)
+        pipeline_time_ms = (time.perf_counter() - pipeline_start) * 1000.0
         metrics = evaluate_render(
             rendered_rgb, input_rgb, rendered_depth, target_depth
         )
+        metrics.update({
+            "model_inference_time_ms": model_time_ms,
+            "mesh_preparation_time_ms": mesh_time_ms,
+            "render_time_ms": render_time_ms,
+            "prediction_render_pipeline_time_ms": pipeline_time_ms,
+        })
         rows.append({"sample_id": sample_id, **metrics})
         rendered_uint8 = (rendered_rgb * 255.0).astype(np.uint8)
         paz.image.write(
@@ -417,7 +437,9 @@ def main(argv=None):
         print(
             f"Rendered {index + 1}/{len(mesh_paths)}: {sample_id}, "
             f"RGB MAE={metrics['rgb_mae_0_1']:.4f}, "
-            f"depth MAE={metrics['depth_mae_m']:.4f} m"
+            f"depth MAE={metrics['depth_mae_m']:.4f} m, "
+            f"model={model_time_ms:.1f} ms, render={render_time_ms:.1f} ms, "
+            f"pipeline={pipeline_time_ms:.1f} ms"
         )
         if (args.clear_caches_every > 0
                 and (index + 1) % args.clear_caches_every == 0):
@@ -428,8 +450,23 @@ def main(argv=None):
         writer = csv.DictWriter(file, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
+    summary = summarize(rows)
+    summary["timing_scope"] = {
+        "model_inference_time_ms": (
+            "Keras physical-head prediction using one dummy SDF query"
+        ),
+        "mesh_preparation_time_ms": (
+            "Loading and preprocessing an already extracted PLY mesh"
+        ),
+        "render_time_ms": "PAZ RGB-D rendering",
+        "prediction_render_pipeline_time_ms": (
+            "Model prediction, decoding, mesh preparation, and rendering; "
+            "does not include SDF-grid evaluation or mesh extraction"
+        ),
+    }
+    summary["jax_cache_clear_interval"] = args.clear_caches_every
     with (output / "metrics_summary.json").open("w") as file:
-        json.dump(jsonify(summarize(rows)), file, indent=2)
+        json.dump(jsonify(summary), file, indent=2)
     print(f"Saved rendered comparisons to {output}")
 
 
