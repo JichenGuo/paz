@@ -122,6 +122,9 @@ class CanonicalVoxelMeshDataset(RGBDFlexiCubesDataset):
         self.y_fov = float(y_fov)
         self.voxel_cache = Path(voxel_cache)
         self.voxel_cache.mkdir(parents=True, exist_ok=True)
+        # Shape names are already stored by GenericTargetNormalizer.
+        # Consume this legacy option instead of forwarding it to RGBDDataset.
+        kwargs.pop("shape_names", None)
         super().__init__(*args, **kwargs)
         self.canonical_voxels = np.stack([
             self.load_or_create_voxel(record) for record in self.records
@@ -302,7 +305,6 @@ def main(argv=None):
 
     common = (normalizer, args.batch_size, args.max_depth)
     options = {
-        "shape_names": shape_names,
         "mesh_frame": "canonical",
         "mesh_extent": args.mesh_extent,
         "structure_resolution": args.structure_resolution,
