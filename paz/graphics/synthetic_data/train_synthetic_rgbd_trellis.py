@@ -109,11 +109,15 @@ class RGBDFlexiCubesDataset(RGBDDataset):
 
     def load_or_create_mesh_grids(self, record):
         sample_id = Path(record["_metadata_path"]).stem
-        path = self.mesh_cache / (f"{sample_id}_flexicubes_r{self.structure_resolution}_e{self.mesh_extent:g}_{self.mesh_frame}.npz")
+        path = self.mesh_cache / (f"{sample_id}_spatialcanonical_v2_flexicubes_r{self.structure_resolution}_e{self.mesh_extent:g}_{self.mesh_frame}.npz")
         if path.is_file():
             data = np.load(path)
             return tuple(data[name] for name in ("structure", "scalar", "deformation", "weights"))
-        mesh = load_canonical_mesh(record, self.mesh_frame)
+        # Dataset meshes are stored in world coordinates. The inherited
+        # loader uses "world" to request world-to-canonical conversion.
+        source_frame = "world" if self.mesh_frame == "canonical" \
+            else "canonical"
+        mesh = load_canonical_mesh(record, source_frame)
         grid = grid_coordinates(self.structure_resolution, self.mesh_extent)
         points = grid.reshape(-1, 3)
         closest, distance, _ = trimesh.proximity.closest_point_naive(mesh, points)
@@ -207,14 +211,101 @@ class TrilinearStructuredSampler(keras.layers.Layer):
         return config
 
 
-def build_trellis_model(image_shape, num_shapes, structure_resolution, structure_channels, mesh_extent, l2_regularization):
-    """Builds a TRELLIS-style dense FlexiCubes parameter decoder."""
+
+@keras.saving.register_keras_serializable(package="paz")
+class LiftSpatialFeatures3D(keras.layers.Layer):
+    """Lifts an XY feature map through Z and appends a Z coordinate."""
+
+    def __init__(self, resolution, **kwargs):
+        super().__init__(**kwargs)
+        self.resolution = int(resolution)
+
+    def call(self, features):
+        lifted = keras.ops.expand_dims(features, axis=3)
+        lifted = keras.ops.repeat(lifted, self.resolution, axis=3)
+        batch = keras.ops.shape(features)[0]
+        z = keras.ops.linspace(-1.0, 1.0, self.resolution)
+        z = keras.ops.reshape(z, (1, 1, 1, self.resolution, 1))
+        z = keras.ops.broadcast_to(
+            z, (batch, self.resolution, self.resolution,
+                self.resolution, 1),
+        )
+        return keras.ops.concatenate([lifted, z], axis=-1)
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], self.resolution, self.resolution,
+                self.resolution, input_shape[-1] + 1)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"resolution": self.resolution})
+        return config
+
+
+@keras.saving.register_keras_serializable(package="paz")
+class RepeatGlobalGrid(keras.layers.Layer):
+    """Broadcasts compact global context over a structured 3D grid."""
+
+    def __init__(self, resolution, **kwargs):
+        super().__init__(**kwargs)
+        self.resolution = int(resolution)
+
+    def call(self, features):
+        features = keras.ops.reshape(
+            features, (keras.ops.shape(features)[0], 1, 1, 1,
+                       keras.ops.shape(features)[-1]),
+        )
+        return keras.ops.tile(
+            features, (1, self.resolution, self.resolution,
+                       self.resolution, 1),
+        )
+
+    def compute_output_shape(self, input_shape):
+        return ((input_shape[0],) + (self.resolution,) * 3
+                + (input_shape[-1],))
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"resolution": self.resolution})
+        return config
+
+
+def build_trellis_model(image_shape, num_shapes, structure_resolution,
+                        structure_channels, mesh_extent, l2_regularization):
+    """Builds a spatial RGB-D structured mesh-parameter decoder."""
     base = build_model(image_shape, l2_regularization, num_shapes)
     regularizer = keras.regularizers.L2(l2_regularization)
     fused = base.get_layer("fused_512d_feature").output
-    latent_units = structure_resolution ** 3 * structure_channels
-    structured = keras.layers.Dense(latent_units, activation="relu", kernel_regularizer=regularizer, name="structured_latent_projection")(fused)
-    structured = keras.layers.Reshape((structure_resolution,) * 3 + (structure_channels,), name="structured_latent_grid")(structured)
+    rgb_spatial = base.get_layer("rgb_stage4_block2_output").output
+    depth_spatial = base.get_layer("depth_stage4_block2_output").output
+    spatial = keras.layers.Concatenate(name="rgb_depth_spatial_fusion")([
+        rgb_spatial, depth_spatial
+    ])
+    spatial = keras.layers.Conv2D(
+        structure_channels, 1, activation="relu",
+        kernel_regularizer=regularizer, name="spatial_channel_projection",
+    )(spatial)
+    spatial = keras.layers.Resizing(
+        structure_resolution, structure_resolution,
+        interpolation="bilinear", name="spatial_grid_resize",
+    )(spatial)
+    spatial = LiftSpatialFeatures3D(
+        structure_resolution, name="spatial_feature_lift_3d"
+    )(spatial)
+    global_context = keras.layers.Dense(
+        structure_channels, activation="relu",
+        kernel_regularizer=regularizer, name="mesh_global_context",
+    )(fused)
+    global_context = RepeatGlobalGrid(
+        structure_resolution, name="repeat_mesh_global_context"
+    )(global_context)
+    structured = keras.layers.Concatenate(name="spatial_global_3d_fusion")([
+        spatial, global_context
+    ])
+    structured = keras.layers.Conv3D(
+        structure_channels, 3, padding="same", activation="relu",
+        kernel_regularizer=regularizer, name="structured_latent_grid",
+    )(structured)
     for index in range(2):
         residual = structured
         structured = keras.layers.Conv3D(structure_channels, 3, padding="same", activation="relu", kernel_regularizer=regularizer, name=f"slat_mesh_conv_{index + 1}")(structured)
@@ -261,8 +352,8 @@ def make_parser():
                         default=Path("experiments/rgbd_trellis_simple_shapes"))
     parser.add_argument("--test-output", type=Path, default=None)
     parser.add_argument("--mesh-frame", choices=("world", "canonical"),
-                        default="world")
-    parser.add_argument("--structure-resolution", type=int, default=8)
+                        default="canonical")
+    parser.add_argument("--structure-resolution", type=int, default=16)
     parser.add_argument("--structure-channels", type=int, default=32)
     parser.add_argument("--structure-surface-band", type=float, default=None)
     parser.add_argument("--structure-loss-weight", type=float, default=0.25)
@@ -339,6 +430,12 @@ def main(argv=None):
         "structure_channels": args.structure_channels,
         "structure_surface_band": surface_band,
         "mesh_extent": args.mesh_extent,
+        "mesh_target_frame": args.mesh_frame,
+        "stored_dataset_mesh_frame": "world",
+        "mesh_spatial_features": (
+            "final RGB/depth ResNet maps lifted to a 3D grid"
+        ),
+        "global_dense_grid_projection": False,
         "geometry_decoder": "structured scalar, deformation, and interpolation grids",
         "pointwise_sdf_decoder": False,
         "mesh_extraction": "scalar-grid isosurface with learned vertex deformation",
