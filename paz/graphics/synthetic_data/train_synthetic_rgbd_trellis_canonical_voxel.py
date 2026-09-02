@@ -354,21 +354,33 @@ def main(argv=None):
                 generic_geodesic_angle_degrees,
             ],
             STRUCTURE_OUTPUT_NAME: [
+                keras.metrics.MeanMetricWrapper(
+                    structure_loss, name="loss"
+                ),
                 keras.metrics.BinaryIoU(
                     target_class_ids=(1,), threshold=0.5,
                     name="surface_iou",
                 )
             ],
             SCALAR_OUTPUT_NAME: [
+                keras.metrics.MeanMetricWrapper(
+                    scalar_loss, name="loss"
+                ),
                 keras.metrics.BinaryIoU(
                     target_class_ids=(1,), threshold=0.5,
                     name="volume_iou",
                 )
             ],
             DEFORMATION_OUTPUT_NAME: [
+                keras.metrics.MeanMetricWrapper(
+                    deformation_loss, name="loss"
+                ),
                 keras.metrics.MeanAbsoluteError(name="deformation_mae")
             ],
             WEIGHTS_OUTPUT_NAME: [
+                keras.metrics.MeanMetricWrapper(
+                    weights_loss, name="loss"
+                ),
                 keras.metrics.MeanAbsoluteError(name="weight_mae")
             ],
         },
