@@ -138,6 +138,83 @@ class RepeatCageCoordinates(keras.layers.Layer):
 
 
 @keras.saving.register_keras_serializable(package="paz")
+class CameraGeometryChannels(keras.layers.Layer):
+    """Builds position-aware camera geometry channels from normalized depth.
+
+    The input depth is ``metric_depth / max_depth``. Consequently, the
+    returned XYZ coordinates are camera-frame points in max-depth units. This
+    keeps their numerical range comparable to CNN activations while retaining
+    projective geometry.
+    """
+
+    def __init__(self, height, width, y_fov_degrees, **kwargs):
+        super().__init__(**kwargs)
+        self.height = int(height)
+        self.width = int(width)
+        self.y_fov_degrees = float(y_fov_degrees)
+        y_fov = np.deg2rad(self.y_fov_degrees)
+        aspect = self.width / self.height
+        half_height = np.tan(y_fov / 2.0)
+        half_width = aspect * half_height
+        x = ((np.arange(self.width, dtype=np.float32) + 0.5)
+             / self.width * 2.0 - 1.0)
+        y = 1.0 - ((np.arange(self.height, dtype=np.float32) + 0.5)
+                   / self.height * 2.0)
+        x_grid, y_grid = np.meshgrid(x, y)
+        # The renderer convention looks down negative camera Z. Keep both
+        # normalized image coordinates and normalized ray directions.
+        rays = np.stack([
+            x_grid * half_width,
+            y_grid * half_height,
+            -np.ones_like(x_grid),
+        ], axis=-1)
+        rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
+        self.image_coordinates = np.stack([x_grid, y_grid], axis=-1)
+        self.rays = rays.astype(np.float32)
+
+    def call(self, normalized_depth):
+        depth = keras.ops.image.resize(
+            normalized_depth, (self.height, self.width),
+            interpolation="bilinear",
+        )
+        valid = keras.ops.image.resize(
+            keras.ops.cast(normalized_depth > 0.0, normalized_depth.dtype),
+            (self.height, self.width), interpolation="nearest",
+        )
+        depth = depth * valid
+        rays = keras.ops.convert_to_tensor(self.rays, dtype=depth.dtype)
+        rays = keras.ops.broadcast_to(
+            rays[None], (keras.ops.shape(depth)[0], self.height, self.width, 3)
+        )
+        image_coordinates = keras.ops.convert_to_tensor(
+            self.image_coordinates, dtype=depth.dtype
+        )
+        image_coordinates = keras.ops.broadcast_to(
+            image_coordinates[None],
+            (keras.ops.shape(depth)[0], self.height, self.width, 2),
+        )
+        ray_distance = depth / keras.ops.maximum(
+            -rays[..., 2:3], 1e-6
+        )
+        camera_points = rays * ray_distance * valid
+        return keras.ops.concatenate([
+            image_coordinates, rays, camera_points, depth, valid,
+        ], axis=-1)
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], self.height, self.width, 10)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "height": self.height,
+            "width": self.width,
+            "y_fov_degrees": self.y_fov_degrees,
+        })
+        return config
+
+
+@keras.saving.register_keras_serializable(package="paz")
 class CageMeshDeformation(keras.layers.Layer):
     """Maps bounded cage offsets to a dense mesh using fixed MVC weights."""
 
@@ -1080,6 +1157,15 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
             query_width, activation="relu", kernel_regularizer=regularizer,
             name="cage_query_projection",
         )(cage_queries)
+        spatial_height = int(spatial_features.shape[1])
+        spatial_width = int(spatial_features.shape[2])
+        camera_geometry = CameraGeometryChannels(
+            spatial_height, spatial_width, y_fov,
+            name="cage_camera_geometry_channels",
+        )(depth)
+        spatial_features = keras.layers.Concatenate(
+            name="cage_position_aware_features"
+        )([spatial_features, camera_geometry])
         spatial_tokens = keras.layers.Conv2D(
             query_width, 1, padding="same", activation="relu",
             kernel_regularizer=regularizer,
@@ -1357,9 +1443,12 @@ def main(argv=None):
             "mesh_representation": "mean-value-coordinate cage deformation",
             "geometry_representation": "cage",
             "cage_decoder": (
-                "per-vertex queries with four-head attention over spatial "
-                "RGB-D features"
+                "per-vertex queries with four-head attention over RGB-D "
+                "features augmented by pixel XY, camera rays, back-projected "
+                "camera XYZ, normalized depth, and a valid-depth mask"
             ),
+            "spatial_token_frame": "camera",
+            "spatial_point_units": "max-depth-normalized metric units",
             "template_subdivisions": args.template_subdivisions,
             "cage_subdivisions": args.cage_subdivisions,
             "template_radius": args.template_radius,
