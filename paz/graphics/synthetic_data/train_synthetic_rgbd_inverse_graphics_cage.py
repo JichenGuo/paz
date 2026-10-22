@@ -14,7 +14,7 @@ depth, and silhouette maps. Reconstruction losses therefore update geometry,
 pose, material, and lighting jointly without an SDF or Marching Cubes::
 
     KERAS_BACKEND=jax JAX_PLATFORMS=cuda python -m \
-      paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_atlas \
+      paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_cage \
       --dataset datasets/synthetic_rgbd_1000_v4 \
       --output experiments/rgbd_inverse_graphics_cage
 """

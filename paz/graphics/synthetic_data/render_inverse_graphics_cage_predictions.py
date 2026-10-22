@@ -8,7 +8,7 @@ RGB-D resolution with the PAZ renderer.
 Example::
 
     KERAS_BACKEND=jax JAX_PLATFORMS=cuda python -m \
-      paz.graphics.synthetic_data.render_inverse_graphics_atlas_predictions \
+      paz.graphics.synthetic_data.render_inverse_graphics_cage_predictions \
       --dataset datasets/synthetic_rgbd_1000_v4 \
       --experiment experiments/rgbd_inverse_graphics_cage
 """
@@ -31,7 +31,7 @@ import numpy as np
 import trimesh
 
 # Register every custom layer/loss before loading the saved Keras model.
-from paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_atlas import (
+from paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_cage import (
     MESH_OUTPUT_NAME,
     CageMeshDeformation,
     DifferentiableCageRenderer,

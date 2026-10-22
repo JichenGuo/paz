@@ -31,14 +31,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from paz.graphics.synthetic_data.render_inverse_graphics_atlas_predictions import (
+from paz.graphics.synthetic_data.render_inverse_graphics_cage_predictions import (
     decode_prediction,
     inference_model,
     load_inputs,
     load_json,
     load_mesh_topology,
 )
-from paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_atlas import (
+from paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_cage import (
     MESH_OUTPUT_NAME,
 )
 
