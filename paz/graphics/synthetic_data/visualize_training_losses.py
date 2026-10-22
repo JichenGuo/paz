@@ -7,6 +7,7 @@ Example:
 
 import argparse
 import csv
+import math
 from pathlib import Path
 
 import matplotlib
@@ -36,15 +37,28 @@ def load_history(csv_path):
         raise ValueError(f"No epochs found in {csv_path}")
     if "epoch" not in rows[0]:
         raise ValueError(f"Missing epoch column in {csv_path}")
-    available = {"epoch"}
-    for name in LOSS_NAMES:
-        for column in (name, f"val_{name}"):
-            if column in rows[0]:
-                available.add(column)
+    available = {
+        name for name in rows[0]
+        if name == "epoch" or name == "loss" or name == "val_loss"
+        or name.endswith("_loss")
+    }
     return {
         name: np.asarray([float(row[name]) for row in rows])
         for name in available
     }
+
+
+def discover_loss_names(history):
+    """Returns loss bases recorded by either standard or geometry training."""
+    names = []
+    for column in history:
+        name = column[4:] if column.startswith("val_") else column
+        if name == "loss" or name.endswith("_loss"):
+            if name not in names:
+                names.append(name)
+    ordered = [name for name in LOSS_NAMES if name in names]
+    ordered.extend(sorted(set(names).difference(ordered)))
+    return ordered
 
 
 def plot_losses(history, output_path):
@@ -53,8 +67,13 @@ def plot_losses(history, output_path):
     selection_name = "val_loss" if "val_loss" in history else "loss"
     best_arg = int(np.nanargmin(history[selection_name]))
     best_epoch = epochs[best_arg]
-    figure, axes = plt.subplots(4, 2, figsize=(14, 16), sharex=True)
-    for axis, name in zip(axes.flat, LOSS_NAMES):
+    loss_names = discover_loss_names(history)
+    columns = 2
+    rows = max(1, math.ceil(len(loss_names) / columns))
+    figure, axes = plt.subplots(
+        rows, columns, figsize=(14, 4 * rows), sharex=True, squeeze=False
+    )
+    for axis, name in zip(axes.flat, loss_names):
         validation_name = f"val_{name}"
         has_curve = False
         if name in history:
@@ -73,9 +92,11 @@ def plot_losses(history, output_path):
             axis.legend(fontsize=8)
         else:
             axis.text(
-                0.5, 0.5, "Not recorded in training.csv",
+                0.5, 0.5, "Not recorded in selected CSV",
                 ha="center", va="center", transform=axis.transAxes,
             )
+    for axis in axes.flat[len(loss_names):]:
+        axis.set_visible(False)
     for axis in axes[-1]:
         axis.set_xlabel("Epoch")
     figure.tight_layout()
@@ -90,7 +111,11 @@ def make_parser():
     parser.add_argument(
         "--experiment", type=Path,
         default=Path("experiments/rgbd_cnn_1000_regularized"),
-        help="Directory containing training.csv.",
+        help="Directory containing training.csv or geometry_warmup.csv.",
+    )
+    parser.add_argument(
+        "--csv", type=Path, default=None,
+        help="Optional explicit CSV path.",
     )
     parser.add_argument(
         "--output", type=Path, default=None,
@@ -101,14 +126,24 @@ def make_parser():
 
 def main(argv=None):
     args = make_parser().parse_args(argv)
-    csv_path = args.experiment / "training.csv"
+    csv_path = args.csv
+    if csv_path is None:
+        candidates = (
+            args.experiment / "training.csv",
+            args.experiment / "geometry_warmup.csv",
+        )
+        csv_path = next((path for path in candidates if path.is_file()), None)
+        if csv_path is None:
+            expected = ", ".join(str(path) for path in candidates)
+            raise FileNotFoundError(f"No training CSV found; checked: {expected}")
     output_path = args.output or args.experiment / "loss_from_csv.png"
     history = load_history(csv_path)
     best_epoch, best_loss = plot_losses(history, output_path)
-    missing = [
+    missing = [] if csv_path.name == "geometry_warmup.csv" else [
         name for name in LOSS_NAMES[1:]
         if name not in history and f"val_{name}" not in history
     ]
+    print(f"Loaded training history from {csv_path}")
     print(f"Saved loss visualization to {output_path}")
     print(f"Best total validation loss: {best_loss:.6f} at epoch {best_epoch}")
     if missing:
