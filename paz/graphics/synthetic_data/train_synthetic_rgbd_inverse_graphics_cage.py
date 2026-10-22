@@ -75,6 +75,14 @@ Objectives = namedtuple("Objectives", [
     "mesh", "mesh_normal", "rotation", "rotation_metric", "cage",
     "losses", "metrics", "weights",
 ])
+CageDecoderArgs = namedtuple("CageDecoderArgs", [
+    "coordinates", "vertices", "weights", "mesh_statistics", "max_offset",
+    "y_fov", "max_depth", "target_statistics",
+])
+RenderArgs = namedtuple("RenderArgs", [
+    "faces", "resolution", "y_fov", "target_statistics", "mesh_statistics",
+    "splat_sigma", "depth_temperature", "splat_strength",
+])
 
 
 def normalize_tensor(values, epsilon=1e-8):
@@ -1139,21 +1147,7 @@ class DifferentiableCageRenderer(keras.layers.Layer):
         return config
 
 
-def build_model(image_shape, num_shapes, coordinates, base_width,
-                l2_regularization, faces, render_resolution, y_fov,
-                target_statistics, mesh_statistics, splat_sigma,
-                depth_temperature, max_depth, cage_vertices, mesh_weights,
-                cage_maximum_offset=1.0, splat_strength=0.5):
-    """Builds a compact physical-parameter and cage-deformation network."""
-    if cage_vertices is None or mesh_weights is None:
-        raise ValueError("cage vertices and MVC weights are required")
-    regularizer = keras.regularizers.L2(l2_regularization)
-    rgb = keras.Input((*image_shape, 3), name="rgb")
-    depth = keras.Input((*image_shape, 1), name="depth")
-    object_mask = keras.Input((*image_shape, 1), name="object_mask")
-    features, spatial_features = compact_encoder(
-        rgb, depth, regularizer, base_width
-    )
+def build_parameter_heads(features, regularizer, num_shapes):
     geometry = keras.layers.Dense(
         192, activation="relu", kernel_regularizer=regularizer,
         name="geometry_mlp",
@@ -1181,91 +1175,87 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
         "light_intensity": keras.layers.Dense(
             1, name="light_intensity")(lighting),
     }
-    # Every reference cage vertex is a distinct learned query. The query
-    # combines its canonical coordinate with global object context, then
-    # attends to the unpooled RGB-D feature map.
-    if cage_vertices is not None:
-        # Every reference cage vertex is a distinct learned query. The query
-        # combines its canonical coordinate with global object context, then
-        # attends to the unpooled RGB-D feature map. This preserves one shared,
-        # category-agnostic decoder while giving different cage regions access
-        # to different image/depth evidence.
-        query_width = 128
-        cage_queries = RepeatCageCoordinates(
-            cage_vertices, name="cage_vertex_queries"
-        )(geometry)
-        cage_queries = keras.layers.Dense(
-            query_width, activation="relu", kernel_regularizer=regularizer,
-            name="cage_query_projection",
-        )(cage_queries)
-        spatial_height = int(spatial_features.shape[1])
-        spatial_width = int(spatial_features.shape[2])
-        camera_geometry = CameraGeometryChannels(
-            spatial_height, spatial_width, y_fov, max_depth,
-            target_statistics,
-            name="cage_camera_geometry_channels",
-        )([
-            depth, object_mask, outputs["object_translation"],
-            outputs["object_orientation_6d"], outputs["object_scale"],
-        ])
-        spatial_features = keras.layers.Concatenate(
-            name="cage_position_aware_features"
-        )([spatial_features, camera_geometry])
-        spatial_tokens = keras.layers.Conv2D(
-            query_width, 1, padding="same", activation="relu",
-            kernel_regularizer=regularizer,
-            name="cage_spatial_projection",
-        )(spatial_features)
-        spatial_tokens = keras.layers.Reshape(
-            (-1, query_width), name="cage_spatial_tokens"
-        )(spatial_tokens)
-        attended = keras.layers.MultiHeadAttention(
-            num_heads=4, key_dim=query_width // 4,
-            kernel_regularizer=regularizer,
-            name="cage_spatial_attention",
-        )(query=cage_queries, value=spatial_tokens, key=spatial_tokens)
-        cage_feature = keras.layers.Add(name="cage_attention_residual")([
-            cage_queries, attended,
-        ])
-        cage_feature = keras.layers.LayerNormalization(
-            name="cage_attention_norm"
-        )(cage_feature)
-        feed_forward = keras.layers.Dense(
-            query_width * 2, activation="gelu",
-            kernel_regularizer=regularizer,
-            name="cage_query_feed_forward_1",
-        )(cage_feature)
-        feed_forward = keras.layers.Dense(
-            query_width, kernel_regularizer=regularizer,
-            name="cage_query_feed_forward_2",
-        )(feed_forward)
-        cage_feature = keras.layers.Add(name="cage_query_residual")([
-            cage_feature, feed_forward,
-        ])
-        cage_feature = keras.layers.LayerNormalization(
-            name="cage_query_norm"
-        )(cage_feature)
-        raw_offsets = keras.layers.Dense(
-            3, kernel_initializer=keras.initializers.RandomNormal(stddev=1e-3),
-            bias_initializer="zeros", kernel_regularizer=regularizer,
-            name="cage_vertex_offsets",
-        )(cage_feature)
-        deformed_mesh, deformed_cage = CageMeshDeformation(
-            cage_vertices, mesh_weights, mesh_statistics["mean"],
-            mesh_statistics["standard_deviation"], cage_maximum_offset,
-            reference_vertices=coordinates,
-            name="cage_deformation",
-        )(raw_offsets)
-        outputs[MESH_OUTPUT_NAME] = keras.layers.Activation(
-            "linear", name=MESH_OUTPUT_NAME
-        )(deformed_mesh)
-        outputs[CAGE_OUTPUT_NAME] = keras.layers.Activation(
-            "linear", name=CAGE_OUTPUT_NAME
-        )(deformed_cage)
+    return geometry, outputs
+
+
+def build_cage_queries(geometry, spatial_features, depth, object_mask,
+                       outputs, regularizer, config):
+    width = 128
+    queries = RepeatCageCoordinates(
+        config.vertices, name="cage_vertex_queries"
+    )(geometry)
+    queries = keras.layers.Dense(
+        width, activation="relu", kernel_regularizer=regularizer,
+        name="cage_query_projection",
+    )(queries)
+    height, image_width = spatial_features.shape[1:3]
+    camera = CameraGeometryChannels(
+        int(height), int(image_width), config.y_fov, config.max_depth,
+        config.target_statistics, name="cage_camera_geometry_channels",
+    )([depth, object_mask, outputs["object_translation"],
+       outputs["object_orientation_6d"], outputs["object_scale"]])
+    tokens = keras.layers.Concatenate(
+        name="cage_position_aware_features"
+    )([spatial_features, camera])
+    tokens = keras.layers.Conv2D(
+        width, 1, padding="same", activation="relu",
+        kernel_regularizer=regularizer, name="cage_spatial_projection",
+    )(tokens)
+    tokens = keras.layers.Reshape(
+        (-1, width), name="cage_spatial_tokens"
+    )(tokens)
+    attended = keras.layers.MultiHeadAttention(
+        num_heads=4, key_dim=width // 4, kernel_regularizer=regularizer,
+        name="cage_spatial_attention",
+    )(query=queries, value=tokens, key=tokens)
+    features = keras.layers.Add(
+        name="cage_attention_residual"
+    )([queries, attended])
+    return keras.layers.LayerNormalization(
+        name="cage_attention_norm"
+    )(features)
+
+
+def build_cage_outputs(features, outputs, regularizer, config):
+    feed_forward = keras.layers.Dense(
+        256, activation="gelu", kernel_regularizer=regularizer,
+        name="cage_query_feed_forward_1",
+    )(features)
+    feed_forward = keras.layers.Dense(
+        128, kernel_regularizer=regularizer,
+        name="cage_query_feed_forward_2",
+    )(feed_forward)
+    features = keras.layers.Add(
+        name="cage_query_residual"
+    )([features, feed_forward])
+    features = keras.layers.LayerNormalization(
+        name="cage_query_norm"
+    )(features)
+    initializer = keras.initializers.RandomNormal(stddev=1e-3)
+    offsets = keras.layers.Dense(
+        3, kernel_initializer=initializer, bias_initializer="zeros",
+        kernel_regularizer=regularizer, name="cage_vertex_offsets",
+    )(features)
+    mesh, cage = CageMeshDeformation(
+        config.vertices, config.weights, config.mesh_statistics["mean"],
+        config.mesh_statistics["standard_deviation"], config.max_offset,
+        reference_vertices=config.coordinates, name="cage_deformation",
+    )(offsets)
+    outputs[MESH_OUTPUT_NAME] = keras.layers.Activation(
+        "linear", name=MESH_OUTPUT_NAME
+    )(mesh)
+    outputs[CAGE_OUTPUT_NAME] = keras.layers.Activation(
+        "linear", name=CAGE_OUTPUT_NAME
+    )(cage)
+
+
+def build_render_outputs(outputs, config):
     rendered = DifferentiableCageRenderer(
-        faces, render_resolution, y_fov, target_statistics, mesh_statistics,
-        splat_sigma=splat_sigma, depth_temperature=depth_temperature,
-        splat_strength=splat_strength,
+        config.faces, config.resolution, config.y_fov,
+        config.target_statistics, config.mesh_statistics,
+        splat_sigma=config.splat_sigma,
+        depth_temperature=config.depth_temperature,
+        splat_strength=config.splat_strength,
         name="differentiable_cage_renderer",
     )([
         outputs[MESH_OUTPUT_NAME], outputs["object_translation"],
@@ -1282,6 +1272,35 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
     outputs[RENDERED_SILHOUETTE_OUTPUT_NAME] = keras.layers.Activation(
         "linear", name=RENDERED_SILHOUETTE_OUTPUT_NAME
     )(rendered[2])
+
+
+def build_model(image_shape, num_shapes, coordinates, base_width,
+                l2_regularization, faces, render_resolution, y_fov,
+                target_statistics, mesh_statistics, splat_sigma,
+                depth_temperature, max_depth, cage_vertices, mesh_weights,
+                cage_maximum_offset=1.0, splat_strength=0.5):
+    """Builds a compact physical-parameter and cage-deformation network."""
+    regularizer = keras.regularizers.L2(l2_regularization)
+    rgb = keras.Input((*image_shape, 3), name="rgb")
+    depth = keras.Input((*image_shape, 1), name="depth")
+    object_mask = keras.Input((*image_shape, 1), name="object_mask")
+    features, spatial = compact_encoder(rgb, depth, regularizer, base_width)
+    geometry, outputs = build_parameter_heads(
+        features, regularizer, num_shapes
+    )
+    decoder = CageDecoderArgs(
+        coordinates, cage_vertices, mesh_weights, mesh_statistics,
+        cage_maximum_offset, y_fov, max_depth, target_statistics,
+    )
+    cage_features = build_cage_queries(
+        geometry, spatial, depth, object_mask, outputs, regularizer, decoder
+    )
+    build_cage_outputs(cage_features, outputs, regularizer, decoder)
+    renderer = RenderArgs(
+        faces, render_resolution, y_fov, target_statistics, mesh_statistics,
+        splat_sigma, depth_temperature, splat_strength,
+    )
+    build_render_outputs(outputs, renderer)
     return keras.Model(
         {"rgb": rgb, "depth": depth, "object_mask": object_mask}, outputs,
         name="compact_rgbd_cage_mesh",
