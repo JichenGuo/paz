@@ -197,15 +197,20 @@ def main(argv=None):
     shape_names = tuple(normalization["shape_names"])
     material_definition = normalization.get("material_definition", {})
     max_depth = float(preprocessing.get("max_depth", 10.0))
+    y_fov = float(preprocessing.get("y_fov_degrees", 45.0))
+    floor_tolerance = float(
+        preprocessing.get("render_floor_tolerance_metres", 0.01)
+    )
     predictions = {}
     for shape, records in selected.items():
         predictions[shape] = []
         for sample_id, metadata in records:
-            rgb, _, normalized_depth = load_inputs(
-                metadata, dataset, max_depth
+            rgb, _, normalized_depth, object_mask = load_inputs(
+                metadata, dataset, max_depth, y_fov, floor_tolerance
             )
             raw = model.predict({
-                "rgb": rgb[None], "depth": normalized_depth[None]
+                "rgb": rgb[None], "depth": normalized_depth[None],
+                "object_mask": object_mask[None],
             }, verbose=0)
             vertices, _ = decode_prediction(
                 raw, statistics, mesh_statistics, shape_names,

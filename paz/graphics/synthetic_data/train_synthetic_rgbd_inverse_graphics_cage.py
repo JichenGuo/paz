@@ -139,7 +139,7 @@ class RepeatCageCoordinates(keras.layers.Layer):
 
 @keras.saving.register_keras_serializable(package="paz")
 class CameraGeometryChannels(keras.layers.Layer):
-    """Builds position-aware camera geometry channels from normalized depth.
+    """Builds pose-aligned geometry channels from object-only depth.
 
     The input depth is ``metric_depth / max_depth``. Consequently, the
     returned XYZ coordinates are camera-frame points in max-depth units. This
@@ -147,11 +147,14 @@ class CameraGeometryChannels(keras.layers.Layer):
     projective geometry.
     """
 
-    def __init__(self, height, width, y_fov_degrees, **kwargs):
+    def __init__(self, height, width, y_fov_degrees, max_depth,
+                 target_statistics, **kwargs):
         super().__init__(**kwargs)
         self.height = int(height)
         self.width = int(width)
         self.y_fov_degrees = float(y_fov_degrees)
+        self.max_depth = float(max_depth)
+        self.target_statistics = target_statistics
         y_fov = np.deg2rad(self.y_fov_degrees)
         aspect = self.width / self.height
         half_height = np.tan(y_fov / 2.0)
@@ -172,15 +175,38 @@ class CameraGeometryChannels(keras.layers.Layer):
         self.image_coordinates = np.stack([x_grid, y_grid], axis=-1)
         self.rays = rays.astype(np.float32)
 
-    def call(self, normalized_depth):
+    @staticmethod
+    def normalize(values, epsilon=1e-8):
+        length = keras.ops.sqrt(keras.ops.sum(
+            keras.ops.square(values), axis=-1, keepdims=True
+        ))
+        return values / keras.ops.maximum(length, epsilon)
+
+    def denormalize(self, values, name):
+        statistics = self.target_statistics[name]
+        mean = keras.ops.convert_to_tensor(
+            statistics["mean"], dtype=values.dtype
+        )
+        deviation = keras.ops.convert_to_tensor(
+            statistics["standard_deviation"], dtype=values.dtype
+        )
+        return values * deviation + mean
+
+    def call(self, inputs):
+        (normalized_depth, object_mask, translation_raw, orientation,
+         scale_raw) = inputs
         depth = keras.ops.image.resize(
             normalized_depth, (self.height, self.width),
             interpolation="bilinear",
         )
-        valid = keras.ops.image.resize(
+        valid_depth = keras.ops.image.resize(
             keras.ops.cast(normalized_depth > 0.0, normalized_depth.dtype),
             (self.height, self.width), interpolation="nearest",
         )
+        object_mask = keras.ops.image.resize(
+            object_mask, (self.height, self.width), interpolation="nearest"
+        )
+        valid = valid_depth * keras.ops.cast(object_mask > 0.5, depth.dtype)
         depth = depth * valid
         rays = keras.ops.convert_to_tensor(self.rays, dtype=depth.dtype)
         rays = keras.ops.broadcast_to(
@@ -196,13 +222,33 @@ class CameraGeometryChannels(keras.layers.Layer):
         ray_distance = depth / keras.ops.maximum(
             -rays[..., 2:3], 1e-6
         )
-        camera_points = rays * ray_distance * valid
+        camera_points = rays * ray_distance * valid * self.max_depth
+        translation = self.denormalize(
+            translation_raw, "object_translation"
+        )
+        scale = keras.ops.maximum(
+            self.denormalize(scale_raw, "object_scale"), 1e-3
+        )
+        first = self.normalize(orientation[..., :3])
+        second = orientation[..., 3:6]
+        second = second - keras.ops.sum(
+            first * second, axis=-1, keepdims=True
+        ) * first
+        second = self.normalize(second)
+        third = keras.ops.cross(first, second)
+        rotation = keras.ops.stack([first, second, third], axis=-1)
+        centered = camera_points - translation[:, None, None, :]
+        canonical_points = keras.ops.einsum(
+            "bhwi,bij->bhwj", centered, rotation
+        ) / scale[:, None, None, :]
+        canonical_points = canonical_points * valid
         return keras.ops.concatenate([
-            image_coordinates, rays, camera_points, depth, valid,
+            image_coordinates, rays, camera_points, canonical_points,
+            depth, valid,
         ], axis=-1)
 
     def compute_output_shape(self, input_shape):
-        return (input_shape[0], self.height, self.width, 10)
+        return (input_shape[0][0], self.height, self.width, 13)
 
     def get_config(self):
         config = super().get_config()
@@ -210,6 +256,8 @@ class CameraGeometryChannels(keras.layers.Layer):
             "height": self.height,
             "width": self.width,
             "y_fov_degrees": self.y_fov_degrees,
+            "max_depth": self.max_depth,
+            "target_statistics": self.target_statistics,
         })
         return config
 
@@ -710,9 +758,9 @@ def camera_ray_directions(height, width, y_fov_degrees):
     return directions / np.linalg.norm(directions, axis=-1, keepdims=True)
 
 
-def object_render_targets(record, rgb, depth, resolution, max_depth, y_fov,
-                          floor_tolerance):
-    """Builds object-only RGB, z-depth, and silhouette targets."""
+def object_foreground_mask(record, depth, max_depth, y_fov,
+                           floor_tolerance):
+    """Returns an object-only mask by rejecting invalid and floor points."""
     directions = camera_ray_directions(*depth.shape, y_fov)
     valid = np.isfinite(depth) & (depth > 0.0) & (depth <= max_depth)
     ray_distance = depth / np.maximum(-directions[..., 2], 1e-8)
@@ -723,7 +771,15 @@ def object_render_targets(record, rgb, depth, resolution, max_depth, y_fov,
     ], axis=-1)
     camera_to_world = np.linalg.inv(world_to_camera_matrix(record["camera"]))
     world_points = homogeneous @ camera_to_world.T
-    mask = valid & (world_points[..., 1] > floor_tolerance)
+    return valid & (world_points[..., 1] > floor_tolerance)
+
+
+def object_render_targets(record, rgb, depth, resolution, max_depth, y_fov,
+                          floor_tolerance):
+    """Builds object-only RGB, z-depth, and silhouette targets."""
+    mask = object_foreground_mask(
+        record, depth, max_depth, y_fov, floor_tolerance
+    )
     size = (resolution, resolution)
     rgb_small = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
     depth_small = cv2.resize(depth, size, interpolation=cv2.INTER_NEAREST)
@@ -781,7 +837,7 @@ class CompactCageDataset(keras.utils.PyDataset):
     def __getitem__(self, batch_index):
         begin = batch_index * self.batch_size
         indices = self.indices[begin:begin + self.batch_size]
-        rgb_images, depth_images, targets = [], [], []
+        rgb_images, depth_images, object_masks, targets = [], [], [], []
         rendered_rgb, rendered_depth, rendered_silhouette = [], [], []
         for index in indices:
             record = self.records[index]
@@ -797,6 +853,10 @@ class CompactCageDataset(keras.utils.PyDataset):
                 (depth <= self.max_depth), depth, 0.0,
             )
             depth_images.append((depth / self.max_depth)[..., None])
+            object_masks.append(object_foreground_mask(
+                record, depth, self.max_depth, self.y_fov,
+                self.floor_tolerance,
+            )[..., None].astype(np.float32))
             render_targets = object_render_targets(
                 record, rgb_images[-1], depth, self.render_resolution,
                 self.max_depth, self.y_fov, self.floor_tolerance,
@@ -810,6 +870,7 @@ class CompactCageDataset(keras.utils.PyDataset):
         inputs = {
             "rgb": np.stack(rgb_images),
             "depth": np.stack(depth_images),
+            "object_mask": np.stack(object_masks),
         }
         outputs = {
             name: np.stack([target[name] for target in targets])
@@ -1102,7 +1163,7 @@ class DifferentiableCageRenderer(keras.layers.Layer):
 def build_model(image_shape, num_shapes, coordinates, base_width,
                 l2_regularization, faces, render_resolution, y_fov,
                 target_statistics, mesh_statistics, splat_sigma,
-                depth_temperature, cage_vertices, mesh_weights,
+                depth_temperature, max_depth, cage_vertices, mesh_weights,
                 cage_maximum_offset=1.0, splat_strength=0.5):
     """Builds a compact physical-parameter and cage-deformation network."""
     if cage_vertices is None or mesh_weights is None:
@@ -1110,6 +1171,7 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
     regularizer = keras.regularizers.L2(l2_regularization)
     rgb = keras.Input((*image_shape, 3), name="rgb")
     depth = keras.Input((*image_shape, 1), name="depth")
+    object_mask = keras.Input((*image_shape, 1), name="object_mask")
     features, spatial_features = compact_encoder(
         rgb, depth, regularizer, base_width
     )
@@ -1160,9 +1222,13 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
         spatial_height = int(spatial_features.shape[1])
         spatial_width = int(spatial_features.shape[2])
         camera_geometry = CameraGeometryChannels(
-            spatial_height, spatial_width, y_fov,
+            spatial_height, spatial_width, y_fov, max_depth,
+            target_statistics,
             name="cage_camera_geometry_channels",
-        )(depth)
+        )([
+            depth, object_mask, outputs["object_translation"],
+            outputs["object_orientation_6d"], outputs["object_scale"],
+        ])
         spatial_features = keras.layers.Concatenate(
             name="cage_position_aware_features"
         )([spatial_features, camera_geometry])
@@ -1238,7 +1304,7 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
         "linear", name=RENDERED_SILHOUETTE_OUTPUT_NAME
     )(rendered[2])
     return keras.Model(
-        {"rgb": rgb, "depth": depth}, outputs,
+        {"rgb": rgb, "depth": depth, "object_mask": object_mask}, outputs,
         name="compact_rgbd_cage_mesh",
     )
 
@@ -1331,10 +1397,12 @@ def make_parser():
     parser.add_argument("--silhouette-reconstruction-weight", type=float,
                         default=0.1)
     parser.add_argument("--geometry-warmup-epochs", type=int, default=15,
-                        help="Geometry-only epochs before joint optimization.")
+                        help=("Geometry and pose-alignment epochs before "
+                              "joint optimization."))
     parser.add_argument(
         "--geometry-only", action="store_true",
-        help="Train only mesh and cage losses for --epochs epochs, then stop.",
+        help=("Train mesh, cage, translation, rotation, and scale for "
+              "--epochs epochs, then stop."),
     )
     parser.add_argument(
         "--overfit-sample-ids", nargs="+", default=None,
@@ -1447,8 +1515,13 @@ def main(argv=None):
                 "features augmented by pixel XY, camera rays, back-projected "
                 "camera XYZ, normalized depth, and a valid-depth mask"
             ),
-            "spatial_token_frame": "camera",
-            "spatial_point_units": "max-depth-normalized metric units",
+            "spatial_token_frame": "camera and predicted canonical",
+            "spatial_point_units": "metric units",
+            "canonical_alignment": (
+                "inverse predicted translation, SO(3) rotation, and metric "
+                "scale"
+            ),
+            "attention_mask": "object-only depth excluding floor",
             "template_subdivisions": args.template_subdivisions,
             "cage_subdivisions": args.cage_subdivisions,
             "template_radius": args.template_radius,
@@ -1508,7 +1581,7 @@ def main(argv=None):
         image_shape, len(shape_names), coordinates, args.base_width,
         args.l2_regularization, faces, args.render_resolution, args.y_fov,
         normalizer.statistics, mesh_statistics, args.splat_sigma,
-        args.depth_temperature, cage_vertices, mesh_weights,
+        args.depth_temperature, args.max_depth, cage_vertices, mesh_weights,
         args.cage_maximum_offset,
         args.splat_strength,
     )
@@ -1589,16 +1662,38 @@ def main(argv=None):
     warmup_epochs = (args.epochs if args.geometry_only else
                      args.geometry_warmup_epochs)
     if warmup_epochs:
-        geometry_names = [MESH_OUTPUT_NAME]
-        geometry_losses = {MESH_OUTPUT_NAME: mesh_loss}
-        geometry_weights = {MESH_OUTPUT_NAME: args.mesh_loss_weight}
+        geometry_names = [
+            MESH_OUTPUT_NAME, "object_translation",
+            "object_orientation_6d", "object_scale",
+        ]
+        vector_mse = keras.losses.MeanSquaredError()
+        geometry_losses = {
+            MESH_OUTPUT_NAME: mesh_loss,
+            "object_translation": vector_mse,
+            "object_orientation_6d": rotation_loss,
+            "object_scale": vector_mse,
+        }
+        geometry_weights = {
+            MESH_OUTPUT_NAME: args.mesh_loss_weight,
+            "object_translation": 1.0,
+            "object_orientation_6d": 1.0,
+            "object_scale": 1.0,
+        }
         geometry_metrics = {
             MESH_OUTPUT_NAME: [
                 keras.metrics.MeanMetricWrapper(mesh_loss, name="loss"),
                 keras.metrics.MeanMetricWrapper(
                     mesh_normal_error, name="surface_normal_error"
                 ),
-            ]
+            ],
+            "object_translation": [
+                keras.metrics.MeanSquaredError(name="loss")
+            ],
+            "object_orientation_6d": [
+                keras.metrics.MeanMetricWrapper(rotation_loss, name="loss"),
+                rotation_metric,
+            ],
+            "object_scale": [keras.metrics.MeanSquaredError(name="loss")],
         }
         geometry_names.append(CAGE_OUTPUT_NAME)
         geometry_losses[CAGE_OUTPUT_NAME] = cage_loss

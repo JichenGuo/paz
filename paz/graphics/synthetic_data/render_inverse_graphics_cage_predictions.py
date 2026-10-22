@@ -40,6 +40,7 @@ from paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_cage impo
     SilhouetteBCEDiceLoss,
     rotation_6d_to_matrix,
     camera_ray_directions,
+    object_foreground_mask,
 )
 from paz.graphics.synthetic_data.train_synthetic_rgbd_resnet18_mesh import (
     world_to_camera_matrix,
@@ -90,7 +91,8 @@ def denormalize(values, statistics):
             + np.asarray(statistics["mean"], np.float32))
 
 
-def load_inputs(metadata, dataset, max_depth):
+def load_inputs(metadata, dataset, max_depth, y_fov=45.0,
+                floor_tolerance=0.01):
     path = dataset / metadata["rgb"]
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None:
@@ -103,7 +105,10 @@ def load_inputs(metadata, dataset, max_depth):
         np.isfinite(depth) & (depth > 0.0) & (depth <= max_depth),
         depth, 0.0,
     )
-    return rgb, depth, (depth / max_depth)[..., None]
+    object_mask = object_foreground_mask(
+        metadata, depth, max_depth, y_fov, floor_tolerance
+    )[..., None].astype(np.float32)
+    return rgb, depth, (depth / max_depth)[..., None], object_mask
 
 
 def decode_prediction(raw, statistics, mesh_statistics, shape_names,
@@ -343,6 +348,9 @@ def main(argv=None):
     material_definition = normalization.get("material_definition", {})
     max_depth = float(preprocessing.get("max_depth", 10.0))
     y_fov = float(preprocessing.get("y_fov_degrees", 45.0))
+    floor_tolerance = float(
+        preprocessing.get("render_floor_tolerance_metres", 0.01)
+    )
     sample_ids = list(split["test"])
     if args.max_samples is not None:
         sample_ids = sample_ids[:args.max_samples]
@@ -360,12 +368,13 @@ def main(argv=None):
             metadata = load_json(
                 dataset / "metadata" / f"{sample_id}.json"
             )
-            target_rgb, target_depth, normalized_depth = load_inputs(
-                metadata, dataset, max_depth
+            target_rgb, target_depth, normalized_depth, object_mask = load_inputs(
+                metadata, dataset, max_depth, y_fov, floor_tolerance
             )
             start = time.perf_counter()
             raw = model.predict({
-                "rgb": target_rgb[None], "depth": normalized_depth[None]
+                "rgb": target_rgb[None], "depth": normalized_depth[None],
+                "object_mask": object_mask[None],
             }, verbose=0)
             jax.tree.map(jax.block_until_ready, raw)
             inference_ms = (time.perf_counter() - start) * 1000.0
