@@ -41,6 +41,10 @@ from paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_atlas imp
     RepeatAtlasCoordinates,
     SilhouetteBCEDiceLoss,
     rotation_6d_to_matrix,
+    camera_ray_directions,
+)
+from paz.graphics.synthetic_data.train_synthetic_rgbd_resnet18_mesh import (
+    world_to_camera_matrix,
 )
 from paz.graphics.synthetic_data.render_sdf_mesh_predictions import (
     evaluate_render,
@@ -217,6 +221,85 @@ def write_rgb(path, image):
     cv2.imwrite(str(path), bgr)
 
 
+def object_mask_from_depth(depth, camera, y_fov, floor_tolerance=0.01):
+    """Separates object pixels from the world-space floor using metric depth."""
+    directions = camera_ray_directions(*depth.shape, y_fov)
+    valid = np.isfinite(depth) & (depth > 0.0)
+    ray_distance = depth / np.maximum(-directions[..., 2], 1e-8)
+    camera_points = directions * ray_distance[..., None]
+    homogeneous = np.concatenate([
+        camera_points,
+        np.ones((*camera_points.shape[:2], 1), dtype=np.float64),
+    ], axis=-1)
+    camera_to_world = np.linalg.inv(world_to_camera_matrix(camera))
+    world = homogeneous @ camera_to_world.T
+    return valid & (world[..., 1] > floor_tolerance)
+
+
+def object_render_metrics(target_rgb, rendered_rgb, target_depth,
+                          rendered_depth, camera, y_fov,
+                          floor_tolerance=0.01):
+    target_mask = object_mask_from_depth(
+        target_depth, camera, y_fov, floor_tolerance
+    )
+    predicted_mask = object_mask_from_depth(
+        rendered_depth, camera, y_fov, floor_tolerance
+    )
+    intersection = target_mask & predicted_mask
+    union = target_mask | predicted_mask
+    metrics = {
+        "object_silhouette_iou": float(
+            intersection.sum() / max(union.sum(), 1)
+        ),
+        "object_silhouette_recall": float(
+            intersection.sum() / max(target_mask.sum(), 1)
+        ),
+        "object_silhouette_precision": float(
+            intersection.sum() / max(predicted_mask.sum(), 1)
+        ),
+    }
+    if np.any(union):
+        metrics["object_union_rgb_mae_0_1"] = float(np.mean(np.abs(
+            rendered_rgb[union] - target_rgb[union]
+        )))
+    else:
+        metrics["object_union_rgb_mae_0_1"] = float("nan")
+    if np.any(intersection):
+        difference = rendered_depth[intersection] - target_depth[intersection]
+        metrics["object_intersection_depth_mae_m"] = float(
+            np.mean(np.abs(difference))
+        )
+        metrics["object_intersection_depth_rmse_m"] = float(
+            np.sqrt(np.mean(np.square(difference)))
+        )
+    else:
+        metrics["object_intersection_depth_mae_m"] = float("nan")
+        metrics["object_intersection_depth_rmse_m"] = float("nan")
+    return metrics
+
+
+def mesh_validity_metrics(vertices, faces, prefix):
+    """Reports degeneracy and winding proxies for a spherical topology."""
+    triangles = np.asarray(vertices)[np.asarray(faces, np.int32)]
+    cross = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    areas = 0.5 * np.linalg.norm(cross, axis=-1)
+    center = np.mean(vertices, axis=0)
+    signed = np.sum(cross * (np.mean(triangles, axis=1) - center), axis=-1)
+    volume = np.sum(np.einsum(
+        "ij,ij->i", triangles[:, 0],
+        np.cross(triangles[:, 1], triangles[:, 2]),
+    )) / 6.0
+    return {
+        f"{prefix}_minimum_face_area": float(np.min(areas)),
+        f"{prefix}_degenerate_face_fraction": float(np.mean(areas < 1e-6)),
+        f"{prefix}_reversed_face_fraction": float(np.mean(signed <= 0.0)),
+        f"{prefix}_signed_volume": float(volume),
+    }
+
+
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
@@ -313,6 +396,17 @@ def main(argv=None):
             canonical_mesh = trimesh.Trimesh(
                 canonical_vertices, faces, process=False
             )
+            validity = mesh_validity_metrics(
+                canonical_vertices, faces, "mesh"
+            )
+            predicted_cage_vertices = None
+            if geometry_representation == "cage":
+                predicted_cage_vertices = decode_cage_vertices(
+                    raw, topology, preprocessing
+                )
+                validity.update(mesh_validity_metrics(
+                    predicted_cage_vertices, topology["cage_faces"], "cage"
+                ))
             render_start = time.perf_counter()
             rendered_rgb, rendered_depth, object_to_camera, object_to_world, \
                 light_world = render(
@@ -332,6 +426,14 @@ def main(argv=None):
             metrics = evaluate_render(
                 rendered_rgb, target_rgb, rendered_depth, target_depth
             )
+            metrics.update(object_render_metrics(
+                target_rgb, rendered_rgb, target_depth, rendered_depth,
+                metadata["camera"], y_fov,
+                float(preprocessing.get(
+                    "render_floor_tolerance_metres", 0.01
+                )),
+            ))
+            metrics.update(validity)
             metrics.update({
                 "model_inference_time_ms": inference_ms,
                 "render_time_ms": render_ms,
@@ -349,12 +451,9 @@ def main(argv=None):
             world_mesh.export(output / "world_meshes" / f"{sample_id}.ply")
             cage_paths = None
             if geometry_representation == "cage":
-                cage_vertices = decode_cage_vertices(
-                    raw, topology, preprocessing
-                )
                 cage_faces = np.asarray(topology["cage_faces"], np.int32)
                 canonical_cage = trimesh.Trimesh(
-                    cage_vertices, cage_faces, process=False
+                    predicted_cage_vertices, cage_faces, process=False
                 )
                 camera_cage = canonical_cage.copy()
                 camera_cage.apply_transform(object_to_camera)

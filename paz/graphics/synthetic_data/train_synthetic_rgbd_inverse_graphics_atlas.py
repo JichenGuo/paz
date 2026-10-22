@@ -50,6 +50,8 @@ from paz.graphics.synthetic_data.train_synthetic_rgb_resnet18 import (
 from paz.graphics.synthetic_data.train_synthetic_rgbd_cnn import (
     export_test_split,
     load_records,
+    symmetry_geodesic_angle_degrees,
+    symmetry_rotation_loss,
 )
 from paz.graphics.synthetic_data.train_synthetic_rgbd_resnet18_mesh import (
     load_camera_mesh_points,
@@ -66,6 +68,7 @@ from paz.graphics.synthetic_data.train_synthetic_rgbd_resnet18_sdf import (
 
 
 ATLAS_OUTPUT_NAME = "atlas_vertices"
+CAGE_OUTPUT_NAME = "cage_vertices"
 RENDERED_RGB_OUTPUT_NAME = "rendered_rgb"
 RENDERED_DEPTH_OUTPUT_NAME = "rendered_depth"
 RENDERED_SILHOUETTE_OUTPUT_NAME = "rendered_silhouette"
@@ -169,10 +172,15 @@ class CageMeshDeformation(keras.layers.Layer):
     """Maps bounded cage offsets to a dense mesh using fixed MVC weights."""
 
     def __init__(self, cage_vertices, mesh_weights, mesh_mean, mesh_deviation,
-                 maximum_offset=1.0, **kwargs):
+                 maximum_offset=1.0, reference_vertices=None, **kwargs):
         super().__init__(**kwargs)
         self.cage_vertices = np.asarray(cage_vertices, dtype=np.float32)
         self.mesh_weights = np.asarray(mesh_weights, dtype=np.float32)
+        if reference_vertices is None:
+            reference_vertices = self.mesh_weights @ self.cage_vertices
+        self.reference_vertices = np.asarray(
+            reference_vertices, dtype=np.float32
+        )
         self.mesh_mean = np.asarray(mesh_mean, dtype=np.float32)
         self.mesh_deviation = np.asarray(mesh_deviation, dtype=np.float32)
         self.maximum_offset = float(maximum_offset)
@@ -189,21 +197,30 @@ class CageMeshDeformation(keras.layers.Layer):
         weights = keras.ops.convert_to_tensor(
             self.mesh_weights, dtype=raw_offsets.dtype
         )
-        vertices = keras.ops.einsum("vc,bcd->bvd", weights, cage)
+        reference = keras.ops.convert_to_tensor(
+            self.reference_vertices, dtype=raw_offsets.dtype
+        )
+        # Residual form guarantees exact identity at zero offsets. It is
+        # algebraically equivalent to W @ (C0 + dC) only when W @ C0 == V0.
+        vertices = reference[None] + keras.ops.einsum(
+            "vc,bcd->bvd", weights, offsets
+        )
         mean = keras.ops.convert_to_tensor(
             self.mesh_mean, dtype=raw_offsets.dtype
         )
         deviation = keras.ops.convert_to_tensor(
             self.mesh_deviation, dtype=raw_offsets.dtype
         )
-        return (vertices - mean) / deviation
+        return (vertices - mean) / deviation, cage
 
     def compute_output_shape(self, input_shape):
-        return (input_shape[0], len(self.mesh_weights), 3)
+        return ((input_shape[0], len(self.mesh_weights), 3),
+                (input_shape[0], len(self.cage_vertices), 3))
 
     def get_config(self):
         config = super().get_config()
         config.update({
+            "reference_vertices": self.reference_vertices.tolist(),
             "cage_vertices": self.cage_vertices.tolist(),
             "mesh_weights": self.mesh_weights.tolist(),
             "mesh_mean": self.mesh_mean.tolist(),
@@ -214,31 +231,161 @@ class CageMeshDeformation(keras.layers.Layer):
 
 
 @keras.saving.register_keras_serializable(package="paz")
-class PhysicalAtlasLoss(keras.losses.Loss):
-    """Physical Chamfer distance plus inexpensive triangle regularization."""
+class CageValidityLoss(keras.losses.Loss):
+    """Keeps a predicted cage close, non-collapsed, and consistently wound."""
 
-    def __init__(self, standard_deviation, edges,
+    def __init__(self, faces, edges, offset_weight=0.1,
+                 edge_weight=0.2, orientation_weight=1.0,
+                 area_weight=0.5, volume_weight=0.1,
+                 minimum_area_ratio=0.15, orientation_margin=0.05,
+                 name="cage_validity", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.faces = np.asarray(faces, np.int32)
+        self.edges = np.asarray(edges, np.int32)
+        self.offset_weight = float(offset_weight)
+        self.edge_weight = float(edge_weight)
+        self.orientation_weight = float(orientation_weight)
+        self.area_weight = float(area_weight)
+        self.volume_weight = float(volume_weight)
+        self.minimum_area_ratio = float(minimum_area_ratio)
+        self.orientation_margin = float(orientation_margin)
+
+    @staticmethod
+    def cross(first, second):
+        return keras.ops.stack([
+            first[..., 1] * second[..., 2]
+            - first[..., 2] * second[..., 1],
+            first[..., 2] * second[..., 0]
+            - first[..., 0] * second[..., 2],
+            first[..., 0] * second[..., 1]
+            - first[..., 1] * second[..., 0],
+        ], axis=-1)
+
+    def call(self, target, prediction):
+        faces = keras.ops.convert_to_tensor(self.faces, dtype="int32")
+        edges = keras.ops.convert_to_tensor(self.edges, dtype="int32")
+        offset = keras.ops.mean(keras.ops.square(prediction - target),
+                                axis=(1, 2))
+        first = keras.ops.take(prediction, edges[:, 0], axis=1)
+        second = keras.ops.take(prediction, edges[:, 1], axis=1)
+        target_first = keras.ops.take(target, edges[:, 0], axis=1)
+        target_second = keras.ops.take(target, edges[:, 1], axis=1)
+        length = keras.ops.sqrt(keras.ops.sum(
+            keras.ops.square(first - second), axis=-1) + 1e-8)
+        target_length = keras.ops.sqrt(keras.ops.sum(
+            keras.ops.square(target_first - target_second), axis=-1) + 1e-8)
+        edge = keras.ops.mean(keras.ops.square(
+            length / keras.ops.maximum(target_length, 1e-6) - 1.0
+        ), axis=1)
+
+        triangle = keras.ops.take(prediction, faces, axis=1)
+        target_triangle = keras.ops.take(target, faces, axis=1)
+        cross = self.cross(
+            triangle[:, :, 1] - triangle[:, :, 0],
+            triangle[:, :, 2] - triangle[:, :, 0],
+        )
+        target_cross = self.cross(
+            target_triangle[:, :, 1] - target_triangle[:, :, 0],
+            target_triangle[:, :, 2] - target_triangle[:, :, 0],
+        )
+        area = keras.ops.sqrt(keras.ops.sum(
+            keras.ops.square(cross), axis=-1) + 1e-8)
+        target_area = keras.ops.sqrt(keras.ops.sum(
+            keras.ops.square(target_cross), axis=-1) + 1e-8)
+        area_ratio = area / keras.ops.maximum(target_area, 1e-6)
+        area_barrier = keras.ops.mean(keras.ops.square(keras.ops.maximum(
+            self.minimum_area_ratio - area_ratio, 0.0
+        )), axis=1)
+        center = keras.ops.mean(prediction, axis=1, keepdims=True)
+        face_center = keras.ops.mean(triangle, axis=2)
+        target_center = keras.ops.mean(target, axis=1, keepdims=True)
+        target_face_center = keras.ops.mean(target_triangle, axis=2)
+        signed = keras.ops.sum(cross * (face_center - center), axis=-1)
+        target_signed = keras.ops.sum(
+            target_cross * (target_face_center - target_center), axis=-1
+        )
+        signed_ratio = signed / keras.ops.maximum(
+            keras.ops.abs(target_signed), 1e-6
+        )
+        orientation = keras.ops.mean(keras.ops.square(keras.ops.maximum(
+            self.orientation_margin - signed_ratio, 0.0
+        )), axis=1)
+        volume = keras.ops.sum(keras.ops.sum(
+            triangle[:, :, 0] * self.cross(
+                triangle[:, :, 1], triangle[:, :, 2]
+            ), axis=-1
+        ), axis=1) / 6.0
+        target_volume = keras.ops.sum(keras.ops.sum(
+            target_triangle[:, :, 0] * self.cross(
+                target_triangle[:, :, 1], target_triangle[:, :, 2]
+            ), axis=-1
+        ), axis=1) / 6.0
+        volume = keras.ops.square(
+            volume / keras.ops.maximum(keras.ops.abs(target_volume), 1e-6)
+            - keras.ops.sign(target_volume)
+        )
+        return (self.offset_weight * offset + self.edge_weight * edge
+                + self.orientation_weight * orientation
+                + self.area_weight * area_barrier
+                + self.volume_weight * volume)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "faces": self.faces.tolist(), "edges": self.edges.tolist(),
+            "offset_weight": self.offset_weight,
+            "edge_weight": self.edge_weight,
+            "orientation_weight": self.orientation_weight,
+            "area_weight": self.area_weight,
+            "volume_weight": self.volume_weight,
+            "minimum_area_ratio": self.minimum_area_ratio,
+            "orientation_margin": self.orientation_margin,
+        })
+        return config
+
+
+@keras.saving.register_keras_serializable(package="paz")
+class PhysicalAtlasLoss(keras.losses.Loss):
+    """Triangle-surface Chamfer plus inexpensive edge regularization."""
+
+    def __init__(self, standard_deviation, faces, edges,
                  edge_uniformity_weight=0.02,
-                 name="physical_atlas_chamfer_m2", **kwargs):
+                 name="physical_surface_chamfer_m2", **kwargs):
         super().__init__(name=name, **kwargs)
         self.standard_deviation = tuple(float(x) for x in standard_deviation)
+        self.faces = np.asarray(faces, dtype=np.int32)
         self.edges = np.asarray(edges, dtype=np.int32)
         self.edge_uniformity_weight = float(edge_uniformity_weight)
+        # Fixed deterministic samples cover triangle interiors, unlike a loss
+        # on template vertices alone. The centroid and three inset corners
+        # avoid duplicating samples along shared edges.
+        self.barycentrics = np.asarray([
+            [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+            [0.6, 0.2, 0.2], [0.2, 0.6, 0.2], [0.2, 0.2, 0.6],
+        ], dtype=np.float32)
 
     def call(self, target, prediction):
         scale = keras.ops.convert_to_tensor(
             self.standard_deviation, dtype=prediction.dtype
         )
-        differences = (
-            prediction[:, :, None, :] - target[:, None, :, :]
-        ) * scale
+        physical = prediction * scale
+        target_physical = target * scale
+        faces = keras.ops.convert_to_tensor(self.faces, dtype="int32")
+        triangles = keras.ops.take(physical, faces, axis=1)
+        barycentrics = keras.ops.convert_to_tensor(
+            self.barycentrics, dtype=prediction.dtype
+        )
+        surface = keras.ops.einsum("sk,bfkd->bfsd", barycentrics, triangles)
+        surface = keras.ops.reshape(
+            surface, (-1, len(self.faces) * len(self.barycentrics), 3)
+        )
+        differences = surface[:, :, None, :] - target_physical[:, None, :, :]
         squared = keras.ops.sum(keras.ops.square(differences), axis=-1)
         chamfer = 0.5 * (
             keras.ops.mean(keras.ops.min(squared, axis=2), axis=1)
             + keras.ops.mean(keras.ops.min(squared, axis=1), axis=1)
         )
         edge_indices = keras.ops.convert_to_tensor(self.edges, dtype="int32")
-        physical = prediction * scale
         first = keras.ops.take(physical, edge_indices[:, 0], axis=1)
         second = keras.ops.take(physical, edge_indices[:, 1], axis=1)
         lengths = keras.ops.sqrt(
@@ -254,6 +401,7 @@ class PhysicalAtlasLoss(keras.losses.Loss):
         config = super().get_config()
         config.update({
             "standard_deviation": self.standard_deviation,
+            "faces": self.faces.tolist(),
             "edges": self.edges.tolist(),
             "edge_uniformity_weight": self.edge_uniformity_weight,
         })
@@ -396,8 +544,9 @@ class CompactAtlasDataset(keras.utils.PyDataset):
     """Loads normalized RGB-D and arbitrary-mesh surface supervision."""
 
     def __init__(self, records, normalizer, shape_names, batch_size,
-                 max_depth, num_vertices, mesh_statistics,
+                 max_depth, num_mesh_points, mesh_statistics,
                  render_resolution, y_fov, floor_tolerance,
+                 reference_cage=None,
                  shuffle=False, seed=0):
         super().__init__()
         self.records = list(records)
@@ -412,11 +561,13 @@ class CompactAtlasDataset(keras.utils.PyDataset):
         self.render_resolution = int(render_resolution)
         self.y_fov = float(y_fov)
         self.floor_tolerance = float(floor_tolerance)
+        self.reference_cage = (None if reference_cage is None else
+                               np.asarray(reference_cage, np.float32))
         self.shuffle = shuffle
         self.rng = np.random.default_rng(seed)
         self.indices = np.arange(len(records))
         self.mesh_targets = np.stack([
-            load_canonical_mesh_points(record, num_vertices)
+            load_canonical_mesh_points(record, num_mesh_points)
             for record in self.records
         ])
         self.on_epoch_end()
@@ -465,6 +616,11 @@ class CompactAtlasDataset(keras.utils.PyDataset):
         outputs[ATLAS_OUTPUT_NAME] = (
             vertices - self.mesh_mean
         ) / self.mesh_std
+        if self.reference_cage is not None:
+            outputs[CAGE_OUTPUT_NAME] = np.broadcast_to(
+                self.reference_cage,
+                (len(indices),) + self.reference_cage.shape,
+            ).copy()
         outputs[RENDERED_RGB_OUTPUT_NAME] = np.stack(rendered_rgb)
         outputs[RENDERED_DEPTH_OUTPUT_NAME] = np.stack(rendered_depth)
         outputs[RENDERED_SILHOUETTE_OUTPUT_NAME] = np.stack(
@@ -584,11 +740,36 @@ class DifferentiableAtlasRenderer(keras.layers.Layer):
         triangle_first = keras.ops.take(vertices, faces[:, 0], axis=1)
         triangle_second = keras.ops.take(vertices, faces[:, 1], axis=1)
         triangle_third = keras.ops.take(vertices, faces[:, 2], axis=1)
-        samples = (triangle_first + triangle_second + triangle_third) / 3.0
-        normals = self.normalize(self.cross(
+        triangles = keras.ops.stack(
+            [triangle_first, triangle_second, triangle_third], axis=2
+        )
+        barycentrics = keras.ops.convert_to_tensor(np.asarray([
+            [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+            [0.6, 0.2, 0.2], [0.2, 0.6, 0.2], [0.2, 0.2, 0.6],
+        ], np.float32), dtype=vertices.dtype)
+        samples = keras.ops.einsum(
+            "sk,bfkd->bfsd", barycentrics, triangles
+        )
+        samples_per_face = 4
+        samples = keras.ops.reshape(
+            samples, (-1, len(self.faces) * samples_per_face, 3)
+        )
+        face_cross = self.cross(
             triangle_second - triangle_first,
             triangle_third - triangle_first,
-        ))
+        )
+        face_area = 0.5 * keras.ops.sqrt(keras.ops.sum(
+            keras.ops.square(face_cross), axis=-1
+        ) + 1e-8)
+        normals = self.normalize(face_cross)
+        normals = keras.ops.repeat(normals, samples_per_face, axis=1)
+        area_weight = face_area / keras.ops.maximum(
+            keras.ops.mean(face_area, axis=1, keepdims=True), 1e-8
+        )
+        area_weight = keras.ops.clip(area_weight, 0.25, 4.0)
+        area_weight = keras.ops.repeat(
+            area_weight, samples_per_face, axis=1
+        )
 
         material = self.denormalize(material_raw, "material")
         color = keras.ops.clip(material[..., :3], 0.0, 1.0)
@@ -608,14 +789,13 @@ class DifferentiableAtlasRenderer(keras.layers.Layer):
         )
         view_direction = self.normalize(-samples)
         half_direction = self.normalize(light_direction + view_direction)
-        # Atlas patches may learn either winding, so use two-sided shading.
-        lambert = keras.ops.abs(keras.ops.sum(
+        lambert = keras.ops.maximum(keras.ops.sum(
             normals * light_direction, axis=-1, keepdims=True
-        ))
+        ), 0.0)
         highlight = keras.ops.power(
-            keras.ops.clip(keras.ops.abs(keras.ops.sum(
+            keras.ops.clip(keras.ops.sum(
                 normals * half_direction, axis=-1, keepdims=True
-            )), 0.0, 1.0),
+            ), 0.0, 1.0),
             shininess[:, None, :],
         )
         sample_colors = keras.ops.clip(
@@ -649,7 +829,8 @@ class DifferentiableAtlasRenderer(keras.layers.Layer):
         ), axis=-1)
         gaussian = keras.ops.exp(
             -squared_pixel_distance / (2.0 * self.splat_sigma ** 2)
-        ) * keras.ops.cast(valid[..., None], projected.dtype)
+        ) * keras.ops.cast(valid[..., None], projected.dtype) \
+            * area_weight[..., None]
         silhouette = 1.0 - keras.ops.exp(
             -self.splat_strength * keras.ops.sum(
                 gaussian, axis=1, keepdims=False
@@ -762,11 +943,18 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
             bias_initializer="zeros", kernel_regularizer=regularizer,
             name="cage_vertex_offsets",
         )(cage_feature)
-        outputs[ATLAS_OUTPUT_NAME] = CageMeshDeformation(
+        deformed_mesh, deformed_cage = CageMeshDeformation(
             cage_vertices, mesh_weights, mesh_statistics["mean"],
             mesh_statistics["standard_deviation"], cage_maximum_offset,
-            name=ATLAS_OUTPUT_NAME,
+            reference_vertices=coordinates,
+            name="cage_deformation",
         )(raw_offsets)
+        outputs[ATLAS_OUTPUT_NAME] = keras.layers.Activation(
+            "linear", name=ATLAS_OUTPUT_NAME
+        )(deformed_mesh)
+        outputs[CAGE_OUTPUT_NAME] = keras.layers.Activation(
+            "linear", name=CAGE_OUTPUT_NAME
+        )(deformed_cage)
     else:
         raise ValueError(
             f"unknown geometry representation: {geometry_representation}"
@@ -864,9 +1052,16 @@ def make_parser():
     parser.add_argument("--cage-subdivisions", type=int, default=1)
     parser.add_argument("--template-radius", type=float, default=1.0)
     parser.add_argument("--cage-radius", type=float, default=1.25)
-    parser.add_argument("--cage-maximum-offset", type=float, default=1.0)
+    parser.add_argument("--cage-maximum-offset", type=float, default=0.65)
+    parser.add_argument("--cage-validity-weight", type=float, default=1.0)
+    parser.add_argument("--cage-offset-weight", type=float, default=0.1)
+    parser.add_argument("--cage-edge-weight", type=float, default=0.2)
+    parser.add_argument("--cage-orientation-weight", type=float, default=1.0)
+    parser.add_argument("--cage-area-weight", type=float, default=0.5)
+    parser.add_argument("--cage-volume-weight", type=float, default=0.1)
     parser.add_argument("--base-width", type=int, default=16)
     parser.add_argument("--mesh-loss-weight", type=float, default=2.0)
+    parser.add_argument("--mesh-target-points", type=int, default=1024)
     parser.add_argument("--edge-uniformity-weight", type=float, default=0.02)
     parser.add_argument("--render-resolution", type=int, default=32)
     parser.add_argument("--y-fov", type=float, default=45.0)
@@ -894,7 +1089,8 @@ def main(argv=None):
     args = make_parser().parse_args(argv)
     positive = (
         args.num_patches, args.patch_resolution, args.base_width,
-        args.mesh_loss_weight, args.batch_size, args.epochs, args.max_depth,
+        args.mesh_loss_weight, args.mesh_target_points, args.batch_size,
+        args.epochs, args.max_depth,
         args.checkpoint_every, args.render_resolution, args.y_fov,
         args.splat_sigma, args.depth_temperature, args.template_radius,
         args.cage_radius, args.cage_maximum_offset,
@@ -907,6 +1103,13 @@ def main(argv=None):
         raise ValueError("subdivision counts cannot be negative")
     if args.edge_uniformity_weight < 0.0:
         raise ValueError("--edge-uniformity-weight cannot be negative")
+    cage_weights = (
+        args.cage_validity_weight, args.cage_offset_weight,
+        args.cage_edge_weight, args.cage_orientation_weight,
+        args.cage_area_weight, args.cage_volume_weight,
+    )
+    if min(cage_weights) < 0.0:
+        raise ValueError("cage loss weights cannot be negative")
     reconstruction_weights = (
         args.rgb_reconstruction_weight, args.depth_reconstruction_weight,
         args.silhouette_reconstruction_weight,
@@ -946,7 +1149,7 @@ def main(argv=None):
     num_vertices = len(coordinates)
     normalizer = GenericTargetNormalizer.fit(training_records, shape_names)
     mesh_statistics = fit_canonical_statistics(
-        training_records, num_vertices
+        training_records, args.mesh_target_points
     )
     normalizer.statistics[ATLAS_OUTPUT_NAME] = mesh_statistics
     normalizer.save(args.output / "normalization.json")
@@ -978,12 +1181,16 @@ def main(argv=None):
             "template_radius": args.template_radius,
             "cage_radius": args.cage_radius,
             "cage_maximum_offset": args.cage_maximum_offset,
+            "cage_validity_weight": args.cage_validity_weight,
             "num_vertices": num_vertices,
             "num_faces": len(faces),
+            "mesh_target_points": args.mesh_target_points,
             "max_depth": args.max_depth,
             "y_fov_degrees": args.y_fov,
             "training_render_resolution": args.render_resolution,
-            "differentiable_renderer": "soft shaded triangle-centroid splats",
+            "differentiable_renderer": (
+                "soft shaded four-samples-per-triangle splats"
+            ),
             "render_floor_tolerance_metres": args.render_floor_tolerance,
             "splat_sigma_pixels": args.splat_sigma,
             "depth_temperature_metres": args.depth_temperature,
@@ -1004,11 +1211,12 @@ def main(argv=None):
         "shape_names": shape_names,
         "batch_size": args.batch_size,
         "max_depth": args.max_depth,
-        "num_vertices": num_vertices,
+        "num_mesh_points": args.mesh_target_points,
         "mesh_statistics": mesh_statistics,
         "render_resolution": args.render_resolution,
         "y_fov": args.y_fov,
         "floor_tolerance": args.render_floor_tolerance,
+        "reference_cage": cage_vertices,
     }
     training = CompactAtlasDataset(
         training_records, shuffle=True, seed=args.seed, **common
@@ -1028,7 +1236,7 @@ def main(argv=None):
         cage_vertices, mesh_weights, args.cage_maximum_offset,
     )
     atlas_loss = PhysicalAtlasLoss(
-        mesh_statistics["standard_deviation"], edges,
+        mesh_statistics["standard_deviation"], faces, edges,
         args.edge_uniformity_weight,
     )
     rgb_loss = MaskedReconstructionHuber(
@@ -1038,50 +1246,71 @@ def main(argv=None):
         delta=0.1, name="rendered_metric_depth_masked_huber"
     )
     silhouette_loss = SilhouetteBCEDiceLoss()
+    primitive_symmetries = shape_names == ("cube", "cylinder", "sphere")
+    rotation_loss = (symmetry_rotation_loss if primitive_symmetries else
+                     generic_rotation_loss)
+    rotation_metric = (symmetry_geodesic_angle_degrees
+                       if primitive_symmetries else
+                       generic_geodesic_angle_degrees)
+    extra_losses = {
+        "object_orientation_6d": rotation_loss,
+        ATLAS_OUTPUT_NAME: atlas_loss,
+        RENDERED_RGB_OUTPUT_NAME: rgb_loss,
+        RENDERED_DEPTH_OUTPUT_NAME: depth_loss,
+        RENDERED_SILHOUETTE_OUTPUT_NAME: silhouette_loss,
+    }
+    extra_metrics = {
+        "object_orientation_6d": [rotation_metric],
+        ATLAS_OUTPUT_NAME: [
+            keras.metrics.MeanMetricWrapper(atlas_loss, name="loss")
+        ],
+        RENDERED_RGB_OUTPUT_NAME: [
+            keras.metrics.MeanMetricWrapper(rgb_loss, name="loss"),
+            keras.metrics.MeanAbsoluteError(name="mae_0_1"),
+        ],
+        RENDERED_DEPTH_OUTPUT_NAME: [
+            keras.metrics.MeanMetricWrapper(depth_loss, name="loss"),
+            keras.metrics.MeanAbsoluteError(name="mae_m"),
+        ],
+        RENDERED_SILHOUETTE_OUTPUT_NAME: [
+            keras.metrics.MeanMetricWrapper(silhouette_loss, name="loss"),
+            keras.metrics.BinaryIoU(
+                target_class_ids=(1,), threshold=0.5, name="iou"
+            ),
+        ],
+    }
+    extra_loss_weights = {
+        ATLAS_OUTPUT_NAME: args.mesh_loss_weight,
+        RENDERED_RGB_OUTPUT_NAME: args.rgb_reconstruction_weight,
+        RENDERED_DEPTH_OUTPUT_NAME: args.depth_reconstruction_weight,
+        RENDERED_SILHOUETTE_OUTPUT_NAME: (
+            args.silhouette_reconstruction_weight
+        ),
+    }
+    if args.geometry_representation == "cage":
+        cage_loss = CageValidityLoss(
+            cage_faces, mesh_edges(cage_faces),
+            offset_weight=args.cage_offset_weight,
+            edge_weight=args.cage_edge_weight,
+            orientation_weight=args.cage_orientation_weight,
+            area_weight=args.cage_area_weight,
+            volume_weight=args.cage_volume_weight,
+        )
+        extra_losses[CAGE_OUTPUT_NAME] = cage_loss
+        extra_metrics[CAGE_OUTPUT_NAME] = [
+            keras.metrics.MeanMetricWrapper(cage_loss, name="loss")
+        ]
+        extra_loss_weights[CAGE_OUTPUT_NAME] = args.cage_validity_weight
     compile_model(
         model, args.learning_rate, args.weight_decay, normalizer.statistics,
-        extra_losses={
-            "object_orientation_6d": generic_rotation_loss,
-            ATLAS_OUTPUT_NAME: atlas_loss,
-            RENDERED_RGB_OUTPUT_NAME: rgb_loss,
-            RENDERED_DEPTH_OUTPUT_NAME: depth_loss,
-            RENDERED_SILHOUETTE_OUTPUT_NAME: silhouette_loss,
-        },
-        extra_metrics={
-            "object_orientation_6d": [generic_geodesic_angle_degrees],
-            ATLAS_OUTPUT_NAME: [
-                keras.metrics.MeanMetricWrapper(atlas_loss, name="loss")
-            ],
-            RENDERED_RGB_OUTPUT_NAME: [
-                keras.metrics.MeanMetricWrapper(rgb_loss, name="loss"),
-                keras.metrics.MeanAbsoluteError(name="mae_0_1"),
-            ],
-            RENDERED_DEPTH_OUTPUT_NAME: [
-                keras.metrics.MeanMetricWrapper(depth_loss, name="loss"),
-                keras.metrics.MeanAbsoluteError(name="mae_m"),
-            ],
-            RENDERED_SILHOUETTE_OUTPUT_NAME: [
-                keras.metrics.MeanMetricWrapper(
-                    silhouette_loss, name="loss"
-                ),
-                keras.metrics.BinaryIoU(
-                    target_class_ids=(1,), threshold=0.5, name="iou"
-                ),
-            ],
-        },
-        extra_loss_weights={
-            ATLAS_OUTPUT_NAME: args.mesh_loss_weight,
-            RENDERED_RGB_OUTPUT_NAME: args.rgb_reconstruction_weight,
-            RENDERED_DEPTH_OUTPUT_NAME: args.depth_reconstruction_weight,
-            RENDERED_SILHOUETTE_OUTPUT_NAME: (
-                args.silhouette_reconstruction_weight
-            ),
-        },
+        extra_losses=extra_losses, extra_metrics=extra_metrics,
+        extra_loss_weights=extra_loss_weights,
     )
     callbacks = [
         keras.callbacks.CSVLogger(args.output / "training.csv"),
         TrainingPlot(
-            args.output / "loss.png", OUTPUT_NAMES + (
+            args.output / "loss.png", OUTPUT_NAMES + ((CAGE_OUTPUT_NAME,)
+                if args.geometry_representation == "cage" else ()) + (
                 ATLAS_OUTPUT_NAME, RENDERED_RGB_OUTPUT_NAME,
                 RENDERED_DEPTH_OUTPUT_NAME,
                 RENDERED_SILHOUETTE_OUTPUT_NAME,
