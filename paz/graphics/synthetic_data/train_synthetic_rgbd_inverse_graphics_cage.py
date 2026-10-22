@@ -26,6 +26,7 @@ os.environ.setdefault("KERAS_BACKEND", "jax")
 import argparse
 import json
 import shutil
+from collections import namedtuple
 from pathlib import Path
 
 import cv2
@@ -70,6 +71,33 @@ CAGE_OUTPUT_NAME = "cage_vertices"
 RENDERED_RGB_OUTPUT_NAME = "rendered_rgb"
 RENDERED_DEPTH_OUTPUT_NAME = "rendered_depth"
 RENDERED_SILHOUETTE_OUTPUT_NAME = "rendered_silhouette"
+Objectives = namedtuple("Objectives", [
+    "mesh", "mesh_normal", "rotation", "rotation_metric", "cage",
+    "losses", "metrics", "weights",
+])
+
+
+def normalize_tensor(values, epsilon=1e-8):
+    squared = keras.ops.sum(keras.ops.square(values), axis=-1, keepdims=True)
+    return values / keras.ops.maximum(keras.ops.sqrt(squared), epsilon)
+
+
+def rotation_6d_to_matrix_ops(values):
+    first = normalize_tensor(values[..., :3])
+    second = values[..., 3:6]
+    projection = keras.ops.sum(first * second, axis=-1, keepdims=True)
+    second = normalize_tensor(second - projection * first)
+    third = keras.ops.cross(first, second)
+    return keras.ops.stack([first, second, third], axis=-1)
+
+
+def denormalize_tensor(values, statistics, name):
+    target = statistics[name]
+    mean = keras.ops.convert_to_tensor(target["mean"], dtype=values.dtype)
+    stdv = keras.ops.convert_to_tensor(
+        target["standard_deviation"], dtype=values.dtype
+    )
+    return values * stdv + mean
 
 
 def mesh_edges(faces):
@@ -175,23 +203,6 @@ class CameraGeometryChannels(keras.layers.Layer):
         self.image_coordinates = np.stack([x_grid, y_grid], axis=-1)
         self.rays = rays.astype(np.float32)
 
-    @staticmethod
-    def normalize(values, epsilon=1e-8):
-        length = keras.ops.sqrt(keras.ops.sum(
-            keras.ops.square(values), axis=-1, keepdims=True
-        ))
-        return values / keras.ops.maximum(length, epsilon)
-
-    def denormalize(self, values, name):
-        statistics = self.target_statistics[name]
-        mean = keras.ops.convert_to_tensor(
-            statistics["mean"], dtype=values.dtype
-        )
-        deviation = keras.ops.convert_to_tensor(
-            statistics["standard_deviation"], dtype=values.dtype
-        )
-        return values * deviation + mean
-
     def call(self, inputs):
         (normalized_depth, object_mask, translation_raw, orientation,
          scale_raw) = inputs
@@ -223,20 +234,15 @@ class CameraGeometryChannels(keras.layers.Layer):
             -rays[..., 2:3], 1e-6
         )
         camera_points = rays * ray_distance * valid * self.max_depth
-        translation = self.denormalize(
-            translation_raw, "object_translation"
+        translation = denormalize_tensor(
+            translation_raw, self.target_statistics, "object_translation"
         )
         scale = keras.ops.maximum(
-            self.denormalize(scale_raw, "object_scale"), 1e-3
+            denormalize_tensor(
+                scale_raw, self.target_statistics, "object_scale"
+            ), 1e-3
         )
-        first = self.normalize(orientation[..., :3])
-        second = orientation[..., 3:6]
-        second = second - keras.ops.sum(
-            first * second, axis=-1, keepdims=True
-        ) * first
-        second = self.normalize(second)
-        third = keras.ops.cross(first, second)
-        rotation = keras.ops.stack([first, second, third], axis=-1)
+        rotation = rotation_6d_to_matrix_ops(orientation)
         centered = camera_points - translation[:, None, None, :]
         canonical_points = keras.ops.einsum(
             "bhwi,bij->bhwj", centered, rotation
@@ -962,35 +968,6 @@ class DifferentiableCageRenderer(keras.layers.Layer):
         )
         self.pixels = np.stack([rows, columns], axis=-1).reshape(-1, 2)
 
-    def denormalize(self, values, name):
-        statistics = self.target_statistics[name]
-        mean = keras.ops.convert_to_tensor(
-            statistics["mean"], dtype=values.dtype
-        )
-        deviation = keras.ops.convert_to_tensor(
-            statistics["standard_deviation"], dtype=values.dtype
-        )
-        return values * deviation + mean
-
-    @staticmethod
-    def normalize(values, epsilon=1e-8):
-        norm = keras.ops.sqrt(
-            keras.ops.sum(keras.ops.square(values), axis=-1, keepdims=True)
-            + epsilon
-        )
-        return values / norm
-
-    @staticmethod
-    def cross(first, second):
-        return keras.ops.stack([
-            first[..., 1] * second[..., 2]
-            - first[..., 2] * second[..., 1],
-            first[..., 2] * second[..., 0]
-            - first[..., 0] * second[..., 2],
-            first[..., 0] * second[..., 1]
-            - first[..., 1] * second[..., 0],
-        ], axis=-1)
-
     def call(self, inputs):
         (canonical, translation_raw, orientation, scale_raw, material_raw,
          light_position_raw, light_intensity_raw) = inputs
@@ -1002,18 +979,15 @@ class DifferentiableCageRenderer(keras.layers.Layer):
             dtype=canonical.dtype,
         )
         canonical = canonical * mesh_deviation + mesh_mean
-        translation = self.denormalize(translation_raw, "object_translation")
-        scale = keras.ops.maximum(
-            self.denormalize(scale_raw, "object_scale"), 1e-3
+        translation = denormalize_tensor(
+            translation_raw, self.target_statistics, "object_translation"
         )
-        first = self.normalize(orientation[..., :3])
-        second = orientation[..., 3:6]
-        second = second - keras.ops.sum(
-            first * second, axis=-1, keepdims=True
-        ) * first
-        second = self.normalize(second)
-        third = self.cross(first, second)
-        rotation = keras.ops.stack([first, second, third], axis=-1)
+        scale = keras.ops.maximum(
+            denormalize_tensor(
+                scale_raw, self.target_statistics, "object_scale"
+            ), 1e-3
+        )
+        rotation = rotation_6d_to_matrix_ops(orientation)
         vertices = keras.ops.matmul(
             canonical, keras.ops.transpose(rotation, (0, 2, 1))
         )
@@ -1037,14 +1011,14 @@ class DifferentiableCageRenderer(keras.layers.Layer):
         samples = keras.ops.reshape(
             samples, (-1, len(self.faces) * samples_per_face, 3)
         )
-        face_cross = self.cross(
+        face_cross = keras.ops.cross(
             triangle_second - triangle_first,
             triangle_third - triangle_first,
         )
         face_area = 0.5 * keras.ops.sqrt(keras.ops.sum(
             keras.ops.square(face_cross), axis=-1
         ) + 1e-8)
-        normals = self.normalize(face_cross)
+        normals = normalize_tensor(face_cross)
         normals = keras.ops.repeat(normals, samples_per_face, axis=1)
         area_weight = face_area / keras.ops.maximum(
             keras.ops.mean(face_area, axis=1, keepdims=True), 1e-8
@@ -1054,24 +1028,29 @@ class DifferentiableCageRenderer(keras.layers.Layer):
             area_weight, samples_per_face, axis=1
         )
 
-        material = self.denormalize(material_raw, "material")
+        material = denormalize_tensor(
+            material_raw, self.target_statistics, "material"
+        )
         color = keras.ops.clip(material[..., :3], 0.0, 1.0)
         diffuse = keras.ops.clip(material[..., 3:4], 0.0, 1.0)
         specular = keras.ops.clip(material[..., 4:5], 0.0, 1.0)
         ambient = keras.ops.clip(material[..., 5:6], 0.0, 1.0)
         shininess = keras.ops.clip(material[..., 6:7], 1.0, 128.0)
-        light_position = self.denormalize(
-            light_position_raw, "light_position"
+        light_position = denormalize_tensor(
+            light_position_raw, self.target_statistics, "light_position"
         )
         light_intensity = keras.ops.clip(
-            self.denormalize(light_intensity_raw, "light_intensity"),
+            denormalize_tensor(
+                light_intensity_raw, self.target_statistics,
+                "light_intensity"
+            ),
             0.0, 5.0,
         )
-        light_direction = self.normalize(
+        light_direction = normalize_tensor(
             light_position[:, None, :] - samples
         )
-        view_direction = self.normalize(-samples)
-        half_direction = self.normalize(light_direction + view_direction)
+        view_direction = normalize_tensor(-samples)
+        half_direction = normalize_tensor(light_direction + view_direction)
         lambert = keras.ops.maximum(keras.ops.sum(
             normals * light_direction, axis=-1, keepdims=True
         ), 0.0)
@@ -1393,7 +1372,8 @@ def make_parser():
     parser.add_argument("--splat-strength", type=float, default=0.5)
     parser.add_argument("--depth-temperature", type=float, default=0.15)
     parser.add_argument("--rgb-reconstruction-weight", type=float, default=0.25)
-    parser.add_argument("--depth-reconstruction-weight", type=float, default=1.0)
+    weight_config = {"type": float, "default": 1.0}
+    parser.add_argument("--depth-reconstruction-weight", **weight_config)
     parser.add_argument("--silhouette-reconstruction-weight", type=float,
                         default=0.1)
     parser.add_argument("--geometry-warmup-epochs", type=int, default=15,
@@ -1421,42 +1401,135 @@ def make_parser():
     return parser
 
 
-def main(argv=None):
-    args = make_parser().parse_args(argv)
+def validate_args(args):
     positive = (
         args.base_width, args.mesh_loss_weight, args.mesh_target_points,
-        args.batch_size,
-        args.epochs, args.max_depth,
-        args.checkpoint_every, args.render_resolution, args.y_fov,
-        args.splat_sigma, args.splat_strength, args.depth_temperature,
-        args.template_radius,
+        args.batch_size, args.epochs, args.max_depth, args.checkpoint_every,
+        args.render_resolution, args.y_fov, args.splat_sigma,
+        args.splat_strength, args.depth_temperature, args.template_radius,
         args.cage_radius, args.cage_maximum_offset,
     )
-    if any(value <= 0 for value in positive) or args.preview_meshes < 0:
+    if min(positive) <= 0 or args.preview_meshes < 0:
         raise ValueError("sizes, weights, and ranges must be positive")
-    if args.template_subdivisions < 0 or args.cage_subdivisions < 0:
-        raise ValueError("subdivision counts cannot be negative")
-    if args.geometry_warmup_epochs < 0:
-        raise ValueError("--geometry-warmup-epochs cannot be negative")
-    if args.edge_uniformity_weight < 0.0:
-        raise ValueError("--edge-uniformity-weight cannot be negative")
+    subdivisions = args.template_subdivisions, args.cage_subdivisions
+    if min(subdivisions) < 0 or args.geometry_warmup_epochs < 0:
+        raise ValueError("epoch and subdivision counts cannot be negative")
     cage_weights = (
         args.cage_validity_weight, args.cage_offset_weight,
         args.cage_edge_weight, args.cage_orientation_weight,
         args.cage_area_weight, args.cage_volume_weight,
     )
-    if min(cage_weights) < 0.0:
-        raise ValueError("cage loss weights cannot be negative")
-    if args.normal_consistency_weight < 0.0:
-        raise ValueError("normal consistency weight cannot be negative")
     reconstruction_weights = (
         args.rgb_reconstruction_weight, args.depth_reconstruction_weight,
         args.silhouette_reconstruction_weight,
     )
-    if min(reconstruction_weights) < 0.0:
-        raise ValueError("reconstruction weights cannot be negative")
-    if args.render_floor_tolerance < 0.0:
-        raise ValueError("--render-floor-tolerance cannot be negative")
+    other_weights = (
+        args.edge_uniformity_weight, args.normal_consistency_weight,
+        args.render_floor_tolerance,
+    )
+    if min(cage_weights + reconstruction_weights + other_weights) < 0.0:
+        raise ValueError("loss weights and floor tolerance cannot be negative")
+
+
+def select_records(args):
+    records = load_records(args.dataset)
+    splits = split_records(records, args.seed, args.validation_split)
+    if not args.overfit_sample_ids:
+        return records, splits
+    records_by_id = {
+        Path(record["_metadata_path"]).stem: record for record in records
+    }
+    missing = set(args.overfit_sample_ids).difference(records_by_id)
+    if missing:
+        raise ValueError(f"Unknown overfit sample IDs: {sorted(missing)}")
+    selected = [records_by_id[name] for name in args.overfit_sample_ids]
+    print(f"Diagnostic overfit set: {args.overfit_sample_ids}")
+    return records, (selected, list(selected), splits[2])
+
+
+def build_objectives(args, mesh_statistics, faces, edges, cage_faces,
+                     shape_names):
+    mesh = PhysicalMeshLoss(
+        mesh_statistics["standard_deviation"], faces, edges,
+        args.edge_uniformity_weight, args.normal_consistency_weight,
+    )
+    mesh_normal = PhysicalMeshNormalError(
+        mesh_statistics["standard_deviation"], faces, edges
+    )
+    primitive_shapes = shape_names == ("cube", "cylinder", "sphere")
+    if primitive_shapes:
+        rotation = symmetry_rotation_loss
+    else:
+        rotation = generic_rotation_loss
+    rotation_metric = (symmetry_geodesic_angle_degrees if primitive_shapes
+                       else generic_geodesic_angle_degrees)
+    cage = CageValidityLoss(
+        cage_faces, mesh_edges(cage_faces),
+        offset_weight=args.cage_offset_weight,
+        edge_weight=args.cage_edge_weight,
+        orientation_weight=args.cage_orientation_weight,
+        area_weight=args.cage_area_weight,
+        volume_weight=args.cage_volume_weight,
+    )
+    rgb = MaskedReconstructionHuber(
+        delta=0.1, name="rendered_rgb_masked_huber"
+    )
+    depth = MaskedReconstructionHuber(
+        delta=0.1, name="rendered_metric_depth_masked_huber"
+    )
+    silhouette = SilhouetteBCEDiceLoss()
+    losses = {
+        "object_orientation_6d": rotation,
+        MESH_OUTPUT_NAME: mesh,
+        CAGE_OUTPUT_NAME: cage,
+        RENDERED_RGB_OUTPUT_NAME: rgb,
+        RENDERED_DEPTH_OUTPUT_NAME: depth,
+        RENDERED_SILHOUETTE_OUTPUT_NAME: silhouette,
+    }
+    metrics = {
+        "object_orientation_6d": [
+            keras.metrics.MeanMetricWrapper(rotation, name="loss"),
+            rotation_metric,
+        ],
+        MESH_OUTPUT_NAME: [
+            keras.metrics.MeanMetricWrapper(mesh, name="loss"),
+            keras.metrics.MeanMetricWrapper(
+                mesh_normal, name="surface_normal_error"
+            ),
+        ],
+        CAGE_OUTPUT_NAME: [
+            keras.metrics.MeanMetricWrapper(cage, name="loss")
+        ] + cage_validity_metrics(cage_faces),
+        RENDERED_RGB_OUTPUT_NAME: [
+            keras.metrics.MeanMetricWrapper(rgb, name="loss"),
+            keras.metrics.MeanAbsoluteError(name="mae_0_1"),
+        ],
+        RENDERED_DEPTH_OUTPUT_NAME: [
+            keras.metrics.MeanMetricWrapper(depth, name="loss"),
+            keras.metrics.MeanAbsoluteError(name="mae_m"),
+        ],
+        RENDERED_SILHOUETTE_OUTPUT_NAME: [
+            keras.metrics.MeanMetricWrapper(silhouette, name="loss"),
+            keras.metrics.BinaryIoU(
+                target_class_ids=(1,), threshold=0.5, name="iou"
+            ),
+        ],
+    }
+    weights = {
+        MESH_OUTPUT_NAME: args.mesh_loss_weight,
+        CAGE_OUTPUT_NAME: args.cage_validity_weight,
+        RENDERED_RGB_OUTPUT_NAME: args.rgb_reconstruction_weight,
+        RENDERED_DEPTH_OUTPUT_NAME: args.depth_reconstruction_weight,
+        RENDERED_SILHOUETTE_OUTPUT_NAME:
+            args.silhouette_reconstruction_weight,
+    }
+    return Objectives(mesh, mesh_normal, rotation, rotation_metric, cage,
+                      losses, metrics, weights)
+
+
+def main(argv=None):
+    args = make_parser().parse_args(argv)
+    validate_args(args)
     args.output.mkdir(parents=True, exist_ok=True)
 
     # Respect JAX_PLATFORMS: CUDA is used on the server, while explicit CPU
@@ -1464,21 +1537,9 @@ def main(argv=None):
     devices = jax.devices()
     device = devices[0]
     jax.config.update("jax_default_device", device)
-    records = load_records(args.dataset)
+    records, splits = select_records(args)
     shape_names = tuple(sorted({record["shape"]["type"] for record in records}))
-    training_records, validation_records, test_records = split_records(
-        records, args.seed, args.validation_split
-    )
-    if args.overfit_sample_ids:
-        by_id = {
-            Path(record["_metadata_path"]).stem: record for record in records
-        }
-        missing = set(args.overfit_sample_ids).difference(by_id)
-        if missing:
-            raise ValueError(f"Unknown overfit sample IDs: {sorted(missing)}")
-        training_records = [by_id[name] for name in args.overfit_sample_ids]
-        validation_records = list(training_records)
-        print(f"Diagnostic overfit set: {args.overfit_sample_ids}")
+    training_records, validation_records, test_records = splits
     export_test_split(test_records, args.output / "test_split")
     export_test_meshes(test_records, args.output / "test_split")
     save_split_manifest(
@@ -1585,80 +1646,9 @@ def main(argv=None):
         args.cage_maximum_offset,
         args.splat_strength,
     )
-    mesh_loss = PhysicalMeshLoss(
-        mesh_statistics["standard_deviation"], faces, edges,
-        args.edge_uniformity_weight, args.normal_consistency_weight,
+    objectives = build_objectives(
+        args, mesh_statistics, faces, edges, cage_faces, shape_names
     )
-    mesh_normal_error = PhysicalMeshNormalError(
-        mesh_statistics["standard_deviation"], faces, edges,
-    )
-    rgb_loss = MaskedReconstructionHuber(
-        delta=0.1, name="rendered_rgb_masked_huber"
-    )
-    depth_loss = MaskedReconstructionHuber(
-        delta=0.1, name="rendered_metric_depth_masked_huber"
-    )
-    silhouette_loss = SilhouetteBCEDiceLoss()
-    primitive_symmetries = shape_names == ("cube", "cylinder", "sphere")
-    rotation_loss = (symmetry_rotation_loss if primitive_symmetries else
-                     generic_rotation_loss)
-    rotation_metric = (symmetry_geodesic_angle_degrees
-                       if primitive_symmetries else
-                       generic_geodesic_angle_degrees)
-    extra_losses = {
-        "object_orientation_6d": rotation_loss,
-        MESH_OUTPUT_NAME: mesh_loss,
-        RENDERED_RGB_OUTPUT_NAME: rgb_loss,
-        RENDERED_DEPTH_OUTPUT_NAME: depth_loss,
-        RENDERED_SILHOUETTE_OUTPUT_NAME: silhouette_loss,
-    }
-    extra_metrics = {
-        "object_orientation_6d": [
-            keras.metrics.MeanMetricWrapper(rotation_loss, name="loss"),
-            rotation_metric,
-        ],
-        MESH_OUTPUT_NAME: [
-            keras.metrics.MeanMetricWrapper(mesh_loss, name="loss"),
-            keras.metrics.MeanMetricWrapper(
-                mesh_normal_error, name="surface_normal_error"
-            ),
-        ],
-        RENDERED_RGB_OUTPUT_NAME: [
-            keras.metrics.MeanMetricWrapper(rgb_loss, name="loss"),
-            keras.metrics.MeanAbsoluteError(name="mae_0_1"),
-        ],
-        RENDERED_DEPTH_OUTPUT_NAME: [
-            keras.metrics.MeanMetricWrapper(depth_loss, name="loss"),
-            keras.metrics.MeanAbsoluteError(name="mae_m"),
-        ],
-        RENDERED_SILHOUETTE_OUTPUT_NAME: [
-            keras.metrics.MeanMetricWrapper(silhouette_loss, name="loss"),
-            keras.metrics.BinaryIoU(
-                target_class_ids=(1,), threshold=0.5, name="iou"
-            ),
-        ],
-    }
-    extra_loss_weights = {
-        MESH_OUTPUT_NAME: args.mesh_loss_weight,
-        RENDERED_RGB_OUTPUT_NAME: args.rgb_reconstruction_weight,
-        RENDERED_DEPTH_OUTPUT_NAME: args.depth_reconstruction_weight,
-        RENDERED_SILHOUETTE_OUTPUT_NAME: (
-            args.silhouette_reconstruction_weight
-        ),
-    }
-    cage_loss = CageValidityLoss(
-        cage_faces, mesh_edges(cage_faces),
-        offset_weight=args.cage_offset_weight,
-        edge_weight=args.cage_edge_weight,
-        orientation_weight=args.cage_orientation_weight,
-        area_weight=args.cage_area_weight,
-        volume_weight=args.cage_volume_weight,
-    )
-    extra_losses[CAGE_OUTPUT_NAME] = cage_loss
-    extra_metrics[CAGE_OUTPUT_NAME] = [
-        keras.metrics.MeanMetricWrapper(cage_loss, name="loss")
-    ] + cage_validity_metrics(cage_faces)
-    extra_loss_weights[CAGE_OUTPUT_NAME] = args.cage_validity_weight
     warmup_epochs = (args.epochs if args.geometry_only else
                      args.geometry_warmup_epochs)
     if warmup_epochs:
@@ -1668,9 +1658,9 @@ def main(argv=None):
         ]
         vector_mse = keras.losses.MeanSquaredError()
         geometry_losses = {
-            MESH_OUTPUT_NAME: mesh_loss,
+            MESH_OUTPUT_NAME: objectives.mesh,
             "object_translation": vector_mse,
-            "object_orientation_6d": rotation_loss,
+            "object_orientation_6d": objectives.rotation,
             "object_scale": vector_mse,
         }
         geometry_weights = {
@@ -1681,25 +1671,27 @@ def main(argv=None):
         }
         geometry_metrics = {
             MESH_OUTPUT_NAME: [
-                keras.metrics.MeanMetricWrapper(mesh_loss, name="loss"),
+                keras.metrics.MeanMetricWrapper(objectives.mesh, name="loss"),
                 keras.metrics.MeanMetricWrapper(
-                    mesh_normal_error, name="surface_normal_error"
+                    objectives.mesh_normal, name="surface_normal_error"
                 ),
             ],
             "object_translation": [
                 keras.metrics.MeanSquaredError(name="loss")
             ],
             "object_orientation_6d": [
-                keras.metrics.MeanMetricWrapper(rotation_loss, name="loss"),
-                rotation_metric,
+                keras.metrics.MeanMetricWrapper(
+                    objectives.rotation, name="loss"
+                ),
+                objectives.rotation_metric,
             ],
             "object_scale": [keras.metrics.MeanSquaredError(name="loss")],
         }
         geometry_names.append(CAGE_OUTPUT_NAME)
-        geometry_losses[CAGE_OUTPUT_NAME] = cage_loss
+        geometry_losses[CAGE_OUTPUT_NAME] = objectives.cage
         geometry_weights[CAGE_OUTPUT_NAME] = args.cage_validity_weight
         geometry_metrics[CAGE_OUTPUT_NAME] = [
-            keras.metrics.MeanMetricWrapper(cage_loss, name="loss")
+            keras.metrics.MeanMetricWrapper(objectives.cage, name="loss")
         ] + cage_validity_metrics(cage_faces)
         geometry_model = keras.Model(
             model.inputs,
@@ -1748,11 +1740,11 @@ def main(argv=None):
             return
     compile_model(
         model, args.learning_rate, args.weight_decay, normalizer.statistics,
-        extra_losses=extra_losses, extra_metrics=extra_metrics,
-        extra_loss_weights=extra_loss_weights,
+        extra_losses=objectives.losses, extra_metrics=objectives.metrics,
+        extra_loss_weights=objectives.weights,
     )
     logged_weights = {name: 1.0 for name in OUTPUT_NAMES}
-    logged_weights.update(extra_loss_weights)
+    logged_weights.update(objectives.weights)
     callbacks = [
         WeightedLossLogger(logged_weights),
         keras.callbacks.CSVLogger(args.output / "training.csv"),
