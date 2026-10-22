@@ -1,11 +1,16 @@
-"""Train a compact differentiable RGB-D inverse-graphics Atlas model.
+"""Train a compact differentiable RGB-D inverse-graphics mesh model.
 
-The geometry decoder deforms several small UV grids directly into camera-frame
-triangle patches.  Fixed connectivity makes mesh extraction immediate, while
-surface Chamfer supervision permits arbitrary category names and does not
-require vertex correspondence or watertight ground-truth meshes.
+The default geometry decoder deforms a connected triangle template through a
+small enclosing control cage. Fixed connectivity makes mesh extraction
+immediate, while surface Chamfer supervision permits arbitrary category names
+and does not require vertex correspondence or watertight ground-truth meshes.
 
-Canonical Atlas vertices are transformed by predicted pose and metric scale,
+By default, a network predicts a small enclosing cage whose mean-value
+coordinates deform a fixed, connected triangle template.  The earlier Atlas
+UV-patch representation remains available with ``--geometry-representation
+atlas`` for controlled comparisons.
+
+Canonical mesh vertices are transformed by predicted pose and metric scale,
 then a lightweight differentiable surface-splat renderer produces object RGB,
 depth, and silhouette maps. Reconstruction losses therefore update geometry,
 pose, material, and lighting jointly without an SDF or Marching Cubes::
@@ -13,7 +18,7 @@ pose, material, and lighting jointly without an SDF or Marching Cubes::
     KERAS_BACKEND=jax JAX_PLATFORMS=cuda python -m \
       paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_atlas \
       --dataset datasets/synthetic_rgbd_1000_v4 \
-      --output experiments/rgbd_inverse_graphics_atlas
+      --output experiments/rgbd_inverse_graphics_cage
 """
 
 import os
@@ -30,6 +35,8 @@ import jax
 import keras
 import numpy as np
 import trimesh
+
+from paz.backend import cage as cage_backend
 
 from paz.graphics.synthetic_data.train_synthetic_rgb_resnet18 import (
     MATERIAL_NAMES,
@@ -92,6 +99,41 @@ def build_atlas_topology(num_patches, patch_resolution):
             np.asarray(faces, np.int32), edges)
 
 
+def mesh_edges(faces):
+    """Returns the unique undirected edges of a triangle array."""
+    faces = np.asarray(faces, dtype=np.int32)
+    edges = np.concatenate([
+        faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]],
+    ])
+    return np.unique(np.sort(edges, axis=1), axis=0).astype(np.int32)
+
+
+def build_cage_topology(template_subdivisions=2, cage_subdivisions=1,
+                        template_radius=1.0, cage_radius=1.25):
+    """Builds a sphere template, enclosing cage, and fixed MVC weights."""
+    if cage_radius <= template_radius:
+        raise ValueError("cage radius must be larger than template radius")
+    template = trimesh.creation.icosphere(
+        subdivisions=template_subdivisions, radius=template_radius
+    )
+    cage = trimesh.creation.icosphere(
+        subdivisions=cage_subdivisions, radius=cage_radius
+    )
+    template_vertices = np.asarray(template.vertices, dtype=np.float32)
+    template_faces = np.asarray(template.faces, dtype=np.int32)
+    cage_vertices = np.asarray(cage.vertices, dtype=np.float32)
+    cage_faces = np.asarray(cage.faces, dtype=np.int32)
+    weights = np.asarray(cage_backend.compute_mesh_weights(
+        template_vertices, cage_vertices, cage_faces
+    ), dtype=np.float32)
+    totals = weights.sum(axis=1, keepdims=True)
+    if not np.all(np.isfinite(weights)) or np.any(np.abs(totals) < 1e-8):
+        raise ValueError("mean-value cage weights are not finite")
+    weights = weights / totals
+    return (template_vertices, template_faces, mesh_edges(template_faces),
+            cage_vertices, cage_faces, weights)
+
+
 @keras.saving.register_keras_serializable(package="paz")
 class RepeatAtlasCoordinates(keras.layers.Layer):
     """Repeats a global feature and appends fixed UV/patch coordinates."""
@@ -119,6 +161,55 @@ class RepeatAtlasCoordinates(keras.layers.Layer):
     def get_config(self):
         config = super().get_config()
         config["coordinates"] = self.coordinates.tolist()
+        return config
+
+
+@keras.saving.register_keras_serializable(package="paz")
+class CageMeshDeformation(keras.layers.Layer):
+    """Maps bounded cage offsets to a dense mesh using fixed MVC weights."""
+
+    def __init__(self, cage_vertices, mesh_weights, mesh_mean, mesh_deviation,
+                 maximum_offset=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.cage_vertices = np.asarray(cage_vertices, dtype=np.float32)
+        self.mesh_weights = np.asarray(mesh_weights, dtype=np.float32)
+        self.mesh_mean = np.asarray(mesh_mean, dtype=np.float32)
+        self.mesh_deviation = np.asarray(mesh_deviation, dtype=np.float32)
+        self.maximum_offset = float(maximum_offset)
+
+    def call(self, raw_offsets):
+        batch = keras.ops.shape(raw_offsets)[0]
+        offsets = keras.ops.reshape(
+            raw_offsets, (batch, len(self.cage_vertices), 3)
+        )
+        offsets = self.maximum_offset * keras.ops.tanh(offsets)
+        cage = keras.ops.convert_to_tensor(
+            self.cage_vertices, dtype=raw_offsets.dtype
+        )[None] + offsets
+        weights = keras.ops.convert_to_tensor(
+            self.mesh_weights, dtype=raw_offsets.dtype
+        )
+        vertices = keras.ops.einsum("vc,bcd->bvd", weights, cage)
+        mean = keras.ops.convert_to_tensor(
+            self.mesh_mean, dtype=raw_offsets.dtype
+        )
+        deviation = keras.ops.convert_to_tensor(
+            self.mesh_deviation, dtype=raw_offsets.dtype
+        )
+        return (vertices - mean) / deviation
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], len(self.mesh_weights), 3)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "cage_vertices": self.cage_vertices.tolist(),
+            "mesh_weights": self.mesh_weights.tolist(),
+            "mesh_mean": self.mesh_mean.tolist(),
+            "mesh_deviation": self.mesh_deviation.tolist(),
+            "maximum_offset": self.maximum_offset,
+        })
         return config
 
 
@@ -608,8 +699,10 @@ class DifferentiableAtlasRenderer(keras.layers.Layer):
 def build_model(image_shape, num_shapes, coordinates, base_width,
                 l2_regularization, faces, render_resolution, y_fov,
                 target_statistics, mesh_statistics, splat_sigma,
-                depth_temperature):
-    """Builds a compact physical-parameter and direct Atlas mesh network."""
+                depth_temperature, geometry_representation="cage",
+                cage_vertices=None, mesh_weights=None,
+                cage_maximum_offset=1.0):
+    """Builds a compact physical-parameter and deformable-mesh network."""
     regularizer = keras.regularizers.L2(l2_regularization)
     rgb = keras.Input((*image_shape, 3), name="rgb")
     depth = keras.Input((*image_shape, 1), name="depth")
@@ -641,17 +734,43 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
         "light_intensity": keras.layers.Dense(
             1, name="light_intensity")(lighting),
     }
-    atlas = RepeatAtlasCoordinates(
-        coordinates, name="repeat_atlas_coordinates"
-    )(geometry)
-    for index, width in enumerate((192, 128, 64), 1):
-        atlas = keras.layers.Dense(
-            width, activation="relu", kernel_regularizer=regularizer,
-            name=f"atlas_decoder_{index}",
-        )(atlas)
-    outputs[ATLAS_OUTPUT_NAME] = keras.layers.Dense(
-        3, name=ATLAS_OUTPUT_NAME, kernel_regularizer=regularizer
-    )(atlas)
+    if geometry_representation == "atlas":
+        mesh = RepeatAtlasCoordinates(
+            coordinates, name="repeat_atlas_coordinates"
+        )(geometry)
+        for index, width in enumerate((192, 128, 64), 1):
+            mesh = keras.layers.Dense(
+                width, activation="relu", kernel_regularizer=regularizer,
+                name=f"atlas_decoder_{index}",
+            )(mesh)
+        outputs[ATLAS_OUTPUT_NAME] = keras.layers.Dense(
+            3, name=ATLAS_OUTPUT_NAME, kernel_regularizer=regularizer
+        )(mesh)
+    elif geometry_representation == "cage":
+        if cage_vertices is None or mesh_weights is None:
+            raise ValueError("cage vertices and MVC weights are required")
+        cage_feature = keras.layers.Dense(
+            192, activation="relu", kernel_regularizer=regularizer,
+            name="cage_decoder_1",
+        )(geometry)
+        cage_feature = keras.layers.Dense(
+            128, activation="relu", kernel_regularizer=regularizer,
+            name="cage_decoder_2",
+        )(cage_feature)
+        raw_offsets = keras.layers.Dense(
+            len(cage_vertices) * 3, kernel_initializer="zeros",
+            bias_initializer="zeros", kernel_regularizer=regularizer,
+            name="cage_vertex_offsets",
+        )(cage_feature)
+        outputs[ATLAS_OUTPUT_NAME] = CageMeshDeformation(
+            cage_vertices, mesh_weights, mesh_statistics["mean"],
+            mesh_statistics["standard_deviation"], cage_maximum_offset,
+            name=ATLAS_OUTPUT_NAME,
+        )(raw_offsets)
+    else:
+        raise ValueError(
+            f"unknown geometry representation: {geometry_representation}"
+        )
     rendered = DifferentiableAtlasRenderer(
         faces, render_resolution, y_fov, target_statistics, mesh_statistics,
         splat_sigma=splat_sigma, depth_temperature=depth_temperature,
@@ -673,7 +792,7 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
     )(rendered[2])
     return keras.Model(
         {"rgb": rgb, "depth": depth}, outputs,
-        name="compact_rgbd_atlas_mesh",
+        name=f"compact_rgbd_{geometry_representation}_mesh",
     )
 
 
@@ -736,9 +855,16 @@ def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path,
-                        default=Path("experiments/rgbd_inverse_graphics_atlas"))
+                        default=Path("experiments/rgbd_inverse_graphics_cage"))
     parser.add_argument("--num-patches", type=int, default=4)
     parser.add_argument("--patch-resolution", type=int, default=8)
+    parser.add_argument("--geometry-representation", choices=("cage", "atlas"),
+                        default="cage")
+    parser.add_argument("--template-subdivisions", type=int, default=2)
+    parser.add_argument("--cage-subdivisions", type=int, default=1)
+    parser.add_argument("--template-radius", type=float, default=1.0)
+    parser.add_argument("--cage-radius", type=float, default=1.25)
+    parser.add_argument("--cage-maximum-offset", type=float, default=1.0)
     parser.add_argument("--base-width", type=int, default=16)
     parser.add_argument("--mesh-loss-weight", type=float, default=2.0)
     parser.add_argument("--edge-uniformity-weight", type=float, default=0.02)
@@ -770,12 +896,15 @@ def main(argv=None):
         args.num_patches, args.patch_resolution, args.base_width,
         args.mesh_loss_weight, args.batch_size, args.epochs, args.max_depth,
         args.checkpoint_every, args.render_resolution, args.y_fov,
-        args.splat_sigma, args.depth_temperature,
+        args.splat_sigma, args.depth_temperature, args.template_radius,
+        args.cage_radius, args.cage_maximum_offset,
     )
     if any(value <= 0 for value in positive) or args.preview_meshes < 0:
         raise ValueError("sizes, weights, and ranges must be positive")
     if args.patch_resolution < 2:
         raise ValueError("--patch-resolution must be at least two")
+    if args.template_subdivisions < 0 or args.cage_subdivisions < 0:
+        raise ValueError("subdivision counts cannot be negative")
     if args.edge_uniformity_weight < 0.0:
         raise ValueError("--edge-uniformity-weight cannot be negative")
     reconstruction_weights = (
@@ -803,9 +932,17 @@ def main(argv=None):
         test_records, args.seed, args.validation_split,
     )
 
-    coordinates, faces, edges = build_atlas_topology(
-        args.num_patches, args.patch_resolution
-    )
+    cage_vertices = cage_faces = mesh_weights = None
+    if args.geometry_representation == "cage":
+        (coordinates, faces, edges, cage_vertices, cage_faces,
+         mesh_weights) = build_cage_topology(
+            args.template_subdivisions, args.cage_subdivisions,
+            args.template_radius, args.cage_radius,
+        )
+    else:
+        coordinates, faces, edges = build_atlas_topology(
+            args.num_patches, args.patch_resolution
+        )
     num_vertices = len(coordinates)
     normalizer = GenericTargetNormalizer.fit(training_records, shape_names)
     mesh_statistics = fit_canonical_statistics(
@@ -813,17 +950,33 @@ def main(argv=None):
     )
     normalizer.statistics[ATLAS_OUTPUT_NAME] = mesh_statistics
     normalizer.save(args.output / "normalization.json")
-    np.savez_compressed(
-        args.output / "atlas_topology.npz",
-        coordinates=coordinates, faces=faces, edges=edges,
-    )
+    topology = {"coordinates": coordinates, "faces": faces, "edges": edges}
+    if args.geometry_representation == "cage":
+        topology.update({
+            "cage_vertices": cage_vertices,
+            "cage_faces": cage_faces,
+            "mesh_weights": mesh_weights,
+        })
+    # Keep the historical filename so the existing evaluation renderer can
+    # consume both Atlas and cage experiments.
+    np.savez_compressed(args.output / "atlas_topology.npz", **topology)
     with (args.output / "input_preprocessing.json").open("w") as file:
         json.dump({
-            "method": "compact multi-patch Atlas mesh",
+            "method": f"compact {args.geometry_representation} mesh",
             "mesh_frame": "canonical transformed by predicted pose and scale",
-            "mesh_representation": "direct vertices with fixed patch faces",
+            "mesh_representation": (
+                "mean-value-coordinate cage deformation"
+                if args.geometry_representation == "cage" else
+                "direct vertices with fixed patch faces"
+            ),
+            "geometry_representation": args.geometry_representation,
             "num_patches": args.num_patches,
             "patch_resolution": args.patch_resolution,
+            "template_subdivisions": args.template_subdivisions,
+            "cage_subdivisions": args.cage_subdivisions,
+            "template_radius": args.template_radius,
+            "cage_radius": args.cage_radius,
+            "cage_maximum_offset": args.cage_maximum_offset,
             "num_vertices": num_vertices,
             "num_faces": len(faces),
             "max_depth": args.max_depth,
@@ -870,7 +1023,8 @@ def main(argv=None):
         image_shape, len(shape_names), coordinates, args.base_width,
         args.l2_regularization, faces, args.render_resolution, args.y_fov,
         normalizer.statistics, mesh_statistics, args.splat_sigma,
-        args.depth_temperature,
+        args.depth_temperature, args.geometry_representation,
+        cage_vertices, mesh_weights, args.cage_maximum_offset,
     )
     atlas_loss = PhysicalAtlasLoss(
         mesh_statistics["standard_deviation"], edges,
@@ -951,7 +1105,8 @@ def main(argv=None):
     ]
     model.summary()
     print(
-        f"Training compact Atlas on {device}: {len(training_records)} train, "
+        f"Training compact {args.geometry_representation} mesh on {device}: "
+        f"{len(training_records)} train, "
         f"{len(validation_records)} validation, {len(test_records)} test; "
         f"{num_vertices} vertices, {len(faces)} faces"
     )
@@ -963,7 +1118,7 @@ def main(argv=None):
     save_preview_meshes(
         model, test, test_records, mesh_statistics, normalizer.statistics,
         faces,
-        args.output / "atlas_preview_meshes",
+        args.output / f"{args.geometry_representation}_preview_meshes",
         min(args.preview_meshes, len(test_records)),
     )
 
