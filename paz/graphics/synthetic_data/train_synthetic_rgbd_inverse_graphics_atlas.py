@@ -806,6 +806,7 @@ class OutputSubsetDataset(keras.utils.PyDataset):
 
 
 def compact_encoder(rgb, depth, regularizer, base_width):
+    """Returns global context and the final spatial RGB-D feature map."""
     features = keras.layers.Concatenate(name="rgbd_concatenation")([rgb, depth])
     for index, width in enumerate([
             base_width, base_width * 2, base_width * 4, base_width * 8], 1):
@@ -819,13 +820,15 @@ def compact_encoder(rgb, depth, regularizer, base_width):
         features = keras.layers.Activation(
             "relu", name=f"compact_relu_{index}"
         )(features)
-    features = keras.layers.GlobalAveragePooling2D(
+    spatial_features = features
+    pooled = keras.layers.GlobalAveragePooling2D(
         name="compact_global_pool"
-    )(features)
-    return keras.layers.Dense(
+    )(spatial_features)
+    global_features = keras.layers.Dense(
         256, activation="relu", kernel_regularizer=regularizer,
         name="compact_global_feature",
-    )(features)
+    )(pooled)
+    return global_features, spatial_features
 
 
 @keras.saving.register_keras_serializable(package="paz")
@@ -1059,7 +1062,9 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
     regularizer = keras.regularizers.L2(l2_regularization)
     rgb = keras.Input((*image_shape, 3), name="rgb")
     depth = keras.Input((*image_shape, 1), name="depth")
-    features = compact_encoder(rgb, depth, regularizer, base_width)
+    features, spatial_features = compact_encoder(
+        rgb, depth, regularizer, base_width
+    )
     geometry = keras.layers.Dense(
         192, activation="relu", kernel_regularizer=regularizer,
         name="geometry_mlp",
@@ -1102,16 +1107,55 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
     elif geometry_representation == "cage":
         if cage_vertices is None or mesh_weights is None:
             raise ValueError("cage vertices and MVC weights are required")
-        cage_feature = keras.layers.Dense(
-            192, activation="relu", kernel_regularizer=regularizer,
-            name="cage_decoder_1",
+        # Every reference cage vertex is a distinct learned query. The query
+        # combines its canonical coordinate with global object context, then
+        # attends to the unpooled RGB-D feature map. This preserves one shared,
+        # category-agnostic decoder while giving different cage regions access
+        # to different image/depth evidence.
+        query_width = 128
+        cage_queries = RepeatAtlasCoordinates(
+            cage_vertices, name="cage_vertex_queries"
         )(geometry)
-        cage_feature = keras.layers.Dense(
-            128, activation="relu", kernel_regularizer=regularizer,
-            name="cage_decoder_2",
+        cage_queries = keras.layers.Dense(
+            query_width, activation="relu", kernel_regularizer=regularizer,
+            name="cage_query_projection",
+        )(cage_queries)
+        spatial_tokens = keras.layers.Conv2D(
+            query_width, 1, padding="same", activation="relu",
+            kernel_regularizer=regularizer,
+            name="cage_spatial_projection",
+        )(spatial_features)
+        spatial_tokens = keras.layers.Reshape(
+            (-1, query_width), name="cage_spatial_tokens"
+        )(spatial_tokens)
+        attended = keras.layers.MultiHeadAttention(
+            num_heads=4, key_dim=query_width // 4,
+            kernel_regularizer=regularizer,
+            name="cage_spatial_attention",
+        )(query=cage_queries, value=spatial_tokens, key=spatial_tokens)
+        cage_feature = keras.layers.Add(name="cage_attention_residual")([
+            cage_queries, attended,
+        ])
+        cage_feature = keras.layers.LayerNormalization(
+            name="cage_attention_norm"
+        )(cage_feature)
+        feed_forward = keras.layers.Dense(
+            query_width * 2, activation="gelu",
+            kernel_regularizer=regularizer,
+            name="cage_query_feed_forward_1",
+        )(cage_feature)
+        feed_forward = keras.layers.Dense(
+            query_width, kernel_regularizer=regularizer,
+            name="cage_query_feed_forward_2",
+        )(feed_forward)
+        cage_feature = keras.layers.Add(name="cage_query_residual")([
+            cage_feature, feed_forward,
+        ])
+        cage_feature = keras.layers.LayerNormalization(
+            name="cage_query_norm"
         )(cage_feature)
         raw_offsets = keras.layers.Dense(
-            len(cage_vertices) * 3, kernel_initializer="zeros",
+            3, kernel_initializer=keras.initializers.RandomNormal(stddev=1e-3),
             bias_initializer="zeros", kernel_regularizer=regularizer,
             name="cage_vertex_offsets",
         )(cage_feature)
@@ -1377,6 +1421,11 @@ def main(argv=None):
                 "direct vertices with fixed patch faces"
             ),
             "geometry_representation": args.geometry_representation,
+            "cage_decoder": (
+                "per-vertex queries with four-head attention over spatial "
+                "RGB-D features"
+                if args.geometry_representation == "cage" else None
+            ),
             "num_patches": args.num_patches,
             "patch_resolution": args.patch_resolution,
             "template_subdivisions": args.template_subdivisions,
