@@ -387,16 +387,18 @@ class WeightedLossLogger(keras.callbacks.Callback):
 
 @keras.saving.register_keras_serializable(package="paz")
 class PhysicalAtlasLoss(keras.losses.Loss):
-    """Triangle-surface Chamfer plus inexpensive edge regularization."""
+    """Surface Chamfer, normal consistency, and edge regularization."""
 
     def __init__(self, standard_deviation, faces, edges,
                  edge_uniformity_weight=0.02,
+                 normal_consistency_weight=0.1,
                  name="physical_surface_chamfer_m2", **kwargs):
         super().__init__(name=name, **kwargs)
         self.standard_deviation = tuple(float(x) for x in standard_deviation)
         self.faces = np.asarray(faces, dtype=np.int32)
         self.edges = np.asarray(edges, dtype=np.int32)
         self.edge_uniformity_weight = float(edge_uniformity_weight)
+        self.normal_consistency_weight = float(normal_consistency_weight)
         # Fixed deterministic samples cover triangle interiors, unlike a loss
         # on template vertices alone. The centroid and three inset corners
         # avoid duplicating samples along shared edges.
@@ -405,12 +407,19 @@ class PhysicalAtlasLoss(keras.losses.Loss):
             [0.6, 0.2, 0.2], [0.2, 0.6, 0.2], [0.2, 0.2, 0.6],
         ], dtype=np.float32)
 
-    def call(self, target, prediction):
+    def components(self, target, prediction):
+        """Returns per-example Chamfer, normal, and edge terms."""
         scale = keras.ops.convert_to_tensor(
             self.standard_deviation, dtype=prediction.dtype
         )
         physical = prediction * scale
-        target_physical = target * scale
+        target_physical = target[..., :3] * scale
+        target_normals = target[..., 3:6]
+        target_normals = target_normals / keras.ops.maximum(
+            keras.ops.sqrt(keras.ops.sum(
+                keras.ops.square(target_normals), axis=-1, keepdims=True
+            )), 1e-8,
+        )
         faces = keras.ops.convert_to_tensor(self.faces, dtype="int32")
         triangles = keras.ops.take(physical, faces, axis=1)
         barycentrics = keras.ops.convert_to_tensor(
@@ -420,11 +429,45 @@ class PhysicalAtlasLoss(keras.losses.Loss):
         surface = keras.ops.reshape(
             surface, (-1, len(self.faces) * len(self.barycentrics), 3)
         )
+        face_normals = keras.ops.cross(
+            triangles[:, :, 1] - triangles[:, :, 0],
+            triangles[:, :, 2] - triangles[:, :, 0],
+        )
+        face_normals = face_normals / keras.ops.maximum(
+            keras.ops.sqrt(keras.ops.sum(
+                keras.ops.square(face_normals), axis=-1, keepdims=True
+            )), 1e-8,
+        )
+        surface_normals = keras.ops.repeat(
+            face_normals, len(self.barycentrics), axis=1
+        )
         differences = surface[:, :, None, :] - target_physical[:, None, :, :]
         squared = keras.ops.sum(keras.ops.square(differences), axis=-1)
         chamfer = 0.5 * (
             keras.ops.mean(keras.ops.min(squared, axis=2), axis=1)
             + keras.ops.mean(keras.ops.min(squared, axis=1), axis=1)
+        )
+        surface_to_target = keras.ops.argmin(squared, axis=2)
+        target_to_surface = keras.ops.argmin(squared, axis=1)
+        matched_target_normals = keras.ops.take_along_axis(
+            target_normals,
+            keras.ops.repeat(surface_to_target[..., None], 3, axis=-1),
+            axis=1,
+        )
+        matched_surface_normals = keras.ops.take_along_axis(
+            surface_normals,
+            keras.ops.repeat(target_to_surface[..., None], 3, axis=-1),
+            axis=1,
+        )
+        predicted_alignment = keras.ops.abs(keras.ops.sum(
+            surface_normals * matched_target_normals, axis=-1
+        ))
+        target_alignment = keras.ops.abs(keras.ops.sum(
+            target_normals * matched_surface_normals, axis=-1
+        ))
+        normal_error = 0.5 * (
+            keras.ops.mean(1.0 - predicted_alignment, axis=1)
+            + keras.ops.mean(1.0 - target_alignment, axis=1)
         )
         edge_indices = keras.ops.convert_to_tensor(self.edges, dtype="int32")
         first = keras.ops.take(physical, edge_indices[:, 0], axis=1)
@@ -436,7 +479,19 @@ class PhysicalAtlasLoss(keras.losses.Loss):
         uniformity = keras.ops.mean(
             keras.ops.square(lengths - mean_length), axis=1
         )
-        return chamfer + self.edge_uniformity_weight * uniformity
+        return chamfer, normal_error, uniformity
+
+    def call(self, target, prediction):
+        chamfer, normal_error, uniformity = self.components(
+            target, prediction
+        )
+        return (chamfer
+                + self.normal_consistency_weight * normal_error
+                + self.edge_uniformity_weight * uniformity)
+
+    def normal_error(self, target, prediction):
+        """Returns unsigned nearest-surface normal error in [0, 1]."""
+        return self.components(target, prediction)[1]
 
     def get_config(self):
         config = super().get_config()
@@ -445,8 +500,26 @@ class PhysicalAtlasLoss(keras.losses.Loss):
             "faces": self.faces.tolist(),
             "edges": self.edges.tolist(),
             "edge_uniformity_weight": self.edge_uniformity_weight,
+            "normal_consistency_weight": self.normal_consistency_weight,
         })
         return config
+
+
+@keras.saving.register_keras_serializable(package="paz")
+class PhysicalAtlasNormalError(PhysicalAtlasLoss):
+    """Separately logged unsigned nearest-surface normal inconsistency."""
+
+    def __init__(self, standard_deviation, faces, edges,
+                 edge_uniformity_weight=0.0,
+                 normal_consistency_weight=0.0,
+                 name="surface_normal_error", **kwargs):
+        super().__init__(
+            standard_deviation, faces, edges, edge_uniformity_weight,
+            normal_consistency_weight, name=name, **kwargs,
+        )
+
+    def call(self, target, prediction):
+        return self.components(target, prediction)[1]
 
 
 @keras.saving.register_keras_serializable(package="paz")
@@ -513,13 +586,49 @@ def transform_points(points, matrix):
     return (homogeneous @ np.asarray(matrix).T)[:, :3]
 
 
+def load_canonical_mesh_samples(record, num_points):
+    """Samples aligned canonical surface points and unsigned face normals."""
+    stem = Path(record["_metadata_path"]).stem
+    mesh_path = Path(record["_root"]) / "meshes" / f"{stem}.ply"
+    mesh = trimesh.load(mesh_path, process=False)
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    triangles = vertices[faces]
+    crosses = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    twice_areas = np.linalg.norm(crosses, axis=1)
+    if not np.isfinite(twice_areas).all() or twice_areas.sum() <= 0.0:
+        raise ValueError(f"Mesh has no valid surface area: {mesh_path}")
+    face_normals = crosses / np.maximum(twice_areas[:, None], 1e-12)
+    rng = np.random.default_rng(int(stem))
+    selected = rng.choice(
+        len(faces), num_points, p=twice_areas / twice_areas.sum()
+    )
+    chosen = triangles[selected]
+    first = np.sqrt(rng.random((num_points, 1)))
+    second = rng.random((num_points, 1))
+    points = ((1.0 - first) * chosen[:, 0]
+              + first * (1.0 - second) * chosen[:, 1]
+              + first * second * chosen[:, 2])
+    world_to_canonical = (
+        np.linalg.inv(canonical_to_camera_matrix(record))
+        @ world_to_camera_matrix(record["camera"])
+    )
+    canonical_points = transform_points(points, world_to_canonical)
+    normal_matrix = np.linalg.inv(world_to_canonical[:3, :3]).T
+    canonical_normals = face_normals[selected] @ normal_matrix.T
+    canonical_normals /= np.maximum(
+        np.linalg.norm(canonical_normals, axis=1, keepdims=True), 1e-12
+    )
+    return (canonical_points.astype(np.float32),
+            canonical_normals.astype(np.float32))
+
+
 def load_canonical_mesh_points(record, num_points):
-    """Samples an arbitrary world mesh and maps it to canonical coordinates."""
-    camera_points = load_camera_mesh_points(record, num_points)
-    camera_to_canonical = np.linalg.inv(canonical_to_camera_matrix(record))
-    return transform_points(
-        camera_points, camera_to_canonical
-    ).astype(np.float32)
+    """Samples arbitrary-mesh surface points in canonical coordinates."""
+    return load_canonical_mesh_samples(record, num_points)[0]
 
 
 def fit_canonical_statistics(records, num_points):
@@ -607,10 +716,16 @@ class CompactAtlasDataset(keras.utils.PyDataset):
         self.shuffle = shuffle
         self.rng = np.random.default_rng(seed)
         self.indices = np.arange(len(records))
-        self.mesh_targets = np.stack([
-            load_canonical_mesh_points(record, num_mesh_points)
-            for record in self.records
-        ])
+        self.mesh_targets = []
+        for record in self.records:
+            points, normals = load_canonical_mesh_samples(
+                record, num_mesh_points
+            )
+            normalized_points = (points - self.mesh_mean) / self.mesh_std
+            self.mesh_targets.append(np.concatenate(
+                [normalized_points, normals], axis=-1
+            ))
+        self.mesh_targets = np.stack(self.mesh_targets)
         self.on_epoch_end()
 
     def __len__(self):
@@ -653,10 +768,7 @@ class CompactAtlasDataset(keras.utils.PyDataset):
             name: np.stack([target[name] for target in targets])
             for name in OUTPUT_NAMES
         }
-        vertices = self.mesh_targets[indices]
-        outputs[ATLAS_OUTPUT_NAME] = (
-            vertices - self.mesh_mean
-        ) / self.mesh_std
+        outputs[ATLAS_OUTPUT_NAME] = self.mesh_targets[indices]
         if self.reference_cage is not None:
             outputs[CAGE_OUTPUT_NAME] = np.broadcast_to(
                 self.reference_cage,
@@ -1124,6 +1236,8 @@ def make_parser():
     parser.add_argument("--mesh-loss-weight", type=float, default=2.0)
     parser.add_argument("--mesh-target-points", type=int, default=1024)
     parser.add_argument("--edge-uniformity-weight", type=float, default=0.02)
+    parser.add_argument("--normal-consistency-weight", type=float, default=0.1,
+                        help="Unsigned nearest-surface normal loss weight.")
     parser.add_argument("--render-resolution", type=int, default=32)
     parser.add_argument("--y-fov", type=float, default=45.0)
     parser.add_argument("--render-floor-tolerance", type=float, default=0.01)
@@ -1185,6 +1299,8 @@ def main(argv=None):
     )
     if min(cage_weights) < 0.0:
         raise ValueError("cage loss weights cannot be negative")
+    if args.normal_consistency_weight < 0.0:
+        raise ValueError("normal consistency weight cannot be negative")
     reconstruction_weights = (
         args.rgb_reconstruction_weight, args.depth_reconstruction_weight,
         args.silhouette_reconstruction_weight,
@@ -1269,6 +1385,7 @@ def main(argv=None):
             "cage_radius": args.cage_radius,
             "cage_maximum_offset": args.cage_maximum_offset,
             "cage_validity_weight": args.cage_validity_weight,
+            "normal_consistency_weight": args.normal_consistency_weight,
             "num_vertices": num_vertices,
             "num_faces": len(faces),
             "mesh_target_points": args.mesh_target_points,
@@ -1327,7 +1444,10 @@ def main(argv=None):
     )
     atlas_loss = PhysicalAtlasLoss(
         mesh_statistics["standard_deviation"], faces, edges,
-        args.edge_uniformity_weight,
+        args.edge_uniformity_weight, args.normal_consistency_weight,
+    )
+    atlas_normal_error = PhysicalAtlasNormalError(
+        mesh_statistics["standard_deviation"], faces, edges,
     )
     rgb_loss = MaskedReconstructionHuber(
         delta=0.1, name="rendered_rgb_masked_huber"
@@ -1355,7 +1475,10 @@ def main(argv=None):
             rotation_metric,
         ],
         ATLAS_OUTPUT_NAME: [
-            keras.metrics.MeanMetricWrapper(atlas_loss, name="loss")
+            keras.metrics.MeanMetricWrapper(atlas_loss, name="loss"),
+            keras.metrics.MeanMetricWrapper(
+                atlas_normal_error, name="surface_normal_error"
+            ),
         ],
         RENDERED_RGB_OUTPUT_NAME: [
             keras.metrics.MeanMetricWrapper(rgb_loss, name="loss"),
@@ -1402,7 +1525,10 @@ def main(argv=None):
         geometry_weights = {ATLAS_OUTPUT_NAME: args.mesh_loss_weight}
         geometry_metrics = {
             ATLAS_OUTPUT_NAME: [
-                keras.metrics.MeanMetricWrapper(atlas_loss, name="loss")
+                keras.metrics.MeanMetricWrapper(atlas_loss, name="loss"),
+                keras.metrics.MeanMetricWrapper(
+                    atlas_normal_error, name="surface_normal_error"
+                ),
             ]
         }
         if args.geometry_representation == "cage":
