@@ -39,7 +39,7 @@ from paz.graphics.synthetic_data.render_inverse_graphics_atlas_predictions impor
     load_mesh_topology,
 )
 from paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_atlas import (
-    ATLAS_OUTPUT_NAME,
+    MESH_OUTPUT_NAME,
 )
 
 
@@ -193,7 +193,7 @@ def main(argv=None):
     complete_model = keras.models.load_model(model_path, compile=False)
     model = inference_model(complete_model, representation)
     statistics = normalization["targets"]
-    mesh_statistics = statistics[ATLAS_OUTPUT_NAME]
+    mesh_statistics = statistics[MESH_OUTPUT_NAME]
     shape_names = tuple(normalization["shape_names"])
     material_definition = normalization.get("material_definition", {})
     max_depth = float(preprocessing.get("max_depth", 10.0))

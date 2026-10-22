@@ -5,10 +5,8 @@ small enclosing control cage. Fixed connectivity makes mesh extraction
 immediate, while surface Chamfer supervision permits arbitrary category names
 and does not require vertex correspondence or watertight ground-truth meshes.
 
-By default, a network predicts a small enclosing cage whose mean-value
-coordinates deform a fixed, connected triangle template.  The earlier Atlas
-UV-patch representation remains available with ``--geometry-representation
-atlas`` for controlled comparisons.
+A network predicts a small enclosing cage whose mean-value coordinates deform
+a fixed, connected triangle template.
 
 Canonical mesh vertices are transformed by predicted pose and metric scale,
 then a lightweight differentiable surface-splat renderer produces object RGB,
@@ -67,39 +65,11 @@ from paz.graphics.synthetic_data.train_synthetic_rgbd_resnet18_sdf import (
 )
 
 
-ATLAS_OUTPUT_NAME = "atlas_vertices"
+MESH_OUTPUT_NAME = "mesh_vertices"
 CAGE_OUTPUT_NAME = "cage_vertices"
 RENDERED_RGB_OUTPUT_NAME = "rendered_rgb"
 RENDERED_DEPTH_OUTPUT_NAME = "rendered_depth"
 RENDERED_SILHOUETTE_OUTPUT_NAME = "rendered_silhouette"
-
-
-def build_atlas_topology(num_patches, patch_resolution):
-    """Returns UV+patch coordinates and disconnected grid triangles."""
-    axis = np.linspace(-1.0, 1.0, patch_resolution, dtype=np.float32)
-    u, v = np.meshgrid(axis, axis, indexing="ij")
-    uv = np.stack([u, v], axis=-1).reshape(-1, 2)
-    coordinates, faces, edges = [], [], []
-    vertices_per_patch = patch_resolution ** 2
-    for patch in range(num_patches):
-        identity = np.zeros((vertices_per_patch, num_patches), np.float32)
-        identity[:, patch] = 1.0
-        coordinates.append(np.concatenate([uv, identity], axis=-1))
-        offset = patch * vertices_per_patch
-        for row in range(patch_resolution - 1):
-            for column in range(patch_resolution - 1):
-                first = offset + row * patch_resolution + column
-                right = first + 1
-                below = first + patch_resolution
-                diagonal = below + 1
-                faces.extend(((first, below, diagonal),
-                              (first, diagonal, right)))
-                edges.extend(((first, right), (first, below),
-                              (first, diagonal), (right, diagonal),
-                              (below, diagonal)))
-    edges = np.unique(np.sort(np.asarray(edges, np.int32), axis=1), axis=0)
-    return (np.concatenate(coordinates).astype(np.float32),
-            np.asarray(faces, np.int32), edges)
 
 
 def mesh_edges(faces):
@@ -138,8 +108,8 @@ def build_cage_topology(template_subdivisions=2, cage_subdivisions=1,
 
 
 @keras.saving.register_keras_serializable(package="paz")
-class RepeatAtlasCoordinates(keras.layers.Layer):
-    """Repeats a global feature and appends fixed UV/patch coordinates."""
+class RepeatCageCoordinates(keras.layers.Layer):
+    """Repeats a global feature and appends fixed cage coordinates."""
 
     def __init__(self, coordinates, **kwargs):
         super().__init__(**kwargs)
@@ -386,7 +356,7 @@ class WeightedLossLogger(keras.callbacks.Callback):
 
 
 @keras.saving.register_keras_serializable(package="paz")
-class PhysicalAtlasLoss(keras.losses.Loss):
+class PhysicalMeshLoss(keras.losses.Loss):
     """Surface Chamfer, normal consistency, and edge regularization."""
 
     def __init__(self, standard_deviation, faces, edges,
@@ -506,7 +476,7 @@ class PhysicalAtlasLoss(keras.losses.Loss):
 
 
 @keras.saving.register_keras_serializable(package="paz")
-class PhysicalAtlasNormalError(PhysicalAtlasLoss):
+class PhysicalMeshNormalError(PhysicalMeshLoss):
     """Separately logged unsigned nearest-surface normal inconsistency."""
 
     def __init__(self, standard_deviation, faces, edges,
@@ -690,7 +660,7 @@ def object_render_targets(record, rgb, depth, resolution, max_depth, y_fov,
     )
 
 
-class CompactAtlasDataset(keras.utils.PyDataset):
+class CompactCageDataset(keras.utils.PyDataset):
     """Loads normalized RGB-D and arbitrary-mesh surface supervision."""
 
     def __init__(self, records, normalizer, shape_names, batch_size,
@@ -768,7 +738,7 @@ class CompactAtlasDataset(keras.utils.PyDataset):
             name: np.stack([target[name] for target in targets])
             for name in OUTPUT_NAMES
         }
-        outputs[ATLAS_OUTPUT_NAME] = self.mesh_targets[indices]
+        outputs[MESH_OUTPUT_NAME] = self.mesh_targets[indices]
         if self.reference_cage is not None:
             outputs[CAGE_OUTPUT_NAME] = np.broadcast_to(
                 self.reference_cage,
@@ -832,7 +802,7 @@ def compact_encoder(rgb, depth, regularizer, base_width):
 
 
 @keras.saving.register_keras_serializable(package="paz")
-class DifferentiableAtlasRenderer(keras.layers.Layer):
+class DifferentiableCageRenderer(keras.layers.Layer):
     """Soft-rasterizes shaded triangle centroids to RGB-D and silhouette."""
 
     def __init__(self, faces, render_resolution, y_fov_degrees,
@@ -1055,10 +1025,11 @@ class DifferentiableAtlasRenderer(keras.layers.Layer):
 def build_model(image_shape, num_shapes, coordinates, base_width,
                 l2_regularization, faces, render_resolution, y_fov,
                 target_statistics, mesh_statistics, splat_sigma,
-                depth_temperature, geometry_representation="cage",
-                cage_vertices=None, mesh_weights=None,
+                depth_temperature, cage_vertices, mesh_weights,
                 cage_maximum_offset=1.0, splat_strength=0.5):
-    """Builds a compact physical-parameter and deformable-mesh network."""
+    """Builds a compact physical-parameter and cage-deformation network."""
+    if cage_vertices is None or mesh_weights is None:
+        raise ValueError("cage vertices and MVC weights are required")
     regularizer = keras.regularizers.L2(l2_regularization)
     rgb = keras.Input((*image_shape, 3), name="rgb")
     depth = keras.Input((*image_shape, 1), name="depth")
@@ -1092,28 +1063,17 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
         "light_intensity": keras.layers.Dense(
             1, name="light_intensity")(lighting),
     }
-    if geometry_representation == "atlas":
-        mesh = RepeatAtlasCoordinates(
-            coordinates, name="repeat_atlas_coordinates"
-        )(geometry)
-        for index, width in enumerate((192, 128, 64), 1):
-            mesh = keras.layers.Dense(
-                width, activation="relu", kernel_regularizer=regularizer,
-                name=f"atlas_decoder_{index}",
-            )(mesh)
-        outputs[ATLAS_OUTPUT_NAME] = keras.layers.Dense(
-            3, name=ATLAS_OUTPUT_NAME, kernel_regularizer=regularizer
-        )(mesh)
-    elif geometry_representation == "cage":
-        if cage_vertices is None or mesh_weights is None:
-            raise ValueError("cage vertices and MVC weights are required")
+    # Every reference cage vertex is a distinct learned query. The query
+    # combines its canonical coordinate with global object context, then
+    # attends to the unpooled RGB-D feature map.
+    if cage_vertices is not None:
         # Every reference cage vertex is a distinct learned query. The query
         # combines its canonical coordinate with global object context, then
         # attends to the unpooled RGB-D feature map. This preserves one shared,
         # category-agnostic decoder while giving different cage regions access
         # to different image/depth evidence.
         query_width = 128
-        cage_queries = RepeatAtlasCoordinates(
+        cage_queries = RepeatCageCoordinates(
             cage_vertices, name="cage_vertex_queries"
         )(geometry)
         cage_queries = keras.layers.Dense(
@@ -1165,23 +1125,19 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
             reference_vertices=coordinates,
             name="cage_deformation",
         )(raw_offsets)
-        outputs[ATLAS_OUTPUT_NAME] = keras.layers.Activation(
-            "linear", name=ATLAS_OUTPUT_NAME
+        outputs[MESH_OUTPUT_NAME] = keras.layers.Activation(
+            "linear", name=MESH_OUTPUT_NAME
         )(deformed_mesh)
         outputs[CAGE_OUTPUT_NAME] = keras.layers.Activation(
             "linear", name=CAGE_OUTPUT_NAME
         )(deformed_cage)
-    else:
-        raise ValueError(
-            f"unknown geometry representation: {geometry_representation}"
-        )
-    rendered = DifferentiableAtlasRenderer(
+    rendered = DifferentiableCageRenderer(
         faces, render_resolution, y_fov, target_statistics, mesh_statistics,
         splat_sigma=splat_sigma, depth_temperature=depth_temperature,
         splat_strength=splat_strength,
-        name="differentiable_atlas_renderer",
+        name="differentiable_cage_renderer",
     )([
-        outputs[ATLAS_OUTPUT_NAME], outputs["object_translation"],
+        outputs[MESH_OUTPUT_NAME], outputs["object_translation"],
         outputs["object_orientation_6d"], outputs["object_scale"],
         outputs["material"], outputs["light_position"],
         outputs["light_intensity"],
@@ -1197,7 +1153,7 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
     )(rendered[2])
     return keras.Model(
         {"rgb": rgb, "depth": depth}, outputs,
-        name=f"compact_rgbd_{geometry_representation}_mesh",
+        name="compact_rgbd_cage_mesh",
     )
 
 
@@ -1229,7 +1185,7 @@ def save_preview_meshes(model, dataset, records, mesh_statistics,
         inputs, _ = dataset[batch_index]
         predictions = model.predict(inputs, verbose=0)
         begin = batch_index * dataset.batch_size
-        for offset, vertices in enumerate(predictions[ATLAS_OUTPUT_NAME]):
+        for offset, vertices in enumerate(predictions[MESH_OUTPUT_NAME]):
             if saved >= count:
                 return
             record = records[begin + offset]
@@ -1261,10 +1217,6 @@ def make_parser():
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path,
                         default=Path("experiments/rgbd_inverse_graphics_cage"))
-    parser.add_argument("--num-patches", type=int, default=4)
-    parser.add_argument("--patch-resolution", type=int, default=8)
-    parser.add_argument("--geometry-representation", choices=("cage", "atlas"),
-                        default="cage")
     parser.add_argument("--template-subdivisions", type=int, default=2)
     parser.add_argument("--cage-subdivisions", type=int, default=1)
     parser.add_argument("--template-radius", type=float, default=1.0)
@@ -1318,8 +1270,8 @@ def make_parser():
 def main(argv=None):
     args = make_parser().parse_args(argv)
     positive = (
-        args.num_patches, args.patch_resolution, args.base_width,
-        args.mesh_loss_weight, args.mesh_target_points, args.batch_size,
+        args.base_width, args.mesh_loss_weight, args.mesh_target_points,
+        args.batch_size,
         args.epochs, args.max_depth,
         args.checkpoint_every, args.render_resolution, args.y_fov,
         args.splat_sigma, args.splat_strength, args.depth_temperature,
@@ -1328,8 +1280,6 @@ def main(argv=None):
     )
     if any(value <= 0 for value in positive) or args.preview_meshes < 0:
         raise ValueError("sizes, weights, and ranges must be positive")
-    if args.patch_resolution < 2:
-        raise ValueError("--patch-resolution must be at least two")
     if args.template_subdivisions < 0 or args.cage_subdivisions < 0:
         raise ValueError("subdivision counts cannot be negative")
     if args.geometry_warmup_epochs < 0:
@@ -1382,52 +1332,34 @@ def main(argv=None):
         test_records, args.seed, args.validation_split,
     )
 
-    cage_vertices = cage_faces = mesh_weights = None
-    if args.geometry_representation == "cage":
-        (coordinates, faces, edges, cage_vertices, cage_faces,
-         mesh_weights) = build_cage_topology(
-            args.template_subdivisions, args.cage_subdivisions,
-            args.template_radius, args.cage_radius,
-        )
-    else:
-        coordinates, faces, edges = build_atlas_topology(
-            args.num_patches, args.patch_resolution
-        )
+    (coordinates, faces, edges, cage_vertices, cage_faces,
+     mesh_weights) = build_cage_topology(
+        args.template_subdivisions, args.cage_subdivisions,
+        args.template_radius, args.cage_radius,
+    )
     num_vertices = len(coordinates)
     normalizer = GenericTargetNormalizer.fit(training_records, shape_names)
     mesh_statistics = fit_canonical_statistics(
         training_records, args.mesh_target_points
     )
-    normalizer.statistics[ATLAS_OUTPUT_NAME] = mesh_statistics
+    normalizer.statistics[MESH_OUTPUT_NAME] = mesh_statistics
     normalizer.save(args.output / "normalization.json")
-    topology = {"coordinates": coordinates, "faces": faces, "edges": edges}
-    if args.geometry_representation == "cage":
-        topology.update({
-            "cage_vertices": cage_vertices,
-            "cage_faces": cage_faces,
-            "mesh_weights": mesh_weights,
-        })
-    # Keep the historical filename so the existing evaluation renderer can
-    # consume both Atlas and cage experiments.
+    topology = {
+        "coordinates": coordinates, "faces": faces, "edges": edges,
+        "cage_vertices": cage_vertices, "cage_faces": cage_faces,
+        "mesh_weights": mesh_weights,
+    }
     np.savez_compressed(args.output / "mesh_topology.npz", **topology)
-    np.savez_compressed(args.output / "atlas_topology.npz", **topology)
     with (args.output / "input_preprocessing.json").open("w") as file:
         json.dump({
-            "method": f"compact {args.geometry_representation} mesh",
+            "method": "compact cage-deformed mesh",
             "mesh_frame": "canonical transformed by predicted pose and scale",
-            "mesh_representation": (
-                "mean-value-coordinate cage deformation"
-                if args.geometry_representation == "cage" else
-                "direct vertices with fixed patch faces"
-            ),
-            "geometry_representation": args.geometry_representation,
+            "mesh_representation": "mean-value-coordinate cage deformation",
+            "geometry_representation": "cage",
             "cage_decoder": (
                 "per-vertex queries with four-head attention over spatial "
                 "RGB-D features"
-                if args.geometry_representation == "cage" else None
             ),
-            "num_patches": args.num_patches,
-            "patch_resolution": args.patch_resolution,
             "template_subdivisions": args.template_subdivisions,
             "cage_subdivisions": args.cage_subdivisions,
             "template_radius": args.template_radius,
@@ -1473,13 +1405,13 @@ def main(argv=None):
         "floor_tolerance": args.render_floor_tolerance,
         "reference_cage": cage_vertices,
     }
-    training = CompactAtlasDataset(
+    training = CompactCageDataset(
         training_records, shuffle=True, seed=args.seed, **common
     )
-    validation = CompactAtlasDataset(
+    validation = CompactCageDataset(
         validation_records, shuffle=False, seed=args.seed, **common
     )
-    test = CompactAtlasDataset(
+    test = CompactCageDataset(
         test_records, shuffle=False, seed=args.seed, **common
     )
     image_shape = training[0][0]["rgb"].shape[1:3]
@@ -1487,15 +1419,15 @@ def main(argv=None):
         image_shape, len(shape_names), coordinates, args.base_width,
         args.l2_regularization, faces, args.render_resolution, args.y_fov,
         normalizer.statistics, mesh_statistics, args.splat_sigma,
-        args.depth_temperature, args.geometry_representation,
-        cage_vertices, mesh_weights, args.cage_maximum_offset,
+        args.depth_temperature, cage_vertices, mesh_weights,
+        args.cage_maximum_offset,
         args.splat_strength,
     )
-    atlas_loss = PhysicalAtlasLoss(
+    mesh_loss = PhysicalMeshLoss(
         mesh_statistics["standard_deviation"], faces, edges,
         args.edge_uniformity_weight, args.normal_consistency_weight,
     )
-    atlas_normal_error = PhysicalAtlasNormalError(
+    mesh_normal_error = PhysicalMeshNormalError(
         mesh_statistics["standard_deviation"], faces, edges,
     )
     rgb_loss = MaskedReconstructionHuber(
@@ -1513,7 +1445,7 @@ def main(argv=None):
                        generic_geodesic_angle_degrees)
     extra_losses = {
         "object_orientation_6d": rotation_loss,
-        ATLAS_OUTPUT_NAME: atlas_loss,
+        MESH_OUTPUT_NAME: mesh_loss,
         RENDERED_RGB_OUTPUT_NAME: rgb_loss,
         RENDERED_DEPTH_OUTPUT_NAME: depth_loss,
         RENDERED_SILHOUETTE_OUTPUT_NAME: silhouette_loss,
@@ -1523,10 +1455,10 @@ def main(argv=None):
             keras.metrics.MeanMetricWrapper(rotation_loss, name="loss"),
             rotation_metric,
         ],
-        ATLAS_OUTPUT_NAME: [
-            keras.metrics.MeanMetricWrapper(atlas_loss, name="loss"),
+        MESH_OUTPUT_NAME: [
+            keras.metrics.MeanMetricWrapper(mesh_loss, name="loss"),
             keras.metrics.MeanMetricWrapper(
-                atlas_normal_error, name="surface_normal_error"
+                mesh_normal_error, name="surface_normal_error"
             ),
         ],
         RENDERED_RGB_OUTPUT_NAME: [
@@ -1545,48 +1477,46 @@ def main(argv=None):
         ],
     }
     extra_loss_weights = {
-        ATLAS_OUTPUT_NAME: args.mesh_loss_weight,
+        MESH_OUTPUT_NAME: args.mesh_loss_weight,
         RENDERED_RGB_OUTPUT_NAME: args.rgb_reconstruction_weight,
         RENDERED_DEPTH_OUTPUT_NAME: args.depth_reconstruction_weight,
         RENDERED_SILHOUETTE_OUTPUT_NAME: (
             args.silhouette_reconstruction_weight
         ),
     }
-    if args.geometry_representation == "cage":
-        cage_loss = CageValidityLoss(
-            cage_faces, mesh_edges(cage_faces),
-            offset_weight=args.cage_offset_weight,
-            edge_weight=args.cage_edge_weight,
-            orientation_weight=args.cage_orientation_weight,
-            area_weight=args.cage_area_weight,
-            volume_weight=args.cage_volume_weight,
-        )
-        extra_losses[CAGE_OUTPUT_NAME] = cage_loss
-        extra_metrics[CAGE_OUTPUT_NAME] = [
-            keras.metrics.MeanMetricWrapper(cage_loss, name="loss")
-        ] + cage_validity_metrics(cage_faces)
-        extra_loss_weights[CAGE_OUTPUT_NAME] = args.cage_validity_weight
+    cage_loss = CageValidityLoss(
+        cage_faces, mesh_edges(cage_faces),
+        offset_weight=args.cage_offset_weight,
+        edge_weight=args.cage_edge_weight,
+        orientation_weight=args.cage_orientation_weight,
+        area_weight=args.cage_area_weight,
+        volume_weight=args.cage_volume_weight,
+    )
+    extra_losses[CAGE_OUTPUT_NAME] = cage_loss
+    extra_metrics[CAGE_OUTPUT_NAME] = [
+        keras.metrics.MeanMetricWrapper(cage_loss, name="loss")
+    ] + cage_validity_metrics(cage_faces)
+    extra_loss_weights[CAGE_OUTPUT_NAME] = args.cage_validity_weight
     warmup_epochs = (args.epochs if args.geometry_only else
                      args.geometry_warmup_epochs)
     if warmup_epochs:
-        geometry_names = [ATLAS_OUTPUT_NAME]
-        geometry_losses = {ATLAS_OUTPUT_NAME: atlas_loss}
-        geometry_weights = {ATLAS_OUTPUT_NAME: args.mesh_loss_weight}
+        geometry_names = [MESH_OUTPUT_NAME]
+        geometry_losses = {MESH_OUTPUT_NAME: mesh_loss}
+        geometry_weights = {MESH_OUTPUT_NAME: args.mesh_loss_weight}
         geometry_metrics = {
-            ATLAS_OUTPUT_NAME: [
-                keras.metrics.MeanMetricWrapper(atlas_loss, name="loss"),
+            MESH_OUTPUT_NAME: [
+                keras.metrics.MeanMetricWrapper(mesh_loss, name="loss"),
                 keras.metrics.MeanMetricWrapper(
-                    atlas_normal_error, name="surface_normal_error"
+                    mesh_normal_error, name="surface_normal_error"
                 ),
             ]
         }
-        if args.geometry_representation == "cage":
-            geometry_names.append(CAGE_OUTPUT_NAME)
-            geometry_losses[CAGE_OUTPUT_NAME] = cage_loss
-            geometry_weights[CAGE_OUTPUT_NAME] = args.cage_validity_weight
-            geometry_metrics[CAGE_OUTPUT_NAME] = [
-                keras.metrics.MeanMetricWrapper(cage_loss, name="loss")
-            ] + cage_validity_metrics(cage_faces)
+        geometry_names.append(CAGE_OUTPUT_NAME)
+        geometry_losses[CAGE_OUTPUT_NAME] = cage_loss
+        geometry_weights[CAGE_OUTPUT_NAME] = args.cage_validity_weight
+        geometry_metrics[CAGE_OUTPUT_NAME] = [
+            keras.metrics.MeanMetricWrapper(cage_loss, name="loss")
+        ] + cage_validity_metrics(cage_faces)
         geometry_model = keras.Model(
             model.inputs,
             {name: model.get_layer(name).output for name in geometry_names},
@@ -1643,9 +1573,9 @@ def main(argv=None):
         WeightedLossLogger(logged_weights),
         keras.callbacks.CSVLogger(args.output / "training.csv"),
         TrainingPlot(
-            args.output / "loss.png", OUTPUT_NAMES + ((CAGE_OUTPUT_NAME,)
-                if args.geometry_representation == "cage" else ()) + (
-                ATLAS_OUTPUT_NAME, RENDERED_RGB_OUTPUT_NAME,
+            args.output / "loss.png", OUTPUT_NAMES + (
+                CAGE_OUTPUT_NAME,
+                MESH_OUTPUT_NAME, RENDERED_RGB_OUTPUT_NAME,
                 RENDERED_DEPTH_OUTPUT_NAME,
                 RENDERED_SILHOUETTE_OUTPUT_NAME,
             )
@@ -1669,7 +1599,7 @@ def main(argv=None):
     ]
     model.summary()
     print(
-        f"Training compact {args.geometry_representation} mesh on {device}: "
+        f"Training compact cage mesh on {device}: "
         f"{len(training_records)} train, "
         f"{len(validation_records)} validation, {len(test_records)} test; "
         f"{num_vertices} vertices, {len(faces)} faces"
@@ -1682,7 +1612,7 @@ def main(argv=None):
     save_preview_meshes(
         model, test, test_records, mesh_statistics, normalizer.statistics,
         faces,
-        args.output / f"{args.geometry_representation}_preview_meshes",
+        args.output / "cage_preview_meshes",
         min(args.preview_meshes, len(test_records)),
     )
 

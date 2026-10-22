@@ -1,10 +1,9 @@
 """Render and compare held-out inverse-graphics mesh predictions.
 
-This loads a trained ``train_synthetic_rgbd_inverse_graphics_atlas`` model,
-predicts canonical geometry and physical parameters, applies the predicted
-similarity transform, and renders the actual fixed-connectivity triangle mesh
-at the original RGB-D resolution with the PAZ renderer. Both the legacy Atlas
-patch representation and mean-value-coordinate cage deformation are supported.
+This loads a trained cage-deformation inverse-graphics model, predicts
+canonical geometry and physical parameters, applies the predicted similarity
+transform, and renders the fixed-connectivity triangle mesh at the original
+RGB-D resolution with the PAZ renderer.
 
 Example::
 
@@ -33,12 +32,11 @@ import trimesh
 
 # Register every custom layer/loss before loading the saved Keras model.
 from paz.graphics.synthetic_data.train_synthetic_rgbd_inverse_graphics_atlas import (
-    ATLAS_OUTPUT_NAME,
+    MESH_OUTPUT_NAME,
     CageMeshDeformation,
-    DifferentiableAtlasRenderer,
+    DifferentiableCageRenderer,
     MaskedReconstructionHuber,
-    PhysicalAtlasLoss,
-    RepeatAtlasCoordinates,
+    PhysicalMeshLoss,
     SilhouetteBCEDiceLoss,
     rotation_6d_to_matrix,
     camera_ray_directions,
@@ -61,37 +59,24 @@ def load_json(path):
 
 
 def load_mesh_topology(experiment, preprocessing):
-    """Loads and validates either a cage or legacy Atlas topology."""
-    candidates = (
-        experiment / "mesh_topology.npz",
-        experiment / "atlas_topology.npz",
-    )
-    topology_path = next((path for path in candidates if path.is_file()), None)
-    if topology_path is None:
-        raise FileNotFoundError(
-            "Missing mesh topology; expected mesh_topology.npz or "
-            "atlas_topology.npz"
-        )
+    """Loads and validates a cage-deformed connected-mesh topology."""
+    topology_path = experiment / "mesh_topology.npz"
+    if not topology_path.is_file():
+        raise FileNotFoundError(f"Missing cage topology: {topology_path}")
     with np.load(topology_path) as archive:
         topology = {name: archive[name] for name in archive.files}
-    required = {"coordinates", "faces"}
+    required = {
+        "coordinates", "faces", "cage_vertices", "cage_faces", "mesh_weights"
+    }
     missing = required.difference(topology)
     if missing:
         raise ValueError(
             f"{topology_path} lacks topology arrays: {sorted(missing)}"
         )
-    representation = preprocessing.get("geometry_representation")
-    inferred = "cage" if {
-        "cage_vertices", "cage_faces", "mesh_weights"
-    }.issubset(topology) else "atlas"
-    if representation is None:
-        representation = inferred
-    if representation not in ("cage", "atlas"):
-        raise ValueError(f"Unsupported geometry representation: {representation}")
-    if representation != inferred:
+    representation = preprocessing.get("geometry_representation", "cage")
+    if representation != "cage":
         raise ValueError(
-            f"Metadata says {representation!r}, but {topology_path.name} "
-            f"contains {inferred!r} topology"
+            f"Only cage geometry is supported, got {representation!r}"
         )
     faces = np.asarray(topology["faces"], dtype=np.int32)
     if faces.ndim != 2 or faces.shape[1] != 3 or np.any(faces < 0):
@@ -123,7 +108,7 @@ def load_inputs(metadata, dataset, max_depth):
 
 def decode_prediction(raw, statistics, mesh_statistics, shape_names,
                       material_definition):
-    canonical = denormalize(raw[ATLAS_OUTPUT_NAME][0], mesh_statistics)
+    canonical = denormalize(raw[MESH_OUTPUT_NAME][0], mesh_statistics)
     translation = denormalize(
         raw["object_translation"][0], statistics["object_translation"]
     )
@@ -181,9 +166,9 @@ def decode_prediction(raw, statistics, mesh_statistics, shape_names,
     }
 
 
-def inference_model(model, geometry_representation):
+def inference_model(model, geometry_representation="cage"):
     required = (
-        ATLAS_OUTPUT_NAME, "object_translation", "object_orientation_6d",
+        MESH_OUTPUT_NAME, "object_translation", "object_orientation_6d",
         "object_scale", "shape", "material", "light_position",
         "light_intensity",
     )
@@ -192,15 +177,16 @@ def inference_model(model, geometry_representation):
     if missing:
         raise ValueError(f"Model lacks outputs: {sorted(missing)}")
     selected = {name: outputs[name] for name in required}
-    if geometry_representation == "cage":
-        try:
-            selected["cage_vertex_offsets_raw"] = model.get_layer(
-                "cage_vertex_offsets"
-            ).output
-        except ValueError as error:
-            raise ValueError(
-                "Cage experiment model lacks the cage_vertex_offsets layer"
-            ) from error
+    if geometry_representation != "cage":
+        raise ValueError("Only cage geometry is supported")
+    try:
+        selected["cage_vertex_offsets_raw"] = model.get_layer(
+            "cage_vertex_offsets"
+        ).output
+    except ValueError as error:
+        raise ValueError(
+            "Cage experiment model lacks the cage_vertex_offsets layer"
+        ) from error
     return keras.Model(model.inputs, selected)
 
 
@@ -346,14 +332,13 @@ def main(argv=None):
         "rendered_rgb", "rendered_depth", "comparisons",
         "canonical_meshes", "camera_meshes", "world_meshes", "metadata",
     ]
-    if geometry_representation == "cage":
-        directories.extend((
-            "canonical_cages", "camera_cages", "world_cages",
-        ))
+    directories.extend((
+        "canonical_cages", "camera_cages", "world_cages",
+    ))
     for name in directories:
         (output / name).mkdir(parents=True, exist_ok=True)
     statistics = normalization["targets"]
-    mesh_statistics = statistics[ATLAS_OUTPUT_NAME]
+    mesh_statistics = statistics[MESH_OUTPUT_NAME]
     shape_names = tuple(normalization["shape_names"])
     material_definition = normalization.get("material_definition", {})
     max_depth = float(preprocessing.get("max_depth", 10.0))
@@ -399,14 +384,12 @@ def main(argv=None):
             validity = mesh_validity_metrics(
                 canonical_vertices, faces, "mesh"
             )
-            predicted_cage_vertices = None
-            if geometry_representation == "cage":
-                predicted_cage_vertices = decode_cage_vertices(
-                    raw, topology, preprocessing
-                )
-                validity.update(mesh_validity_metrics(
-                    predicted_cage_vertices, topology["cage_faces"], "cage"
-                ))
+            predicted_cage_vertices = decode_cage_vertices(
+                raw, topology, preprocessing
+            )
+            validity.update(mesh_validity_metrics(
+                predicted_cage_vertices, topology["cage_faces"], "cage"
+            ))
             render_start = time.perf_counter()
             rendered_rgb, rendered_depth, object_to_camera, object_to_world, \
                 light_world = render(
@@ -449,24 +432,22 @@ def main(argv=None):
             )
             camera_mesh.export(output / "camera_meshes" / f"{sample_id}.ply")
             world_mesh.export(output / "world_meshes" / f"{sample_id}.ply")
-            cage_paths = None
-            if geometry_representation == "cage":
-                cage_faces = np.asarray(topology["cage_faces"], np.int32)
-                canonical_cage = trimesh.Trimesh(
-                    predicted_cage_vertices, cage_faces, process=False
-                )
-                camera_cage = canonical_cage.copy()
-                camera_cage.apply_transform(object_to_camera)
-                world_cage = canonical_cage.copy()
-                world_cage.apply_transform(object_to_world)
-                cage_paths = {
-                    "canonical": f"canonical_cages/{sample_id}.ply",
-                    "camera": f"camera_cages/{sample_id}.ply",
-                    "world": f"world_cages/{sample_id}.ply",
-                }
-                canonical_cage.export(output / cage_paths["canonical"])
-                camera_cage.export(output / cage_paths["camera"])
-                world_cage.export(output / cage_paths["world"])
+            cage_faces = np.asarray(topology["cage_faces"], np.int32)
+            canonical_cage = trimesh.Trimesh(
+                predicted_cage_vertices, cage_faces, process=False
+            )
+            camera_cage = canonical_cage.copy()
+            camera_cage.apply_transform(object_to_camera)
+            world_cage = canonical_cage.copy()
+            world_cage.apply_transform(object_to_world)
+            cage_paths = {
+                "canonical": f"canonical_cages/{sample_id}.ply",
+                "camera": f"camera_cages/{sample_id}.ply",
+                "world": f"world_cages/{sample_id}.ply",
+            }
+            canonical_cage.export(output / cage_paths["canonical"])
+            camera_cage.export(output / cage_paths["camera"])
+            world_cage.export(output / cage_paths["world"])
             write_rgb(output / "rendered_rgb" / f"{sample_id}.png",
                       rendered_rgb)
             np.save(output / "rendered_depth" / f"{sample_id}.npy",
@@ -485,8 +466,7 @@ def main(argv=None):
                 "light_position_world_xyz": light_world,
                 "metrics": metrics,
             }
-            if cage_paths is not None:
-                payload["predicted_control_cages"] = cage_paths
+            payload["predicted_control_cages"] = cage_paths
             with (output / "metadata" / f"{sample_id}.json").open("w") as file:
                 json.dump(jsonify(payload), file, indent=2)
             print(
