@@ -959,6 +959,7 @@ def main(argv=None):
         })
     # Keep the historical filename so the existing evaluation renderer can
     # consume both Atlas and cage experiments.
+    np.savez_compressed(args.output / "mesh_topology.npz", **topology)
     np.savez_compressed(args.output / "atlas_topology.npz", **topology)
     with (args.output / "input_preprocessing.json").open("w") as file:
         json.dump({
