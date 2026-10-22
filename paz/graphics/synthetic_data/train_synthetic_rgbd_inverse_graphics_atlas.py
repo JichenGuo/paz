@@ -344,6 +344,47 @@ class CageValidityLoss(keras.losses.Loss):
         return config
 
 
+def cage_validity_metrics(cage_faces):
+    """Returns separately logged terms of the cage validity objective."""
+    edges = mesh_edges(cage_faces)
+    specifications = {
+        "offset_mse": (1.0, 0.0, 0.0, 0.0, 0.0),
+        "edge_distortion": (0.0, 1.0, 0.0, 0.0, 0.0),
+        "orientation_barrier": (0.0, 0.0, 1.0, 0.0, 0.0),
+        "area_barrier": (0.0, 0.0, 0.0, 1.0, 0.0),
+        "volume_error": (0.0, 0.0, 0.0, 0.0, 1.0),
+    }
+    metrics = []
+    for name, weights in specifications.items():
+        term = CageValidityLoss(
+            cage_faces, edges, offset_weight=weights[0],
+            edge_weight=weights[1], orientation_weight=weights[2],
+            area_weight=weights[3], volume_weight=weights[4],
+            name=f"cage_{name}",
+        )
+        metrics.append(keras.metrics.MeanMetricWrapper(term, name=name))
+    return metrics
+
+
+class WeightedLossLogger(keras.callbacks.Callback):
+    """Adds explicit weighted loss contributions to epoch logs and CSV."""
+
+    def __init__(self, loss_weights):
+        super().__init__()
+        self.loss_weights = dict(loss_weights)
+
+    def on_epoch_end(self, epoch, logs=None):
+        if logs is None:
+            return
+        for output, weight in self.loss_weights.items():
+            for prefix in ("", "val_"):
+                source = f"{prefix}{output}_loss"
+                if source in logs:
+                    logs[f"{prefix}{output}_weighted_loss"] = (
+                        float(weight) * float(logs[source])
+                    )
+
+
 @keras.saving.register_keras_serializable(package="paz")
 class PhysicalAtlasLoss(keras.losses.Loss):
     """Triangle-surface Chamfer plus inexpensive edge regularization."""
@@ -633,6 +674,25 @@ class CompactAtlasDataset(keras.utils.PyDataset):
             self.rng.shuffle(self.indices)
 
 
+class OutputSubsetDataset(keras.utils.PyDataset):
+    """Presents selected targets from another dataset without copying data."""
+
+    def __init__(self, dataset, output_names):
+        super().__init__()
+        self.dataset = dataset
+        self.output_names = tuple(output_names)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        inputs, targets = self.dataset[index]
+        return inputs, {name: targets[name] for name in self.output_names}
+
+    def on_epoch_end(self):
+        self.dataset.on_epoch_end()
+
+
 def compact_encoder(rgb, depth, regularizer, base_width):
     features = keras.layers.Concatenate(name="rgbd_concatenation")([rgb, depth])
     for index, width in enumerate([
@@ -641,8 +701,8 @@ def compact_encoder(rgb, depth, regularizer, base_width):
             width, 3, strides=2, padding="same", use_bias=False,
             kernel_regularizer=regularizer, name=f"compact_conv_{index}",
         )(features)
-        features = keras.layers.BatchNormalization(
-            name=f"compact_bn_{index}"
+        features = keras.layers.GroupNormalization(
+            groups=min(8, width), name=f"compact_group_norm_{index}"
         )(features)
         features = keras.layers.Activation(
             "relu", name=f"compact_relu_{index}"
@@ -882,7 +942,7 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
                 target_statistics, mesh_statistics, splat_sigma,
                 depth_temperature, geometry_representation="cage",
                 cage_vertices=None, mesh_weights=None,
-                cage_maximum_offset=1.0):
+                cage_maximum_offset=1.0, splat_strength=0.5):
     """Builds a compact physical-parameter and deformable-mesh network."""
     regularizer = keras.regularizers.L2(l2_regularization)
     rgb = keras.Input((*image_shape, 3), name="rgb")
@@ -962,6 +1022,7 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
     rendered = DifferentiableAtlasRenderer(
         faces, render_resolution, y_fov, target_statistics, mesh_statistics,
         splat_sigma=splat_sigma, depth_temperature=depth_temperature,
+        splat_strength=splat_strength,
         name="differentiable_atlas_renderer",
     )([
         outputs[ATLAS_OUTPUT_NAME], outputs["object_translation"],
@@ -1066,12 +1127,23 @@ def make_parser():
     parser.add_argument("--render-resolution", type=int, default=32)
     parser.add_argument("--y-fov", type=float, default=45.0)
     parser.add_argument("--render-floor-tolerance", type=float, default=0.01)
-    parser.add_argument("--splat-sigma", type=float, default=1.2)
+    parser.add_argument("--splat-sigma", type=float, default=0.3)
+    parser.add_argument("--splat-strength", type=float, default=0.5)
     parser.add_argument("--depth-temperature", type=float, default=0.15)
     parser.add_argument("--rgb-reconstruction-weight", type=float, default=0.25)
     parser.add_argument("--depth-reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--silhouette-reconstruction-weight", type=float,
-                        default=1.0)
+                        default=0.1)
+    parser.add_argument("--geometry-warmup-epochs", type=int, default=15,
+                        help="Geometry-only epochs before joint optimization.")
+    parser.add_argument(
+        "--geometry-only", action="store_true",
+        help="Train only mesh and cage losses for --epochs epochs, then stop.",
+    )
+    parser.add_argument(
+        "--overfit-sample-ids", nargs="+", default=None,
+        help="Diagnostic: use only these sample IDs for train and validation.",
+    )
     parser.add_argument("--preview-meshes", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=100)
@@ -1092,7 +1164,8 @@ def main(argv=None):
         args.mesh_loss_weight, args.mesh_target_points, args.batch_size,
         args.epochs, args.max_depth,
         args.checkpoint_every, args.render_resolution, args.y_fov,
-        args.splat_sigma, args.depth_temperature, args.template_radius,
+        args.splat_sigma, args.splat_strength, args.depth_temperature,
+        args.template_radius,
         args.cage_radius, args.cage_maximum_offset,
     )
     if any(value <= 0 for value in positive) or args.preview_meshes < 0:
@@ -1101,6 +1174,8 @@ def main(argv=None):
         raise ValueError("--patch-resolution must be at least two")
     if args.template_subdivisions < 0 or args.cage_subdivisions < 0:
         raise ValueError("subdivision counts cannot be negative")
+    if args.geometry_warmup_epochs < 0:
+        raise ValueError("--geometry-warmup-epochs cannot be negative")
     if args.edge_uniformity_weight < 0.0:
         raise ValueError("--edge-uniformity-weight cannot be negative")
     cage_weights = (
@@ -1120,7 +1195,9 @@ def main(argv=None):
         raise ValueError("--render-floor-tolerance cannot be negative")
     args.output.mkdir(parents=True, exist_ok=True)
 
-    devices = jax.devices("cuda")
+    # Respect JAX_PLATFORMS: CUDA is used on the server, while explicit CPU
+    # runs remain possible for focused diagnostics and unit tests.
+    devices = jax.devices()
     device = devices[0]
     jax.config.update("jax_default_device", device)
     records = load_records(args.dataset)
@@ -1128,6 +1205,16 @@ def main(argv=None):
     training_records, validation_records, test_records = split_records(
         records, args.seed, args.validation_split
     )
+    if args.overfit_sample_ids:
+        by_id = {
+            Path(record["_metadata_path"]).stem: record for record in records
+        }
+        missing = set(args.overfit_sample_ids).difference(by_id)
+        if missing:
+            raise ValueError(f"Unknown overfit sample IDs: {sorted(missing)}")
+        training_records = [by_id[name] for name in args.overfit_sample_ids]
+        validation_records = list(training_records)
+        print(f"Diagnostic overfit set: {args.overfit_sample_ids}")
     export_test_split(test_records, args.output / "test_split")
     export_test_meshes(test_records, args.output / "test_split")
     save_split_manifest(
@@ -1193,12 +1280,14 @@ def main(argv=None):
             ),
             "render_floor_tolerance_metres": args.render_floor_tolerance,
             "splat_sigma_pixels": args.splat_sigma,
+            "splat_strength": args.splat_strength,
             "depth_temperature_metres": args.depth_temperature,
             "rgb_reconstruction_weight": args.rgb_reconstruction_weight,
             "depth_reconstruction_weight": args.depth_reconstruction_weight,
             "silhouette_reconstruction_weight": (
                 args.silhouette_reconstruction_weight
             ),
+            "geometry_warmup_epochs": args.geometry_warmup_epochs,
             "rgb_range": [0.0, 1.0],
             "depth_range": [0.0, 1.0],
             "requires_watertight_meshes": False,
@@ -1234,6 +1323,7 @@ def main(argv=None):
         normalizer.statistics, mesh_statistics, args.splat_sigma,
         args.depth_temperature, args.geometry_representation,
         cage_vertices, mesh_weights, args.cage_maximum_offset,
+        args.splat_strength,
     )
     atlas_loss = PhysicalAtlasLoss(
         mesh_statistics["standard_deviation"], faces, edges,
@@ -1260,7 +1350,10 @@ def main(argv=None):
         RENDERED_SILHOUETTE_OUTPUT_NAME: silhouette_loss,
     }
     extra_metrics = {
-        "object_orientation_6d": [rotation_metric],
+        "object_orientation_6d": [
+            keras.metrics.MeanMetricWrapper(rotation_loss, name="loss"),
+            rotation_metric,
+        ],
         ATLAS_OUTPUT_NAME: [
             keras.metrics.MeanMetricWrapper(atlas_loss, name="loss")
         ],
@@ -1299,14 +1392,80 @@ def main(argv=None):
         extra_losses[CAGE_OUTPUT_NAME] = cage_loss
         extra_metrics[CAGE_OUTPUT_NAME] = [
             keras.metrics.MeanMetricWrapper(cage_loss, name="loss")
-        ]
+        ] + cage_validity_metrics(cage_faces)
         extra_loss_weights[CAGE_OUTPUT_NAME] = args.cage_validity_weight
+    warmup_epochs = (args.epochs if args.geometry_only else
+                     args.geometry_warmup_epochs)
+    if warmup_epochs:
+        geometry_names = [ATLAS_OUTPUT_NAME]
+        geometry_losses = {ATLAS_OUTPUT_NAME: atlas_loss}
+        geometry_weights = {ATLAS_OUTPUT_NAME: args.mesh_loss_weight}
+        geometry_metrics = {
+            ATLAS_OUTPUT_NAME: [
+                keras.metrics.MeanMetricWrapper(atlas_loss, name="loss")
+            ]
+        }
+        if args.geometry_representation == "cage":
+            geometry_names.append(CAGE_OUTPUT_NAME)
+            geometry_losses[CAGE_OUTPUT_NAME] = cage_loss
+            geometry_weights[CAGE_OUTPUT_NAME] = args.cage_validity_weight
+            geometry_metrics[CAGE_OUTPUT_NAME] = [
+                keras.metrics.MeanMetricWrapper(cage_loss, name="loss")
+            ] + cage_validity_metrics(cage_faces)
+        geometry_model = keras.Model(
+            model.inputs,
+            {name: model.get_layer(name).output for name in geometry_names},
+            name="cage_geometry_warmup",
+        )
+        geometry_model.compile(
+            optimizer=keras.optimizers.AdamW(
+                args.learning_rate, weight_decay=args.weight_decay,
+                global_clipnorm=1.0,
+            ),
+            loss=geometry_losses, loss_weights=geometry_weights,
+            metrics=geometry_metrics,
+        )
+        print(
+            f"Geometry-only training for {warmup_epochs} epochs"
+        )
+        geometry_model.fit(
+            OutputSubsetDataset(training, geometry_names),
+            validation_data=OutputSubsetDataset(validation, geometry_names),
+            epochs=warmup_epochs,
+            callbacks=[
+                WeightedLossLogger(geometry_weights),
+                keras.callbacks.CSVLogger(
+                    args.output / "geometry_warmup.csv"
+                ),
+                keras.callbacks.TerminateOnNaN(),
+                keras.callbacks.ModelCheckpoint(
+                    args.output / "geometry_warmup_best.weights.h5",
+                    monitor="val_loss", mode="min", save_best_only=True,
+                    save_weights_only=True,
+                ),
+            ],
+        )
+        geometry_model.load_weights(
+            args.output / "geometry_warmup_best.weights.h5"
+        )
+        if args.geometry_only:
+            model.save(args.output / "geometry_only.keras")
+            save_preview_meshes(
+                model, test, test_records, mesh_statistics,
+                normalizer.statistics, faces,
+                args.output / "geometry_only_preview_meshes",
+                min(args.preview_meshes, len(test_records)),
+            )
+            return
     compile_model(
         model, args.learning_rate, args.weight_decay, normalizer.statistics,
         extra_losses=extra_losses, extra_metrics=extra_metrics,
         extra_loss_weights=extra_loss_weights,
     )
+    logged_weights = {name: 1.0 for name in OUTPUT_NAMES}
+    logged_weights.update(extra_loss_weights)
     callbacks = [
+        WeightedLossLogger(logged_weights),
         keras.callbacks.CSVLogger(args.output / "training.csv"),
         TrainingPlot(
             args.output / "loss.png", OUTPUT_NAMES + ((CAGE_OUTPUT_NAME,)

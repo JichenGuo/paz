@@ -378,7 +378,7 @@ def build_model(input_shape=(256, 256), l2_regularization=1e-4,
 
 def compile_model(model, learning_rate, weight_decay, statistics,
                   extra_losses=None, extra_metrics=None,
-                  extra_loss_weights=None):
+                  extra_loss_weights=None, loss_weight_overrides=None):
     translation_std = statistics["object_translation"]["standard_deviation"]
     scale_std = statistics["object_scale"]["standard_deviation"]
     material_std = statistics["material"]["standard_deviation"]
@@ -454,6 +454,8 @@ def compile_model(model, learning_rate, weight_decay, statistics,
     loss_weights["light_position"] = 1.0
     if extra_loss_weights:
         loss_weights.update(extra_loss_weights)
+    if loss_weight_overrides:
+        loss_weights.update(loss_weight_overrides)
     optimizer = keras.optimizers.AdamW(
         learning_rate, weight_decay=weight_decay, global_clipnorm=1.0
     )
