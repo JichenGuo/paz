@@ -72,8 +72,8 @@ RENDERED_RGB_OUTPUT_NAME = "rendered_rgb"
 RENDERED_DEPTH_OUTPUT_NAME = "rendered_depth"
 RENDERED_SILHOUETTE_OUTPUT_NAME = "rendered_silhouette"
 Objectives = namedtuple("Objectives", [
-    "mesh", "mesh_normal", "rotation", "rotation_metric", "cage",
-    "losses", "metrics", "weights",
+    "mesh", "mesh_normal", "point_plane", "normal_variation", "rotation",
+    "rotation_metric", "cage", "losses", "metrics", "weights",
 ])
 CageDecoderArgs = namedtuple("CageDecoderArgs", [
     "coordinates", "vertices", "weights", "mesh_statistics", "max_offset",
@@ -115,6 +115,18 @@ def mesh_edges(faces):
         faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]],
     ])
     return np.unique(np.sort(edges, axis=1), axis=0).astype(np.int32)
+
+
+def face_adjacency(faces):
+    edge_faces = {}
+    for face_index, face in enumerate(np.asarray(faces, np.int32)):
+        for first, second in ((face[0], face[1]), (face[1], face[2]),
+                              (face[2], face[0])):
+            edge = tuple(sorted((int(first), int(second))))
+            edge_faces.setdefault(edge, []).append(face_index)
+    adjacent = [indices for indices in edge_faces.values()
+                if len(indices) == 2]
+    return np.asarray(adjacent, np.int32)
 
 
 def build_cage_topology(template_subdivisions=2, cage_subdivisions=1,
@@ -502,14 +514,19 @@ class PhysicalMeshLoss(keras.losses.Loss):
                  edge_uniformity_weight=0.02,
                  normal_consistency_weight=0.1,
                  point_to_plane_weight=0.5,
+                 normal_variation_weight=0.25,
+                 discontinuity_emphasis=4.0,
                  name="physical_surface_chamfer_m2", **kwargs):
         super().__init__(name=name, **kwargs)
         self.standard_deviation = tuple(float(x) for x in standard_deviation)
         self.faces = np.asarray(faces, dtype=np.int32)
         self.edges = np.asarray(edges, dtype=np.int32)
+        self.face_adjacency = face_adjacency(self.faces)
         self.edge_uniformity_weight = float(edge_uniformity_weight)
         self.normal_consistency_weight = float(normal_consistency_weight)
         self.point_to_plane_weight = float(point_to_plane_weight)
+        self.normal_variation_weight = float(normal_variation_weight)
+        self.discontinuity_emphasis = float(discontinuity_emphasis)
         # Fixed deterministic samples cover triangle interiors, unlike a loss
         # on template vertices alone. The centroid and three inset corners
         # avoid duplicating samples along shared edges.
@@ -613,16 +630,54 @@ class PhysicalMeshLoss(keras.losses.Loss):
             keras.ops.mean(surface_plane, axis=1)
             + keras.ops.mean(target_plane, axis=1)
         )
-        return chamfer, normal_error, uniformity, point_to_plane
+        centers = keras.ops.mean(triangles, axis=2)
+        center_differences = (
+            centers[:, :, None, :] - target_physical[:, None, :, :]
+        )
+        center_squared = keras.ops.sum(
+            keras.ops.square(center_differences), axis=-1
+        )
+        center_matches = keras.ops.argmin(center_squared, axis=2)
+        matched_center_normals = keras.ops.take_along_axis(
+            target_normals,
+            keras.ops.repeat(center_matches[..., None], 3, axis=-1),
+            axis=1,
+        )
+        adjacency = keras.ops.convert_to_tensor(
+            self.face_adjacency, dtype="int32"
+        )
+        first_faces = keras.ops.take(face_normals, adjacency[:, 0], axis=1)
+        second_faces = keras.ops.take(face_normals, adjacency[:, 1], axis=1)
+        first_targets = keras.ops.take(
+            matched_center_normals, adjacency[:, 0], axis=1
+        )
+        second_targets = keras.ops.take(
+            matched_center_normals, adjacency[:, 1], axis=1
+        )
+        predicted_variation = 1.0 - keras.ops.abs(keras.ops.sum(
+            first_faces * second_faces, axis=-1
+        ))
+        target_variation = 1.0 - keras.ops.abs(keras.ops.sum(
+            first_targets * second_targets, axis=-1
+        ))
+        emphasis = 1.0 + self.discontinuity_emphasis * target_variation
+        variation_squared = keras.ops.square(
+            predicted_variation - target_variation
+        )
+        variation_error = keras.ops.sum(
+            emphasis * variation_squared, axis=1
+        ) / keras.ops.maximum(keras.ops.sum(emphasis, axis=1), 1e-8)
+        return (chamfer, normal_error, uniformity, point_to_plane,
+                variation_error)
 
     def call(self, target, prediction):
-        chamfer, normal_error, uniformity, point_to_plane = self.components(
-            target, prediction
-        )
+        terms = self.components(target, prediction)
+        chamfer, normal_error, uniformity, point_to_plane, variation = terms
         return (chamfer
                 + self.normal_consistency_weight * normal_error
                 + self.edge_uniformity_weight * uniformity
-                + self.point_to_plane_weight * point_to_plane)
+                + self.point_to_plane_weight * point_to_plane
+                + self.normal_variation_weight * variation)
 
     def normal_error(self, target, prediction):
         """Returns unsigned nearest-surface normal error in [0, 1]."""
@@ -637,6 +692,8 @@ class PhysicalMeshLoss(keras.losses.Loss):
             "edge_uniformity_weight": self.edge_uniformity_weight,
             "normal_consistency_weight": self.normal_consistency_weight,
             "point_to_plane_weight": self.point_to_plane_weight,
+            "normal_variation_weight": self.normal_variation_weight,
+            "discontinuity_emphasis": self.discontinuity_emphasis,
         })
         return config
 
@@ -649,10 +706,13 @@ class PhysicalMeshNormalError(PhysicalMeshLoss):
                  edge_uniformity_weight=0.0,
                  normal_consistency_weight=0.0,
                  point_to_plane_weight=0.0,
+                 normal_variation_weight=0.0,
+                 discontinuity_emphasis=4.0,
                  name="surface_normal_error", **kwargs):
         super().__init__(
             standard_deviation, faces, edges, edge_uniformity_weight,
             normal_consistency_weight, point_to_plane_weight,
+            normal_variation_weight, discontinuity_emphasis,
             name=name, **kwargs,
         )
 
@@ -664,14 +724,42 @@ class PhysicalMeshNormalError(PhysicalMeshLoss):
 class PhysicalMeshPointPlaneError(PhysicalMeshLoss):
 
     def __init__(self, standard_deviation, faces, edges,
+                 edge_uniformity_weight=0.0,
+                 normal_consistency_weight=0.0,
+                 point_to_plane_weight=0.0,
+                 normal_variation_weight=0.0,
+                 discontinuity_emphasis=4.0,
                  name="surface_point_to_plane_m2", **kwargs):
         super().__init__(
-            standard_deviation, faces, edges, 0.0, 0.0, 0.0,
+            standard_deviation, faces, edges, edge_uniformity_weight,
+            normal_consistency_weight, point_to_plane_weight,
+            normal_variation_weight, discontinuity_emphasis,
             name=name, **kwargs,
         )
 
     def call(self, target, prediction):
         return self.components(target, prediction)[3]
+
+
+@keras.saving.register_keras_serializable(package="paz")
+class PhysicalMeshNormalVariationError(PhysicalMeshLoss):
+
+    def __init__(self, standard_deviation, faces, edges,
+                 edge_uniformity_weight=0.0,
+                 normal_consistency_weight=0.0,
+                 point_to_plane_weight=0.0,
+                 normal_variation_weight=0.0,
+                 discontinuity_emphasis=4.0,
+                 name="local_normal_variation_error", **kwargs):
+        super().__init__(
+            standard_deviation, faces, edges, edge_uniformity_weight,
+            normal_consistency_weight, point_to_plane_weight,
+            normal_variation_weight,
+            discontinuity_emphasis, name=name, **kwargs,
+        )
+
+    def call(self, target, prediction):
+        return self.components(target, prediction)[4]
 
 
 @keras.saving.register_keras_serializable(package="paz")
@@ -1460,6 +1548,8 @@ def make_parser():
     parser.add_argument("--normal-consistency-weight", type=float, default=0.1,
                         help="Unsigned nearest-surface normal loss weight.")
     parser.add_argument("--point-to-plane-weight", type=float, default=0.5)
+    parser.add_argument("--normal-variation-weight", type=float, default=0.25)
+    parser.add_argument("--discontinuity-emphasis", type=float, default=4.0)
     parser.add_argument("--joint-pose-loss-weight", type=float, default=0.25)
     parser.add_argument("--render-resolution", type=int, default=32)
     parser.add_argument("--y-fov", type=float, default=45.0)
@@ -1521,7 +1611,8 @@ def validate_args(args):
     )
     other_weights = (
         args.edge_uniformity_weight, args.normal_consistency_weight,
-        args.point_to_plane_weight, args.joint_pose_loss_weight,
+        args.point_to_plane_weight, args.normal_variation_weight,
+        args.discontinuity_emphasis, args.joint_pose_loss_weight,
         args.render_floor_tolerance,
     )
     if min(cage_weights + reconstruction_weights + other_weights) < 0.0:
@@ -1549,13 +1640,18 @@ def build_objectives(args, mesh_statistics, faces, edges, cage_faces,
     mesh = PhysicalMeshLoss(
         mesh_statistics["standard_deviation"], faces, edges,
         args.edge_uniformity_weight, args.normal_consistency_weight,
-        args.point_to_plane_weight,
+        args.point_to_plane_weight, args.normal_variation_weight,
+        args.discontinuity_emphasis,
     )
     mesh_normal = PhysicalMeshNormalError(
         mesh_statistics["standard_deviation"], faces, edges
     )
     point_plane = PhysicalMeshPointPlaneError(
         mesh_statistics["standard_deviation"], faces, edges
+    )
+    normal_variation = PhysicalMeshNormalVariationError(
+        mesh_statistics["standard_deviation"], faces, edges,
+        discontinuity_emphasis=args.discontinuity_emphasis,
     )
     primitive_shapes = shape_names == ("cube", "cylinder", "sphere")
     if primitive_shapes:
@@ -1600,6 +1696,9 @@ def build_objectives(args, mesh_statistics, faces, edges, cage_faces,
             keras.metrics.MeanMetricWrapper(
                 point_plane, name="surface_point_to_plane_m2"
             ),
+            keras.metrics.MeanMetricWrapper(
+                normal_variation, name="local_normal_variation_error"
+            ),
         ],
         CAGE_OUTPUT_NAME: [
             keras.metrics.MeanMetricWrapper(cage, name="loss")
@@ -1627,8 +1726,10 @@ def build_objectives(args, mesh_statistics, faces, edges, cage_faces,
         RENDERED_SILHOUETTE_OUTPUT_NAME:
             args.silhouette_reconstruction_weight,
     }
-    return Objectives(mesh, mesh_normal, rotation, rotation_metric, cage,
-                      losses, metrics, weights)
+    return Objectives(
+        mesh, mesh_normal, point_plane, normal_variation, rotation,
+        rotation_metric, cage, losses, metrics, weights
+    )
 
 
 def main(argv=None):
@@ -1695,6 +1796,8 @@ def main(argv=None):
             "cage_validity_weight": args.cage_validity_weight,
             "normal_consistency_weight": args.normal_consistency_weight,
             "point_to_plane_weight": args.point_to_plane_weight,
+            "normal_variation_weight": args.normal_variation_weight,
+            "discontinuity_emphasis": args.discontinuity_emphasis,
             "joint_pose_loss_weight": args.joint_pose_loss_weight,
             "encoder_mask_conditioning": (
                 "RGB-D, object mask, masked RGB, and masked depth"
@@ -1783,6 +1886,13 @@ def main(argv=None):
                 keras.metrics.MeanMetricWrapper(objectives.mesh, name="loss"),
                 keras.metrics.MeanMetricWrapper(
                     objectives.mesh_normal, name="surface_normal_error"
+                ),
+                keras.metrics.MeanMetricWrapper(
+                    objectives.point_plane, name="surface_point_to_plane_m2"
+                ),
+                keras.metrics.MeanMetricWrapper(
+                    objectives.normal_variation,
+                    name="local_normal_variation_error",
                 ),
             ],
             "object_translation": [
