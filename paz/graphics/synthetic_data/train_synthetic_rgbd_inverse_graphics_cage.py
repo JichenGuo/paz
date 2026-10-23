@@ -1443,7 +1443,7 @@ def make_parser():
     parser.add_argument("--output", type=Path,
                         default=Path("experiments/rgbd_inverse_graphics_cage"))
     parser.add_argument("--template-subdivisions", type=int, default=2)
-    parser.add_argument("--cage-subdivisions", type=int, default=1)
+    parser.add_argument("--cage-subdivisions", type=int, default=2)
     parser.add_argument("--template-radius", type=float, default=1.0)
     parser.add_argument("--cage-radius", type=float, default=1.25)
     parser.add_argument("--cage-maximum-offset", type=float, default=0.65)
@@ -1456,7 +1456,7 @@ def make_parser():
     parser.add_argument("--base-width", type=int, default=16)
     parser.add_argument("--mesh-loss-weight", type=float, default=2.0)
     parser.add_argument("--mesh-target-points", type=int, default=1024)
-    parser.add_argument("--edge-uniformity-weight", type=float, default=0.02)
+    parser.add_argument("--edge-uniformity-weight", type=float, default=0.005)
     parser.add_argument("--normal-consistency-weight", type=float, default=0.1,
                         help="Unsigned nearest-surface normal loss weight.")
     parser.add_argument("--point-to-plane-weight", type=float, default=0.5)
