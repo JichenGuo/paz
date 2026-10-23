@@ -501,6 +501,7 @@ class PhysicalMeshLoss(keras.losses.Loss):
     def __init__(self, standard_deviation, faces, edges,
                  edge_uniformity_weight=0.02,
                  normal_consistency_weight=0.1,
+                 point_to_plane_weight=0.5,
                  name="physical_surface_chamfer_m2", **kwargs):
         super().__init__(name=name, **kwargs)
         self.standard_deviation = tuple(float(x) for x in standard_deviation)
@@ -508,6 +509,7 @@ class PhysicalMeshLoss(keras.losses.Loss):
         self.edges = np.asarray(edges, dtype=np.int32)
         self.edge_uniformity_weight = float(edge_uniformity_weight)
         self.normal_consistency_weight = float(normal_consistency_weight)
+        self.point_to_plane_weight = float(point_to_plane_weight)
         # Fixed deterministic samples cover triangle interiors, unlike a loss
         # on template vertices alone. The centroid and three inset corners
         # avoid duplicating samples along shared edges.
@@ -588,15 +590,39 @@ class PhysicalMeshLoss(keras.losses.Loss):
         uniformity = keras.ops.mean(
             keras.ops.square(lengths - mean_length), axis=1
         )
-        return chamfer, normal_error, uniformity
+        surface_indices = keras.ops.repeat(
+            surface_to_target[..., None, None], 3, axis=-1
+        )
+        surface_offsets = keras.ops.take_along_axis(
+            differences, surface_indices, axis=2
+        )[:, :, 0]
+        target_differences = keras.ops.transpose(differences, (0, 2, 1, 3))
+        target_indices = keras.ops.repeat(
+            target_to_surface[..., None, None], 3, axis=-1
+        )
+        target_offsets = keras.ops.take_along_axis(
+            target_differences, target_indices, axis=2
+        )[:, :, 0]
+        surface_plane = keras.ops.square(keras.ops.sum(
+            surface_offsets * matched_target_normals, axis=-1
+        ))
+        target_plane = keras.ops.square(keras.ops.sum(
+            target_offsets * matched_surface_normals, axis=-1
+        ))
+        point_to_plane = 0.5 * (
+            keras.ops.mean(surface_plane, axis=1)
+            + keras.ops.mean(target_plane, axis=1)
+        )
+        return chamfer, normal_error, uniformity, point_to_plane
 
     def call(self, target, prediction):
-        chamfer, normal_error, uniformity = self.components(
+        chamfer, normal_error, uniformity, point_to_plane = self.components(
             target, prediction
         )
         return (chamfer
                 + self.normal_consistency_weight * normal_error
-                + self.edge_uniformity_weight * uniformity)
+                + self.edge_uniformity_weight * uniformity
+                + self.point_to_plane_weight * point_to_plane)
 
     def normal_error(self, target, prediction):
         """Returns unsigned nearest-surface normal error in [0, 1]."""
@@ -610,6 +636,7 @@ class PhysicalMeshLoss(keras.losses.Loss):
             "edges": self.edges.tolist(),
             "edge_uniformity_weight": self.edge_uniformity_weight,
             "normal_consistency_weight": self.normal_consistency_weight,
+            "point_to_plane_weight": self.point_to_plane_weight,
         })
         return config
 
@@ -621,14 +648,30 @@ class PhysicalMeshNormalError(PhysicalMeshLoss):
     def __init__(self, standard_deviation, faces, edges,
                  edge_uniformity_weight=0.0,
                  normal_consistency_weight=0.0,
+                 point_to_plane_weight=0.0,
                  name="surface_normal_error", **kwargs):
         super().__init__(
             standard_deviation, faces, edges, edge_uniformity_weight,
-            normal_consistency_weight, name=name, **kwargs,
+            normal_consistency_weight, point_to_plane_weight,
+            name=name, **kwargs,
         )
 
     def call(self, target, prediction):
         return self.components(target, prediction)[1]
+
+
+@keras.saving.register_keras_serializable(package="paz")
+class PhysicalMeshPointPlaneError(PhysicalMeshLoss):
+
+    def __init__(self, standard_deviation, faces, edges,
+                 name="surface_point_to_plane_m2", **kwargs):
+        super().__init__(
+            standard_deviation, faces, edges, 0.0, 0.0, 0.0,
+            name=name, **kwargs,
+        )
+
+    def call(self, target, prediction):
+        return self.components(target, prediction)[3]
 
 
 @keras.saving.register_keras_serializable(package="paz")
@@ -660,6 +703,29 @@ class MaskedReconstructionHuber(keras.losses.Loss):
         config = super().get_config()
         config["delta"] = self.delta
         return config
+
+
+@keras.saving.register_keras_serializable(package="paz")
+class ForegroundMeanAbsoluteError(keras.metrics.Metric):
+
+    def __init__(self, name="foreground_mae", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.total = self.add_weight(name="total", initializer="zeros")
+        self.count = self.add_weight(name="count", initializer="zeros")
+
+    def update_state(self, target, prediction, sample_weight=None):
+        mask = keras.ops.max(keras.ops.abs(target), axis=-1, keepdims=True)
+        mask = keras.ops.cast(mask > 1e-6, prediction.dtype)
+        error = keras.ops.mean(keras.ops.abs(prediction - target), axis=-1)
+        self.total.assign_add(keras.ops.sum(error * mask[..., 0]))
+        self.count.assign_add(keras.ops.sum(mask))
+
+    def result(self):
+        return self.total / keras.ops.maximum(self.count, 1.0)
+
+    def reset_state(self):
+        self.total.assign(0.0)
+        self.count.assign(0.0)
 
 
 @keras.saving.register_keras_serializable(package="paz")
@@ -927,9 +993,16 @@ class OutputSubsetDataset(keras.utils.PyDataset):
         self.dataset.on_epoch_end()
 
 
-def compact_encoder(rgb, depth, regularizer, base_width):
+def compact_encoder(rgb, depth, object_mask, regularizer, base_width):
     """Returns global context and the final spatial RGB-D feature map."""
-    features = keras.layers.Concatenate(name="rgbd_concatenation")([rgb, depth])
+    masked_rgb = keras.layers.Multiply(name="masked_rgb")([rgb, object_mask])
+    masked_depth = keras.layers.Multiply(
+        name="masked_depth"
+    )([depth, object_mask])
+    encoder_inputs = [rgb, depth, object_mask, masked_rgb, masked_depth]
+    features = keras.layers.Concatenate(
+        name="rgbd_concatenation"
+    )(encoder_inputs)
     for index, width in enumerate([
             base_width, base_width * 2, base_width * 4, base_width * 8], 1):
         features = keras.layers.Conv2D(
@@ -1284,7 +1357,9 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
     rgb = keras.Input((*image_shape, 3), name="rgb")
     depth = keras.Input((*image_shape, 1), name="depth")
     object_mask = keras.Input((*image_shape, 1), name="object_mask")
-    features, spatial = compact_encoder(rgb, depth, regularizer, base_width)
+    features, spatial = compact_encoder(
+        rgb, depth, object_mask, regularizer, base_width
+    )
     geometry, outputs = build_parameter_heads(
         features, regularizer, num_shapes
     )
@@ -1384,6 +1459,8 @@ def make_parser():
     parser.add_argument("--edge-uniformity-weight", type=float, default=0.02)
     parser.add_argument("--normal-consistency-weight", type=float, default=0.1,
                         help="Unsigned nearest-surface normal loss weight.")
+    parser.add_argument("--point-to-plane-weight", type=float, default=0.5)
+    parser.add_argument("--joint-pose-loss-weight", type=float, default=0.25)
     parser.add_argument("--render-resolution", type=int, default=32)
     parser.add_argument("--y-fov", type=float, default=45.0)
     parser.add_argument("--render-floor-tolerance", type=float, default=0.01)
@@ -1444,6 +1521,7 @@ def validate_args(args):
     )
     other_weights = (
         args.edge_uniformity_weight, args.normal_consistency_weight,
+        args.point_to_plane_weight, args.joint_pose_loss_weight,
         args.render_floor_tolerance,
     )
     if min(cage_weights + reconstruction_weights + other_weights) < 0.0:
@@ -1471,8 +1549,12 @@ def build_objectives(args, mesh_statistics, faces, edges, cage_faces,
     mesh = PhysicalMeshLoss(
         mesh_statistics["standard_deviation"], faces, edges,
         args.edge_uniformity_weight, args.normal_consistency_weight,
+        args.point_to_plane_weight,
     )
     mesh_normal = PhysicalMeshNormalError(
+        mesh_statistics["standard_deviation"], faces, edges
+    )
+    point_plane = PhysicalMeshPointPlaneError(
         mesh_statistics["standard_deviation"], faces, edges
     )
     primitive_shapes = shape_names == ("cube", "cylinder", "sphere")
@@ -1515,17 +1597,20 @@ def build_objectives(args, mesh_statistics, faces, edges, cage_faces,
             keras.metrics.MeanMetricWrapper(
                 mesh_normal, name="surface_normal_error"
             ),
+            keras.metrics.MeanMetricWrapper(
+                point_plane, name="surface_point_to_plane_m2"
+            ),
         ],
         CAGE_OUTPUT_NAME: [
             keras.metrics.MeanMetricWrapper(cage, name="loss")
         ] + cage_validity_metrics(cage_faces),
         RENDERED_RGB_OUTPUT_NAME: [
             keras.metrics.MeanMetricWrapper(rgb, name="loss"),
-            keras.metrics.MeanAbsoluteError(name="mae_0_1"),
+            ForegroundMeanAbsoluteError(name="foreground_mae_0_1"),
         ],
         RENDERED_DEPTH_OUTPUT_NAME: [
             keras.metrics.MeanMetricWrapper(depth, name="loss"),
-            keras.metrics.MeanAbsoluteError(name="mae_m"),
+            ForegroundMeanAbsoluteError(name="foreground_mae_m"),
         ],
         RENDERED_SILHOUETTE_OUTPUT_NAME: [
             keras.metrics.MeanMetricWrapper(silhouette, name="loss"),
@@ -1609,6 +1694,11 @@ def main(argv=None):
             "cage_maximum_offset": args.cage_maximum_offset,
             "cage_validity_weight": args.cage_validity_weight,
             "normal_consistency_weight": args.normal_consistency_weight,
+            "point_to_plane_weight": args.point_to_plane_weight,
+            "joint_pose_loss_weight": args.joint_pose_loss_weight,
+            "encoder_mask_conditioning": (
+                "RGB-D, object mask, masked RGB, and masked depth"
+            ),
             "num_vertices": num_vertices,
             "num_faces": len(faces),
             "mesh_target_points": args.mesh_target_points,
@@ -1757,13 +1847,20 @@ def main(argv=None):
                 min(args.preview_meshes, len(test_records)),
             )
             return
+    pose_weights = {
+        "object_translation": args.joint_pose_loss_weight,
+        "object_orientation_6d": args.joint_pose_loss_weight,
+        "object_scale": args.joint_pose_loss_weight,
+    }
     compile_model(
         model, args.learning_rate, args.weight_decay, normalizer.statistics,
         extra_losses=objectives.losses, extra_metrics=objectives.metrics,
         extra_loss_weights=objectives.weights,
+        loss_weight_overrides=pose_weights,
     )
     logged_weights = {name: 1.0 for name in OUTPUT_NAMES}
     logged_weights.update(objectives.weights)
+    logged_weights.update(pose_weights)
     callbacks = [
         WeightedLossLogger(logged_weights),
         keras.callbacks.CSVLogger(args.output / "training.csv"),
@@ -1804,8 +1901,12 @@ def main(argv=None):
         callbacks=callbacks,
     )
     model.save(args.output / "final.keras")
+    best_model = keras.models.load_model(
+        args.output / "best.keras", compile=False
+    )
     save_preview_meshes(
-        model, test, test_records, mesh_statistics, normalizer.statistics,
+        best_model, test, test_records, mesh_statistics,
+        normalizer.statistics,
         faces,
         args.output / "cage_preview_meshes",
         min(args.preview_meshes, len(test_records)),
