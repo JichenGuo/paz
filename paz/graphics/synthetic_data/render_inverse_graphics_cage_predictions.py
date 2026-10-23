@@ -157,24 +157,26 @@ def decode_prediction(raw, statistics, mesh_statistics, shape_names,
     light_intensity = max(float(denormalize(
         raw["light_intensity"][0], statistics["light_intensity"]
     )[0]), 0.0)
-    probabilities = np.asarray(raw["shape"][0])
-    return canonical, {
+    prediction = {
         "object_translation_camera_xyz": translation,
         "object_orientation_camera_6d": orientation,
         "object_rotation_camera_3x3": rotation,
         "object_scale": scale,
-        "shape": shape_names[int(np.argmax(probabilities))],
-        "shape_probabilities": probabilities,
         "material": material,
         "light_position_camera_xyz": light_position,
         "light_intensity": light_intensity,
     }
+    if "shape" in raw:
+        probabilities = np.asarray(raw["shape"][0])
+        prediction["shape"] = shape_names[int(np.argmax(probabilities))]
+        prediction["shape_probabilities"] = probabilities
+    return canonical, prediction
 
 
 def inference_model(model, geometry_representation="cage"):
     required = (
         MESH_OUTPUT_NAME, "object_translation", "object_orientation_6d",
-        "object_scale", "shape", "material", "light_position",
+        "object_scale", "material", "light_position",
         "light_intensity",
     )
     outputs = dict(zip(model.output_names, model.outputs))
@@ -182,6 +184,8 @@ def inference_model(model, geometry_representation="cage"):
     if missing:
         raise ValueError(f"Model lacks outputs: {sorted(missing)}")
     selected = {name: outputs[name] for name in required}
+    if "shape" in outputs:
+        selected["shape"] = outputs["shape"]
     if geometry_representation != "cage":
         raise ValueError("Only cage geometry is supported")
     try:

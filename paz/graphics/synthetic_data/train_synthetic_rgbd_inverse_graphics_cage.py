@@ -49,8 +49,6 @@ from paz.graphics.synthetic_data.train_synthetic_rgb_resnet18 import (
 from paz.graphics.synthetic_data.train_synthetic_rgbd_cnn import (
     export_test_split,
     load_records,
-    symmetry_geodesic_angle_degrees,
-    symmetry_rotation_loss,
 )
 from paz.graphics.synthetic_data.train_synthetic_rgbd_resnet18_mesh import (
     load_camera_mesh_points,
@@ -68,6 +66,9 @@ from paz.graphics.synthetic_data.train_synthetic_rgbd_resnet18_sdf import (
 
 MESH_OUTPUT_NAME = "mesh_vertices"
 CAGE_OUTPUT_NAME = "cage_vertices"
+PARAMETER_OUTPUT_NAMES = tuple(
+    name for name in OUTPUT_NAMES if name != "shape"
+)
 RENDERED_RGB_OUTPUT_NAME = "rendered_rgb"
 RENDERED_DEPTH_OUTPUT_NAME = "rendered_depth"
 RENDERED_SILHOUETTE_OUTPUT_NAME = "rendered_silhouette"
@@ -1042,7 +1043,7 @@ class CompactCageDataset(keras.utils.PyDataset):
         }
         outputs = {
             name: np.stack([target[name] for target in targets])
-            for name in OUTPUT_NAMES
+            for name in PARAMETER_OUTPUT_NAMES
         }
         outputs[MESH_OUTPUT_NAME] = self.mesh_targets[indices]
         if self.reference_cage is not None:
@@ -1308,7 +1309,7 @@ class DifferentiableCageRenderer(keras.layers.Layer):
         return config
 
 
-def build_parameter_heads(features, regularizer, num_shapes):
+def build_parameter_heads(features, regularizer):
     geometry = keras.layers.Dense(
         192, activation="relu", kernel_regularizer=regularizer,
         name="geometry_mlp",
@@ -1327,8 +1328,6 @@ def build_parameter_heads(features, regularizer, num_shapes):
         "object_orientation_6d": keras.layers.Dense(
             6, name="object_orientation_6d")(geometry),
         "object_scale": keras.layers.Dense(1, name="object_scale")(geometry),
-        "shape": keras.layers.Dense(
-            num_shapes, activation="softmax", name="shape")(geometry),
         "material": keras.layers.Dense(
             len(MATERIAL_NAMES), name="material")(material),
         "light_position": keras.layers.Dense(
@@ -1435,7 +1434,7 @@ def build_render_outputs(outputs, config):
     )(rendered[2])
 
 
-def build_model(image_shape, num_shapes, coordinates, base_width,
+def build_model(image_shape, coordinates, base_width,
                 l2_regularization, faces, render_resolution, y_fov,
                 target_statistics, mesh_statistics, splat_sigma,
                 depth_temperature, max_depth, cage_vertices, mesh_weights,
@@ -1448,9 +1447,7 @@ def build_model(image_shape, num_shapes, coordinates, base_width,
     features, spatial = compact_encoder(
         rgb, depth, object_mask, regularizer, base_width
     )
-    geometry, outputs = build_parameter_heads(
-        features, regularizer, num_shapes
-    )
+    geometry, outputs = build_parameter_heads(features, regularizer)
     decoder = CageDecoderArgs(
         coordinates, cage_vertices, mesh_weights, mesh_statistics,
         cage_maximum_offset, y_fov, max_depth, target_statistics,
@@ -1635,8 +1632,7 @@ def select_records(args):
     return records, (selected, list(selected), splits[2])
 
 
-def build_objectives(args, mesh_statistics, faces, edges, cage_faces,
-                     shape_names):
+def build_objectives(args, mesh_statistics, faces, edges, cage_faces):
     mesh = PhysicalMeshLoss(
         mesh_statistics["standard_deviation"], faces, edges,
         args.edge_uniformity_weight, args.normal_consistency_weight,
@@ -1653,13 +1649,8 @@ def build_objectives(args, mesh_statistics, faces, edges, cage_faces,
         mesh_statistics["standard_deviation"], faces, edges,
         discontinuity_emphasis=args.discontinuity_emphasis,
     )
-    primitive_shapes = shape_names == ("cube", "cylinder", "sphere")
-    if primitive_shapes:
-        rotation = symmetry_rotation_loss
-    else:
-        rotation = generic_rotation_loss
-    rotation_metric = (symmetry_geodesic_angle_degrees if primitive_shapes
-                       else generic_geodesic_angle_degrees)
+    rotation = generic_rotation_loss
+    rotation_metric = generic_geodesic_angle_degrees
     cage = CageValidityLoss(
         cage_faces, mesh_edges(cage_faces),
         offset_weight=args.cage_offset_weight,
@@ -1826,6 +1817,8 @@ def main(argv=None):
             "requires_watertight_meshes": False,
             "uses_sdf": False,
             "uses_marching_cubes": False,
+            "uses_shape_supervision": False,
+            "rotation_supervision": "generic_so3",
         }, file, indent=2)
 
     common = {
@@ -1851,7 +1844,7 @@ def main(argv=None):
     )
     image_shape = training[0][0]["rgb"].shape[1:3]
     model = build_model(
-        image_shape, len(shape_names), coordinates, args.base_width,
+        image_shape, coordinates, args.base_width,
         args.l2_regularization, faces, args.render_resolution, args.y_fov,
         normalizer.statistics, mesh_statistics, args.splat_sigma,
         args.depth_temperature, args.max_depth, cage_vertices, mesh_weights,
@@ -1859,7 +1852,7 @@ def main(argv=None):
         args.splat_strength,
     )
     objectives = build_objectives(
-        args, mesh_statistics, faces, edges, cage_faces, shape_names
+        args, mesh_statistics, faces, edges, cage_faces
     )
     warmup_epochs = (args.epochs if args.geometry_only else
                      args.geometry_warmup_epochs)
@@ -1968,14 +1961,14 @@ def main(argv=None):
         extra_loss_weights=objectives.weights,
         loss_weight_overrides=pose_weights,
     )
-    logged_weights = {name: 1.0 for name in OUTPUT_NAMES}
+    logged_weights = {name: 1.0 for name in PARAMETER_OUTPUT_NAMES}
     logged_weights.update(objectives.weights)
     logged_weights.update(pose_weights)
     callbacks = [
         WeightedLossLogger(logged_weights),
         keras.callbacks.CSVLogger(args.output / "training.csv"),
         TrainingPlot(
-            args.output / "loss.png", OUTPUT_NAMES + (
+            args.output / "loss.png", PARAMETER_OUTPUT_NAMES + (
                 CAGE_OUTPUT_NAME,
                 MESH_OUTPUT_NAME, RENDERED_RGB_OUTPUT_NAME,
                 RENDERED_DEPTH_OUTPUT_NAME,

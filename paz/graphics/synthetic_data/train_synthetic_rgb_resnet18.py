@@ -456,6 +456,13 @@ def compile_model(model, learning_rate, weight_decay, statistics,
         loss_weights.update(extra_loss_weights)
     if loss_weight_overrides:
         loss_weights.update(loss_weight_overrides)
+    model_outputs = set(model.output_names)
+    losses = {name: value for name, value in losses.items()
+              if name in model_outputs}
+    metrics = {name: value for name, value in metrics.items()
+               if name in model_outputs}
+    loss_weights = {name: value for name, value in loss_weights.items()
+                    if name in model_outputs}
     optimizer = keras.optimizers.AdamW(
         learning_rate, weight_decay=weight_decay, global_clipnorm=1.0
     )
