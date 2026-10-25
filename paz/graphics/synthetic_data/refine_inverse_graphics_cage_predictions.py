@@ -202,31 +202,49 @@ def build_objective(model, observations, geometry, loss_weights):
 
 
 def refine_cage(initial_cage, loss, terms, args):
-    trace = []
-    callback = paz.optimization.TraceParameters(trace)
     optimizer = optax.adamw(args.learning_rate)
-    stop = paz.optimization.patience_stop(
-        args.early_stop_min_delta, args.early_stop_patience
-    )
-    minimize_args = jp.asarray(initial_cage), loss, optimizer
-    minimize_args += args.refinement_steps,
-    kwargs = dict(stop_fn=stop, callbacks=[callback], verbose=True)
+    initial_cage = jp.asarray(initial_cage)
+    initial_loss = loss(initial_cage)
+    state = optimizer.init(initial_cage)
+
+    def step(carry, _):
+        cage, state, cage_loss, best_loss, wait, active = carry
+        _, gradients = jax.value_and_grad(loss)(cage)
+        updates, state_new = optimizer.update(gradients, state, cage)
+        candidate = optax.apply_updates(cage, updates)
+        candidate_loss = loss(candidate)
+        finite = jp.isfinite(candidate_loss)
+        threshold = best_loss - args.early_stop_min_delta
+        improved = active & finite & (candidate_loss < threshold)
+        best_new = jp.where(improved, candidate_loss, best_loss)
+        wait_new = jp.where(improved, 0, wait + 1)
+        active_new = active & finite & (wait_new < args.early_stop_patience)
+        cage_new = jp.where(active, candidate, cage)
+        cage_loss_new = jp.where(active, candidate_loss, cage_loss)
+        state = jax.tree.map(
+            lambda new, old: jp.where(active, new, old), state_new, state
+        )
+        carry = cage_new, state, cage_loss_new, best_new, wait_new, active_new
+        return carry, (cage_new, cage_loss_new, active_new)
+
+    carry = initial_cage, state, initial_loss, initial_loss
+    carry += jp.array(0), jp.array(True)
     start = time.perf_counter()
-    _, last_cage, history = paz.minimize(*minimize_args, **kwargs)
-    jax.block_until_ready(last_cage)
+    _, trace = jax.lax.scan(step, carry, None, args.refinement_steps)
+    cages, losses, active = trace
+    jax.block_until_ready(cages)
     elapsed = time.perf_counter() - start
-    count = int(history.stop_step)
-    losses = np.asarray(history.losses[:count])
-    cages = trace[:count]
-    last_loss = float(loss(last_cage))
-    losses = np.append(losses, last_loss)
-    cages.append(np.asarray(last_cage))
+    cages = np.concatenate([initial_cage[None], np.asarray(cages)], axis=0)
+    losses = np.concatenate([[float(initial_loss)], np.asarray(losses)])
     best = int(np.argmin(losses))
     best_cage = np.asarray(cages[best])
     values = jax.device_get(terms(jp.asarray(best_cage)))
     values = {name: float(value) for name, value in values.items()}
     values["total"] = float(losses[best])
     values["best_step"] = best
+    inactive = np.flatnonzero(~np.asarray(active))
+    completed = inactive[0] + 1 if len(inactive) else args.refinement_steps
+    values["completed_steps"] = int(completed)
     return best_cage, losses.tolist(), values, elapsed
 
 
