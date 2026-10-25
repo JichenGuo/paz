@@ -1438,13 +1438,15 @@ def build_model(image_shape, coordinates, base_width,
                 l2_regularization, faces, render_resolution, y_fov,
                 target_statistics, mesh_statistics, splat_sigma,
                 depth_temperature, max_depth, cage_vertices, mesh_weights,
-                cage_maximum_offset=1.0, splat_strength=0.5):
-    """Builds a compact physical-parameter and cage-deformation network."""
+                cage_maximum_offset=1.0, splat_strength=0.5,
+                encoder_builder=compact_encoder,
+                model_name="compact_rgbd_cage_mesh"):
+    """Builds a physical-parameter and cage-deformation network."""
     regularizer = keras.regularizers.L2(l2_regularization)
     rgb = keras.Input((*image_shape, 3), name="rgb")
     depth = keras.Input((*image_shape, 1), name="depth")
     object_mask = keras.Input((*image_shape, 1), name="object_mask")
-    features, spatial = compact_encoder(
+    features, spatial = encoder_builder(
         rgb, depth, object_mask, regularizer, base_width
     )
     geometry, outputs = build_parameter_heads(features, regularizer)
@@ -1463,7 +1465,7 @@ def build_model(image_shape, coordinates, base_width,
     build_render_outputs(outputs, renderer)
     return keras.Model(
         {"rgb": rgb, "depth": depth, "object_mask": object_mask}, outputs,
-        name="compact_rgbd_cage_mesh",
+        name=model_name,
     )
 
 
@@ -1723,7 +1725,9 @@ def build_objectives(args, mesh_statistics, faces, edges, cage_faces):
     )
 
 
-def main(argv=None):
+def main(argv=None, encoder_builder=compact_encoder,
+         encoder_name="compact CNN",
+         model_name="compact_rgbd_cage_mesh"):
     args = make_parser().parse_args(argv)
     validate_args(args)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -1763,7 +1767,8 @@ def main(argv=None):
     np.savez_compressed(args.output / "mesh_topology.npz", **topology)
     with (args.output / "input_preprocessing.json").open("w") as file:
         json.dump({
-            "method": "compact cage-deformed mesh",
+            "method": f"{encoder_name} cage-deformed mesh",
+            "encoder": encoder_name,
             "mesh_frame": "canonical transformed by predicted pose and scale",
             "mesh_representation": "mean-value-coordinate cage deformation",
             "geometry_representation": "cage",
@@ -1850,6 +1855,8 @@ def main(argv=None):
         args.depth_temperature, args.max_depth, cage_vertices, mesh_weights,
         args.cage_maximum_offset,
         args.splat_strength,
+        encoder_builder,
+        model_name,
     )
     objectives = build_objectives(
         args, mesh_statistics, faces, edges, cage_faces
@@ -1994,7 +2001,7 @@ def main(argv=None):
     ]
     model.summary()
     print(
-        f"Training compact cage mesh on {device}: "
+        f"Training {encoder_name} cage mesh on {device}: "
         f"{len(training_records)} train, "
         f"{len(validation_records)} validation, {len(test_records)} test; "
         f"{num_vertices} vertices, {len(faces)} faces"
