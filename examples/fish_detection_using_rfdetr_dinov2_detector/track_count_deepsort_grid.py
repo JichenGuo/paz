@@ -314,6 +314,7 @@ def draw_track_overlay(
 
 
 def draw_count_overlay(image, counts):
+    """Show current-frame detection totals for the selected count classes."""
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated, "RGBA")
     image_width, image_height = annotated.size
@@ -329,9 +330,8 @@ def draw_count_overlay(image, counts):
     except OSError:
         font = ImageFont.load_default()
 
-    lines = [f"{name}: {count}" for name, count in counts.items()]
-    if not lines:
-        return annotated
+    lines = [f"Current frame total: {sum(counts.values())}"]
+    lines.extend(f"{name}: {count}" for name, count in counts.items())
     text_boxes = [draw.textbbox((0, 0), line, font=font) for line in lines]
     line_widths = [right - left for left, top, right, bottom in text_boxes]
     line_heights = [bottom - top for left, top, right, bottom in text_boxes]
@@ -541,10 +541,14 @@ def annotate_frame(
         track_class_names,
         max_draw_missed_frames,
     )
-    annotated = draw_count_overlay(annotated, counts)
     grid_counts = count_grid_detections(
         detection_records, count_classes, frame_rgb.shape[1], frame_rgb.shape[0]
     )
+    frame_counts = {
+        name: sum(cell[name] for cell in grid_counts.values())
+        for name in count_classes
+    }
+    annotated = draw_count_overlay(annotated, frame_counts)
     annotated = draw_grid_overlay(annotated, grid_counts)
     annotated_bgr = cv2.cvtColor(np.asarray(annotated), cv2.COLOR_RGB2BGR)
     track_records = tracks_to_records(
