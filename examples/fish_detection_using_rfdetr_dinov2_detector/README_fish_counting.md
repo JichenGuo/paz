@@ -93,10 +93,10 @@ The launcher uses these settings:
 | Setting | Value | Meaning |
 | --- | --- | --- |
 | `THRESHOLD` | `0.5` | Detection confidence threshold. |
-| `TRACK_FRAMES` | `5` | Minimum observed track length for cumulative counting. |
-| `MAX_AGE` | `10` | Maximum missed-frame age before DeepSORT removes a track. |
-| `N_INIT` | `5` | Detections needed before DeepSORT confirms a track. |
-| `DRAW_MISS_FRAMES` | `3` | Maximum missed frames for drawing a confirmed track. |
+| `TRACK_FRAMES` | `3` | Minimum observed track length for cumulative counting. |
+| `MAX_AGE` | `3` | Maximum missed-frame age before DeepSORT removes a track. |
+| `N_INIT` | `3` | Detections needed before DeepSORT confirms a track. |
+| `DRAW_MISS_FRAMES` | `1` | Maximum missed frames for drawing a confirmed track. |
 | `--count-classes` | `crab,fish,lobster` | Classes included in tracking and counting. |
 
 For fish-only counting, change the final argument to `--count-classes fish`.
@@ -106,7 +106,7 @@ Preserve the trailing backslashes between continued command lines.
 
 ### Frame downsampling and processing time
 
-Add `--frame-stride 10` to the Python command in the launcher to process every
+Add `--frame-stride 5` to the Python command in the launcher to process every
 10th frame. The default is `1` (all frames). Sampling starts at `--start-frame`:
 for example, a start frame of 5 and stride of 10 process frames 5, 15, 25, etc.
 Skipped frames are not passed to the detector or tracker. `--max-frames` limits
