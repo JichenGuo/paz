@@ -12,3 +12,7 @@
 # extend exceptions to subdirectories
 !*/
 /.idea/
+
+# Keep only the fish detection example.
+/examples/*
+!/examples/fish_detection_using_rfdetr_dinov2_detector/
