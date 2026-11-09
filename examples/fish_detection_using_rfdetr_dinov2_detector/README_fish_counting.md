@@ -107,7 +107,7 @@ Preserve the trailing backslashes between continued command lines.
 ### Frame downsampling and processing time
 
 Add `--frame-stride 5` to the Python command in the launcher to process every
-10th frame. The default is `1` (all frames). Sampling starts at `--start-frame`:
+5th frame. The default is `1` (all frames). Sampling starts at `--start-frame`:
 for example, a start frame of 5 and stride of 10 process frames 5, 15, 25, etc.
 Skipped frames are not passed to the detector or tracker. `--max-frames` limits
 the number of processed frames. The output video uses input FPS divided by the
