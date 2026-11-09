@@ -78,6 +78,8 @@ The launcher binds `/mnt/beegfs` into the container with
 needed, ensuring that the repository, checkpoint, input video, and output
 directory are accessible inside the container at the configured paths.
 
+Example videos can be downloaded from [DFKI cloud video folder](https://cloud.dfki.de/owncloud/index.php/apps/files/files/123413025?dir=/Reefshield_videos)
+
 ## Run
 
 From the repository root:
