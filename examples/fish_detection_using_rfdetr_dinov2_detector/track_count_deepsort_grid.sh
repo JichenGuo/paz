@@ -35,11 +35,11 @@ JSON_OUTPUT=/mnt/beegfs/home/jguo/projects/fish_detector_using_rfdetr/paz/exampl
     
     
 THRESHOLD=0.5
-TRACK_FRAMES=5
-MAX_AGE=10
-N_INIT=5
-DRAW_MISS_FRAMES=3
-
+TRACK_FRAMES=3
+MAX_AGE=3
+N_INIT=3
+DRAW_MISS_FRAMES=1
+FRAME_STRIDE=5
 DETECTOR="LARGE"
 
 
@@ -57,6 +57,7 @@ singularity exec --nv \
         --max-age "$MAX_AGE"\
         --n-init "$N_INIT"\
         --max-draw-missed-frames "$DRAW_MISS_FRAMES"\
+        --frame-stride "$FRAME_STRIDE"\
         --count-classes crab,fish,lobster
 
 
