@@ -319,28 +319,25 @@ def draw_count_overlay(image, counts):
     draw = ImageDraw.Draw(annotated, "RGBA")
     image_width, image_height = annotated.size
     short_side = min(image_width, image_height)
-    font_size = max(MIN_COUNT_FONT_SIZE, round(short_side * 0.06))
-    padding = max(12, round(font_size * 0.4))
-    margin = max(12, round(short_side * 0.018))
-    line_gap = max(8, round(font_size * 0.25))
-    border_width = max(3, round(short_side * 0.004))
-    text_stroke_width = max(1, round(font_size * 0.04))
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
-    except OSError:
-        font = ImageFont.load_default()
-
+    cell_width, cell_height = image_width // 2, image_height // 2
+    padding = max(2, round(min(cell_width, cell_height) * 0.025))
+    margin = padding
+    font_size = max(1, round(short_side * 0.028))
     lines = [f"Current frame total: {sum(counts.values())}"]
     lines.extend(f"{name}: {count}" for name, count in counts.items())
-    text_boxes = [draw.textbbox((0, 0), line, font=font) for line in lines]
-    line_widths = [right - left for left, top, right, bottom in text_boxes]
-    line_heights = [bottom - top for left, top, right, bottom in text_boxes]
-    box_width = max(line_widths) + 2 * padding
-    box_height = (
-        sum(line_heights)
-        + line_gap * max(0, len(lines) - 1)
-        + 2 * padding
-    )
+    while True:
+        try:
+            font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
+        except OSError:
+            font = ImageFont.load_default()
+        text_boxes = [draw.textbbox((0, 0), line, font=font) for line in lines]
+        line_height = max(box[3] - box[1] for box in text_boxes) + padding
+        box_width = max(box[2] - box[0] for box in text_boxes) + 2 * padding
+        box_height = len(lines) * line_height + padding
+        if (box_width + 2 * padding <= cell_width and
+                box_height + 2 * padding <= cell_height) or font_size <= 1:
+            break
+        font_size -= 1
 
     x1 = max(0, image_width - box_width - margin)
     y1 = max(0, image_height - box_height - margin)
@@ -348,25 +345,22 @@ def draw_count_overlay(image, counts):
     y2 = y1 + box_height
     draw.rectangle(
         (x1, y1, x2, y2),
-        fill=(*COUNT_BG_COLOR, 230),
+        fill=(*COUNT_BG_COLOR, 210),
         outline=(*COUNT_BORDER_COLOR, 255),
-        width=border_width,
+        width=1,
     )
 
     y = y1 + padding
-    for line, line_height, text_box in zip(lines, line_heights, text_boxes):
+    for line, text_box in zip(lines, text_boxes):
         left, top, right, bottom = text_box
-        text_width = right - left
-        x = x2 - padding - text_width
+        x = x1 + padding
         draw.text(
             (x - left, y - top),
             line,
             fill=COUNT_TEXT_COLOR,
             font=font,
-            stroke_width=text_stroke_width,
-            stroke_fill=COUNT_TEXT_STROKE_COLOR,
         )
-        y += line_height + line_gap
+        y += line_height
 
     return annotated
 
