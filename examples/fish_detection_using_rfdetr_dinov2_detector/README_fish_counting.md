@@ -104,6 +104,26 @@ To process a short sample, add `--max-frames 100` to the Python command inside
 the launcher. Add `--start-frame N` to begin at a particular frame index.
 Preserve the trailing backslashes between continued command lines.
 
+### Frame downsampling and processing time
+
+Add `--frame-stride 10` to the Python command in the launcher to process every
+10th frame. The default is `1` (all frames). Sampling starts at `--start-frame`:
+for example, a start frame of 5 and stride of 10 process frames 5, 15, 25, etc.
+Skipped frames are not passed to the detector or tracker. `--max-frames` limits
+the number of processed frames. The output video uses input FPS divided by the
+stride to preserve playback speed, with fewer frames and unchanged resolution.
+DeepSORT age, confirmation, drawing, and minimum-track-length settings are
+measured in processed frames; larger strides can make tracking harder when
+objects move significantly between observations.
+
+Every processed frame prints its source frame index and pipeline processing
+time in milliseconds. When `--json-output` is supplied (as in the launcher),
+each frame also records `pipeline_inference_time_ms`, `frame_index`, and
+`source_time_seconds`. The timing includes preprocessing, detection, tracking,
+counting, and drawing; it excludes video decoding and writing. The first frame
+can include model warm-up or compilation overhead. JSON metadata records
+`frame_stride`, input `fps`, and `output_fps`, along with aggregate timing.
+
 ## Read the output
 
 The output video contains:

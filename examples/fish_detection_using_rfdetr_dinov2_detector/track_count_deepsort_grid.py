@@ -96,6 +96,12 @@ def parse_args():
     )
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument(
+        "--frame-stride", type=int, default=1,
+        help=("Process every Nth source frame, starting at --start-frame. "
+              "Use 10 for tenfold temporal downsampling. --max-frames limits "
+              "processed frames; output FPS is input FPS divided by N."),
+    )
     parser.add_argument("--fourcc", default="mp4v")
     parser.add_argument(
         "--count-classes",
@@ -564,6 +570,8 @@ def annotate_frame(
 
 def main():
     args = parse_args()
+    if args.frame_stride < 1:
+        raise ValueError("--frame-stride must be >= 1")
     if args.min_track_frames < 1:
         raise ValueError("--min-track-frames must be >= 1")
     if args.max_draw_missed_frames < 0:
@@ -596,7 +604,9 @@ def main():
 
     capture = open_video(video_path)
     fps, width, height, frame_count = video_metadata(capture)
-    writer = make_writer(output_path, fps, width, height, args.fourcc)
+    output_fps = fps / args.frame_stride
+    writer = make_writer(output_path, output_fps, width, height, args.fourcc)
+    print(f"Frame stride: {args.frame_stride}; output FPS: {output_fps:g}")
 
     if args.start_frame > 0:
         capture.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
@@ -629,6 +639,8 @@ def main():
             "embedder": args.embedder,
         },
         "fps": fps,
+        "output_fps": output_fps,
+        "frame_stride": args.frame_stride,
         "width": width,
         "height": height,
         "input_frame_count": frame_count,
@@ -638,17 +650,26 @@ def main():
     }
 
     processed = 0
+    source_offset = 0
     pipeline_times_ms = []
     try:
         while True:
             if args.max_frames is not None and processed >= args.max_frames:
                 break
 
+            frame_index = args.start_frame + source_offset
+            if source_offset % args.frame_stride:
+                ok = capture.grab()
+                source_offset += 1
+                if not ok:
+                    break
+                continue
+
             ok, frame = capture.read()
+            source_offset += 1
             if not ok:
                 break
 
-            frame_index = args.start_frame + processed
             (
                 annotated,
                 detections,
@@ -677,6 +698,7 @@ def main():
                 payload["frames"].append(
                     {
                         "frame_index": frame_index,
+                        "source_time_seconds": frame_index / fps,
                         "pipeline_inference_time_ms": pipeline_time_ms,
                         "num_detections": len(detections),
                         "num_tracks": len(tracks),
@@ -691,12 +713,11 @@ def main():
                 )
 
             processed += 1
-            if processed == 1 or processed % 25 == 0:
-                print(
-                    f"Processed {processed} frames "
-                    f"(active tracks: {len(tracks)}, counts: {dict(counts)}, "
-                    f"pipeline: {pipeline_time_ms:.1f} ms)"
-                )
+            print(
+                f"Processed frame {processed} (source frame {frame_index}, "
+                f"active tracks: {len(tracks)}, counts: {dict(counts)}, "
+                f"pipeline: {pipeline_time_ms:.1f} ms)"
+            )
     finally:
         capture.release()
         writer.release()
