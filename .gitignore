@@ -11,3 +11,4 @@
 
 # extend exceptions to subdirectories
 !*/
+/.idea/
